@@ -1,0 +1,90 @@
+[project]
+name = "cutedsl-ops"
+version = "0.1.0"
+description = "Practice operators implemented with NVIDIA CuTe DSL (Python)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "cutedsl-ops contributors" }]
+dependencies = [
+  "nvidia-cutlass-dsl>=4.7.0",
+  "cuda-python>=12.9",
+  "cuda-bindings>=12.9",
+  "apache-tvm-ffi>=0.1.8",
+  "torch-c-dlpack-ext>=0.1.5",
+  "numpy",
+]
+
+# NOTE: a CUDA-enabled `torch` build is intentionally NOT pinned here, because
+# the right wheel index depends on the host driver / CUDA toolkit. Install one
+# yourself first (matching your driver), e.g. for CUDA 12.4:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+# then `uv sync` for the rest of the dependencies.
+
+[tool.ruff]
+line-length = 119
+indent-width = 4
+target-version = "py310"
+
+[tool.ruff.lint]
+preview = false
+extend-select = [
+  "B",   # flake8-bugbear
+  "C4",
+  "E",   # PEP8 errors
+  "F",   # pyflakes
+  "FURB",
+  "I",   # isort
+  "PERF",
+  "PIE",
+  "PL",
+  "RUF",
+  "SIM", # flake8-simplify
+  "UP",  # pyupgrade
+  "W",   # PEP8 warnings
+]
+ignore = [
+  "A001",
+  "A002",
+  "A005",
+  "B007",
+  "B008",
+  "B028",
+  "B904",
+  "C408",
+  "E402",  # module level import not at top (DSL scripts set env first)
+  "E501",  # line length handled by ruff-format
+  "E731",
+  "E741",
+  "E902",
+  "PERF203",
+  "PERF401",
+  "PERF403",
+  "PLR0913",
+  "PLR0917", # too-many-positional-arguments — DSL kernels & harness defaults legitimately exceed 5
+  "PLR2004",
+  "SIM102",
+  "SIM105",
+  "SIM108",
+  "SIM115",
+  "SIM117",
+  "SIM118",
+  "UP007",
+  "W605",
+]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+
+[tool.ruff.lint.per-file-ignores]
+# Kernel scaffolds: the device body is a guided TODO, so thread/block index
+# variables are bound to show the pattern but not yet consumed.
+"ops/**/*_kernel.py" = ["F841", "RUF059"]
+# Run harnesses use a sys.path bootstrap before first-party imports.
+"ops/**/run_*.py" = ["E402"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+line-ending = "auto"
+quote-style = "double"

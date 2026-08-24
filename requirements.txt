@@ -1,0 +1,10 @@
+# Convenience pin list (mirrors pyproject.toml). Prefer `uv sync`, but if you
+# install into a bare venv this works too. Install a CUDA `torch` first.
+nvidia-cutlass-dsl>=4.7.0
+cuda-python>=12.9
+cuda-bindings>=12.9
+apache-tvm-ffi>=0.1.8
+torch-c-dlpack-ext>=0.1.5
+numpy
+# torch  -- install a CUDA build matching your driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124

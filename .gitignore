@@ -1,0 +1,48 @@
+# Custom Settings
+.DS_Store
+.vscode
+.idea
+.temp
+log_dir/
+saved_model/
+cache/
+tmp/
+
+# uv / venv
+.venv/
+env/
+venv/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.ruff_cache/
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checkers
+.mypy_cache/
+.pytype/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Local opencode config (may carry provider secrets) — keep a secret-free
+# opencode.json committed; ignore local overrides.
+opencode.local.json
