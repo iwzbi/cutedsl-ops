@@ -1,6 +1,6 @@
 .PHONY: help install sync style style-unsafe quality run-gemm run-flash run-moe test
 
-PYTHON := python
+PYTHON := .venv/bin/python
 OPS := gemm flash_attn megamoe
 
 help: ## Show this help

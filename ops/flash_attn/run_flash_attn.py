@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from cutlass import cute
 
 
-sys.path.append(".")
+sys.path.insert(0, ".")
 from common.bench import compare_tensor, cuda_bench
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.flash_attn.flash_attn_kernel import flash_attn
@@ -59,6 +59,7 @@ def run_case(B: int, H: int, S: int, Dd: int, dtype: torch.dtype = torch.float16
         BH,
         S,
         Dd,
+        options="--enable-tvm-ffi --generate-line-info",
     )
     compiled(q3, k3, v3, o3)
     torch.cuda.synchronize()

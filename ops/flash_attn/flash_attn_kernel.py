@@ -40,6 +40,7 @@ from __future__ import annotations
 import cutlass
 from cuda.bindings.driver import CUstream
 from cutlass import cute
+from cutlass.cute.nvgpu.warpgroup import OperandMajorMode, OperandSource
 
 
 # Q-block rows and KV-block cols; head dim is the contraction/inner dims.
@@ -119,7 +120,14 @@ def flash_attn(
 ):
     """Host entry: build the (warpgroup) TiledMma and launch the grid."""
     # Hopper warpgroup MMA. On Ampere swap for cute.nvgpu.warp.MmaF16BF16Op.
-    op = cute.nvgpu.warpgroup.MmaF16BF16Op(cutlass.Float16, cutlass.Float16, (128, 16, 16))
+    op = cute.nvgpu.warpgroup.MmaF16BF16Op(
+        cutlass.Float16,
+        cutlass.Float16,
+        (64, 16, 16),
+        OperandSource.SMEM,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
+    )
     tiled_mma = cute.make_tiled_mma(op, atom_layout_mnk=(1, 1, 1))
     num_threads = tiled_mma.size
 

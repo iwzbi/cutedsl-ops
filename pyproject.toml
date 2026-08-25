@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "cutedsl-ops contributors" }]
 dependencies = [
   "nvidia-cutlass-dsl>=4.7.0",
+  "nvidia-cutlass-dsl-libs-base==4.7.0",
   "cuda-python>=12.9",
   "cuda-bindings>=12.9",
   "apache-tvm-ffi>=0.1.8",
@@ -20,6 +21,14 @@ dependencies = [
 # yourself first (matching your driver), e.g. for CUDA 12.4:
 #   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 # then `uv sync` for the rest of the dependencies.
+
+# Vendor the `nvidia-cutlass-dsl-libs-base` wheel with a patched
+# `dsl_user_op` decorator (generic TypeVar signature) so pyright/basedpyright
+# see the real parameter names of every CuTe DSL wrapper (local_tile,
+# make_tiled_mma, ...). Upstream fix: NVIDIA/cutlass#3528. Rebuild the wheel
+# from vendor/ when bumping nvidia-cutlass-dsl.
+[tool.uv.sources]
+nvidia-cutlass-dsl-libs-base = { path = "vendor/nvidia_cutlass_dsl_libs_base-4.7.0-cp312-cp312-manylinux_2_28_x86_64.whl", marker = "python_full_version == '3.12.*'" }
 
 [tool.ruff]
 line-length = 119

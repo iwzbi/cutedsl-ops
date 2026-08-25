@@ -46,3 +46,6 @@ htmlcov/
 # Local opencode config (may carry provider secrets) — keep a secret-free
 # opencode.json committed; ignore local overrides.
 opencode.local.json
+
+# opencode runtime state (session/continuation tracking)
+.omo/

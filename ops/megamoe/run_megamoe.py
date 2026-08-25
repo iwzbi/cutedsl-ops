@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from cutlass import cute
 
 
-sys.path.append(".")
+sys.path.insert(0, ".")
 from common.bench import compare_tensor, cuda_bench
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.megamoe.megamoe_kernel import BLOCK_M, grouped_gemm
@@ -91,6 +91,7 @@ def grouped_gemm_call(
         T,
         K_in,
         K_out,
+        options="--enable-tvm-ffi --generate-line-info",
     )
     compiled(a, b, c)
 

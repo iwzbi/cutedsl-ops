@@ -17,7 +17,7 @@ import torch
 from cutlass import cute
 
 
-sys.path.append(".")
+sys.path.insert(0, ".")
 from common.bench import compare_tensor, cuda_bench
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.gemm.gemm_kernel import gemm
@@ -46,6 +46,7 @@ def run_case(M: int, N: int, K: int, dtype: torch.dtype = torch.float16, bench: 
         M,
         N,
         K,
+        options="--enable-tvm-ffi --generate-line-info",
     )
     compiled(a, b, c)
     torch.cuda.synchronize()

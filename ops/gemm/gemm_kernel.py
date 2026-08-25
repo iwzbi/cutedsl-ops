@@ -67,6 +67,8 @@ def gemm_kernel(
     # TODO(practice): replace the placeholders above with the real local_tile calls.
     #   The leading K axis stays dynamic (use a dynamic tile of size K) so the
     #   mainloop below can stride along it.
+    tiler = (BLOCK_M, BLOCK_N, BLOCK_K)
+    gA = cute.local_tile(mA, tiler=tiler, c)
 
     # --- 2. Allocate shared-memory staging for one A and one B stripe --------
     # Use cute.make_tensor over a shared-memory allocator with the layout
