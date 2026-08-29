@@ -29,6 +29,7 @@ from common.bench import (
     cuda_bench,
     parse_ncu_output,
     print_bench_report,
+    run_ncu_gui,
     run_ncu_profile,
 )
 from common.cute_runtime import make_cute_tensor, make_stream
@@ -152,6 +153,8 @@ def run_case(
     use_cuda_graphs: bool = False,
     use_cupti: bool = False,
     use_ncu: bool = False,
+    ncu_raw: bool = False,
+    ncu_gui: bool = False,
 ) -> bool:
     torch.cuda.manual_seed_all(9527)
     a = torch.randn(M, K, device="cuda", dtype=dtype) * 0.5
@@ -187,8 +190,15 @@ def run_case(
         ncu_data = None
         if use_ncu:
             program_cmd = [sys.executable, os.path.abspath(__file__), str(M), str(N), str(K)]
-            ncu_text = run_ncu_profile("gemm_kernel", program_cmd)
-            ncu_data = parse_ncu_output(ncu_text)
+            if ncu_gui:
+                run_ncu_gui("gemm_kernel", program_cmd, output_file="gemm_profile.ncu-rep")
+            else:
+                ncu_text = run_ncu_profile("gemm_kernel", program_cmd)
+                if ncu_raw:
+                    print("\n--- ncu raw output ---")
+                    print(ncu_text)
+                else:
+                    ncu_data = parse_ncu_output(ncu_text)
 
         # Build report metadata
         meta = _make_kernel_meta()
@@ -223,8 +233,10 @@ def main() -> None:
 
     use_cuda_graphs = "--cuda-graphs" in sys.argv
     use_cupti = "--cupti" in sys.argv
-    use_ncu = "--ncu" in sys.argv
-    sys.argv = [x for x in sys.argv if x not in ("--cuda-graphs", "--cupti", "--ncu")]
+    use_ncu = "--ncu" in sys.argv or "--ncu-raw" in sys.argv or "--ncu-gui" in sys.argv
+    ncu_raw = "--ncu-raw" in sys.argv
+    ncu_gui = "--ncu-gui" in sys.argv
+    sys.argv = [x for x in sys.argv if x not in ("--cuda-graphs", "--cupti", "--ncu", "--ncu-raw", "--ncu-gui")]
 
     args = [int(x) for x in sys.argv[1:4]]
     shapes = [tuple(args)] if len(args) == 3 else [(1024, 1024, 1024)]
@@ -239,6 +251,8 @@ def main() -> None:
             use_cuda_graphs=use_cuda_graphs,
             use_cupti=use_cupti,
             use_ncu=use_ncu,
+            ncu_raw=ncu_raw,
+            ncu_gui=ncu_gui,
         ):
             counters["succeed"] += 1
         else:

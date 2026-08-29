@@ -52,3 +52,6 @@ opencode.local.json
 .opencode/
 *.bak
 tui.json
+
+# ncu profiling reports (large binary files, download to laptop for GUI)
+*.ncu-rep

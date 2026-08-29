@@ -1,4 +1,4 @@
-.PHONY: help sync style quality bench-gemm bench-gemm-ncu bench-flash bench-moe test
+.PHONY: help sync style quality bench-gemm bench-gemm-ncu bench-gemm-ncu-raw bench-gemm-ncu-gui bench-flash bench-moe test
 
 PYTHON := .venv/bin/python
 
@@ -17,8 +17,20 @@ quality: ## Check lint + format without changing files
 bench-gemm: ## Benchmark GEMM (4096³ fp16, timing + theoretical analysis)
 	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096
 
-bench-gemm-ncu: ## Benchmark GEMM with ncu profiling (hardware-level analysis)
+bench-gemm-ncu: ## Benchmark GEMM with ncu profiling (parsed report)
 	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096 --ncu
+
+bench-gemm-ncu-raw: ## Benchmark GEMM with raw ncu output (full original report)
+	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096 --ncu-raw
+
+bench-gemm-ncu-gui: ## Generate ncu .ncu-rep + serve for laptop download
+	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096 --ncu-gui
+	@curl -s http://localhost:8899/ > /dev/null 2>&1 || (cd . && $(PYTHON) -m http.server 8899 --bind 0.0.0.0 > /dev/null 2>&1 &)
+	@echo ""
+	@echo "=== Download from your laptop ==="
+	@echo "  curl -o ~/workspace/log/ncu/gemm_profile.ncu-rep http://11.167.35.90:8899/gemm_profile.ncu-rep"
+	@echo "=== Or open in browser ==="
+	@echo "  http://11.167.35.90:8899/gemm_profile.ncu-rep"
 
 bench-flash: ## Benchmark FlashAttention
 	$(PYTHON) ops/flash_attn/run_flash_attn.py

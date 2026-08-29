@@ -459,6 +459,75 @@ def run_ncu_profile(
     return result.stdout
 
 
+def run_ncu_gui(
+    kernel_name: str,
+    program_cmd: list[str],
+    output_file: str = "profile.ncu-rep",
+    *,
+    ncu_path: str | None = None,
+    section_set: str = "full",
+    launch_count: int = 1,
+    launch_skip: int = 0,
+    timeout: int = 600,
+) -> str:
+    """Run ncu and save a .ncu-rep file for GUI inspection on a laptop.
+
+    Download the file and open with Nsight Compute GUI locally::
+
+        scp server:./profile.ncu-rep .
+        ncu-ui profile.ncu-rep
+
+    Returns the output file path.
+    """
+    ncu = ncu_path or _find_ncu()
+    if not ncu:
+        raise FileNotFoundError("ncu not found. Set NCU_PATH env var or install Nsight Compute.")
+
+    cmd = [
+        ncu,
+        "--set",
+        section_set,
+        "--target-processes",
+        "all",
+        "--kernel-name",
+        f"regex:{kernel_name}",
+        "--launch-skip",
+        str(launch_skip),
+        "--launch-count",
+        str(launch_count),
+        "--export",
+        output_file,
+        "--force-overwrite",
+        *program_cmd,
+    ]
+
+    env = os.environ.copy()
+    env["NCU_PROFILING"] = "1"
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        print(f"[ncu] stderr: {result.stderr[:500]}")
+
+    abspath = os.path.abspath(output_file)
+    if os.path.exists(output_file):
+        size_mb = os.path.getsize(output_file) / 1024 / 1024
+        print(f"[ncu] Report saved: {abspath} ({size_mb:.1f} MB)")
+        print("[ncu] Download and open with Nsight Compute GUI:")
+        print(f"  scp <server>:{abspath} . && ncu-ui {output_file}")
+    else:
+        print(f"[ncu] Report file not created. stderr: {result.stderr[:500]}")
+
+    return abspath
+
+
 def parse_ncu_output(text: str) -> dict:
     """Parse key metrics from ncu text output.
 
