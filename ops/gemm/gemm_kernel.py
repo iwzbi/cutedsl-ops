@@ -399,4 +399,16 @@ def gemm(
     )
 
 
-__all__ = ["BLK_K", "BLK_M", "BLK_N", "NUM_STAGES", "gemm", "gemm_kernel"]
+__all__ = [
+    "BLK_K",
+    "BLK_M",
+    "BLK_N",
+    "NUM_DMA_WARPGROUPS",
+    "NUM_MMA_WARPGROUPS",
+    "NUM_STAGES",
+    "NUM_THREADS",
+    "NUM_THREADS_PER_WARPGROUP",
+    "NUM_WARPGROUPS",
+    "gemm",
+    "gemm_kernel",
+]
