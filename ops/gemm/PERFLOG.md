@@ -195,12 +195,49 @@ into a separate output buffer slice. Host-side `sum(dim=0)` reduces.
 
 ---
 
+## Step 6: Persistent + Split-K + Epilogue Overlap (mixed results)
+
+**Goal**: Overlap TMA S2G store (epilogue) with next tile's mainloop by moving
+`cp_async_bulk_wait_group` from after-commit to before-next-R2S.
+
+### Technique
+- TMA S2G: commit but DON'T wait (`commit_group` only)
+- Next tile's epilogue start: `wait_group(1)` (waits for previous store)
+- NamedBarrier before R2S ensures sD is free
+- Final `wait_group(0)` after tile loop ensures last store completes
+
+### Results
+
+| M×N×K | sk | persistent+sk | +epi-overlap | Delta |
+|--------|----|---------------|-------------|-------|
+| 512³   | 8  | 42.9          | 41.1        | -4.2% worse |
+| 1024³  | 2  | 91.1          | 89.6        | -1.6% worse |
+| 2048³  | 4  | 121.6         | **123.3**   | +1.4% better |
+| 4096³  | 4  | 132.8         | 133.3       | +0.4% better |
+| 16384³ | 1  | 141.1         | 141.4       | +0.2% better |
+
+### Analysis
+- **Small scale (512³ sk=8)**: each CTA does 1 K-tile → mainloop ~50 cycles,
+  TMA store ~180 cycles → `wait_group(1)` stalls 130 cycles. Overlap impossible
+  when mainloop is shorter than the TMA store.
+- **Medium scale (2048³ sk=4)**: mainloop ~3200 cycles, TMA store ~180 cycles →
+  store completes during mainloop → `wait_group(1)` is instant. **Best gain +1.4%**.
+- **Large scale (4096³+)**: marginal — mainloop long enough but pipeline already
+  well-overlapped.
+
+### ncu Raw Reports
+- [v6-epi-overlap 4096³](ncu_reports/v6-epi-overlap_4096.txt)
+
+---
+
 ## Performance Comparison Summary
 
 | Version | 512³ | 1024³ | 4096³ | 16384³ | vs cuBLAS (best) |
 |---------|------|-------|-------|--------|-------------------|
 | v1-baseline | 12.1 | 51.5 | 130.6 | 141.8 | +1.8% (16K³) |
-| v2-persistent | — | 51.3 | 131.0 | 140.9 | +1.1% (16K³) |
-| v3-swizzle | — | — | 130.7 | 141.0 | +1.4% (16K³) |
-| v4-blk96 | — | — | 129.8 | 140.7 | +1.0% (16K³) |
-| v5-splitk (best sk) | **39.4** | **90.1** | **131.4** | — | **+85% (512³)** |
+| v2-persistent | — | 51.3 | 131.0 | 140.9 | — |
+| v3-swizzle | — | — | 130.7 | 141.0 | — |
+| v4-blk96 | — | — | 129.8 | 140.7 | — |
+| v5-splitk (best sk) | 39.4 | 90.1 | 131.4 | — | +85% (512³) |
+| v6-persistent+sk | 42.9 | 91.1 | 132.8 | 141.1 | +101% (512³) |
+| v6+epi-overlap | 41.1 | 89.6 | 133.3 | 141.4 | +93% (512³) |

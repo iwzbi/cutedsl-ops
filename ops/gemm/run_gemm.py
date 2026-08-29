@@ -27,6 +27,7 @@ from common.bench import (
     KernelMeta,
     compare_tensor,
     cuda_bench,
+    get_gpu_info,
     parse_ncu_output,
     print_bench_report,
     run_ncu_gui,
@@ -56,7 +57,7 @@ def _make_kernel_meta(total_tiles: int = 0, split_k: int = 1) -> KernelMeta:
         block_description=(
             f"{kern.NUM_WARPGROUPS} warpgroups: {kern.NUM_DMA_WARPGROUPS} DMA + {kern.NUM_MMA_WARPGROUPS} MMA"
         ),
-        grid_mode="standard",
+        grid_mode="persistent",
         extra={
             "MMA atom": f"wgmma m64n{kern.BLK_N}k16, layout={kern.ATOM_LAYOUT_MNK}",
             "total_tiles": str(total_tiles) if total_tiles else "",
@@ -216,8 +217,9 @@ def run_case(
         # Build report metadata
         blocks_m = (M + kern.BLK_M - 1) // kern.BLK_M
         blocks_n = (N + kern.BLK_N - 1) // kern.BLK_N
-        total_tiles = blocks_m * blocks_n
-        grid_blocks = total_tiles * split_k
+        total_tiles = blocks_m * blocks_n * split_k
+        num_sms = get_gpu_info()["num_sms"]
+        grid_blocks = min(total_tiles, num_sms)
         meta = _make_kernel_meta(total_tiles=total_tiles, split_k=split_k)
         flops = 2 * M * N * K
         elt_size = a.element_size()
