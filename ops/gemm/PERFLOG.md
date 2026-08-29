@@ -106,20 +106,53 @@ Launch `min(total_tiles, num_sms)` CTAs instead of `total_tiles`.
 
 ---
 
-## Step 3: Split-K (planned)
+## Step 3: Block Swizzle — GROUP_M=4 (no gain, L2 worse, case study)
 
-**Goal**: Increase grid size for small problems (4096³ only 512 blocks → 6.56 waves).
+**Commit**: (tag: `v3-swizzle`)
 
-Split K dimension into multiple partitions, each CTA computes partial result, atomic add to accumulate.
+### What changed
+Tile assignment uses swizzled (bid_m, bid_n) mapping: tiles are grouped by GROUP_M=4
+consecutive M-blocks before striding N, to improve L2 reuse of A tiles.
 
-**Expected**: Small-scale +10-20%, large-scale minimal change.
+### Result: L2 hit rate dropped
+
+| Metric | v2-persistent | v3-swizzle | Delta |
+|--------|---------------|------------|-------|
+| L2 Hit Rate | 66.3% | **62.3%** | -4.0% worse |
+| TFLOPS (4096³) | 131.0 | 130.7 | ~0% |
+| TFLOPS (16384³) | 140.9 | 141.0 | ~0% |
+
+### Why worse
+1. Default M-major order already maximizes A reuse (consecutive M-blocks share A rows)
+2. GROUP_M=4 forces 4 M-blocks active simultaneously → 6 active M-blocks per wave vs 5 default
+3. 4096³ data = 64MB ≈ L2 60MB → more active blocks = more L2 pressure
+4. Kernel is compute-bound (DRAM 7.1%) → L2 optimization is the wrong direction
+
+### ncu Raw Reports
+- [v3-swizzle 4096³](ncu_reports/v3-swizzle_4096.txt)
+
+---
+
+## Step 4: CTA Barrier Stall Optimization (planned)
+
+**Goal**: Reduce the 74.3% CTA barrier stall (51.1 cycles/issued instruction).
+
+Current bottleneck: pipeline mbarrier sync — `consumer_wait` waits for TMA data,
+`producer_acquire` waits for consumer release. 64 K-tile sync cycles for 4096³.
+
+Options:
+- **BLK_K=128, NUM_STAGES=2**: Half the sync points (64→32), but needs BLK_N=128 to fit smem
+- **BLK_K=96, NUM_STAGES=2**: 33% fewer syncs (64→43), smem fits with BLK_N=256
+- **Epilogue overlap**: Overlap epilogue R2S+TMA-store with next tile's TMA prefetch
+- **Batch K-tiles per wait**: Process 2 K-tiles per consumer_wait/release cycle
 
 ---
 
 ## Performance Comparison Summary
 
-| Version | 1024³ | 4096³ | 16384³ | TC% | Top Stall | Occupancy |
-|---------|-------|-------|--------|-----|-----------|-----------|
-| v1-baseline | 51.5 | 130.6 | 141.8 | 90.9% | CTA barrier 74% | 13.9% |
-| v2-persistent | 51.3 | 131.0 | 140.9 | 91.4% | CTA barrier 74% | 13.9% |
-| v3-splitk | — | — | — | — | — | — |
+| Version | 1024³ | 4096³ | 16384³ | TC% | Top Stall | L2 Hit | Occupancy |
+|---------|-------|-------|--------|-----|-----------|--------|-----------|
+| v1-baseline | 51.5 | 130.6 | 141.8 | 90.9% | CTA barrier 74% | 65.1% | 13.9% |
+| v2-persistent | 51.3 | 131.0 | 140.9 | 91.4% | CTA barrier 74% | 66.3% | 13.9% |
+| v3-swizzle | — | 130.7 | 141.0 | 91.3% | CTA barrier 74% | 62.3% | 14.1% |
+| v4-barrier | — | — | — | — | — | — | — |

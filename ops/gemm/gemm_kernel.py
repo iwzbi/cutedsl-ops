@@ -74,6 +74,7 @@ NUM_MMA_THREADS = NUM_MMA_WARPGROUPS * NUM_THREADS_PER_WARPGROUP  # 256
 MMA_NAMED_BARRIER_ID = 1
 LOAD_REGISTER_REQUIREMENT = 40
 MMA_REGISTER_REQUIREMENT = 232
+GROUP_M = 4  # block swizzle: group M-blocks for L2 cache reuse
 
 
 @cute.kernel
@@ -156,8 +157,11 @@ def gemm_kernel(
         for tile_iter in cutlass.range(tiles_per_cta, unroll=1):
             tile_idx = tile_iter * num_persistent + bidx
             if tile_idx < total_tiles:
-                bid_m = tile_idx // grid_n
-                bid_n = tile_idx % grid_n
+                tiles_per_group = GROUP_M * grid_n
+                group_idx = tile_idx // tiles_per_group
+                in_group = tile_idx % tiles_per_group
+                bid_m = group_idx * GROUP_M + in_group // grid_n
+                bid_n = in_group % grid_n
 
                 tiler = (BLK_M, BLK_N, BLK_K)
                 gA = cute.local_tile(mA, tiler=tiler, coord=(bid_m, bid_n, None), proj=(1, None, 1))
@@ -230,8 +234,11 @@ def gemm_kernel(
         for tile_iter in cutlass.range(tiles_per_cta, unroll=1):
             tile_idx = tile_iter * num_persistent + bidx
             if tile_idx < total_tiles:
-                bid_m = tile_idx // grid_n
-                bid_n = tile_idx % grid_n
+                tiles_per_group = GROUP_M * grid_n
+                group_idx = tile_idx // tiles_per_group
+                in_group = tile_idx % tiles_per_group
+                bid_m = group_idx * GROUP_M + in_group // grid_n
+                bid_n = in_group % grid_n
 
                 tiler = (BLK_M, BLK_N, BLK_K)
                 gA = cute.local_tile(mA, tiler=tiler, coord=(bid_m, bid_n, None), proj=(1, None, 1))
