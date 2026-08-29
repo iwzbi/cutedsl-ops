@@ -1,4 +1,4 @@
-.PHONY: help install sync style style-unsafe quality run-gemm run-flash run-moe test
+.PHONY: help install sync style style-unsafe quality run-gemm run-flash run-moe bench-gemm bench-gemm-ncu bench-flash bench-moe test
 
 PYTHON := .venv/bin/python
 OPS := gemm flash_attn megamoe
@@ -34,5 +34,17 @@ run-moe: ## Run the MegaMoE operator harness
 	$(PYTHON) ops/megamoe/run_megamoe.py
 
 run-all: $(addprefix run-,$(OPS)) ## Run every operator harness
+
+bench-gemm: ## Benchmark GEMM (4096³ fp16, timing + theoretical analysis)
+	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096
+
+bench-gemm-ncu: ## Benchmark GEMM with ncu profiling (hardware-level analysis)
+	$(PYTHON) ops/gemm/run_gemm.py 4096 4096 4096 --ncu
+
+bench-flash: ## Benchmark FlashAttention
+	$(PYTHON) ops/flash_attn/run_flash_attn.py
+
+bench-moe: ## Benchmark MegaMoE
+	$(PYTHON) ops/megamoe/run_megamoe.py
 
 test: quality ## Lint gate used as the test target (kernels need a GPU)

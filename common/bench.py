@@ -294,58 +294,48 @@ def print_bench_report(
     print(f"  {meta.name} {shape_str} {dtype_str} | {gpu['name']} {gpu['compute_capability']} | {gpu['num_sms']} SMs")
     print(sep)
 
-    # Performance
-    print(f"  {'Time':<20} {ms:.4f} ms/call  ({timing_mode}, {warmup} warmup + {iterations} iters)")
-    print(f"  {'TFLOPS':<20} {tflops:,.1f} / {peak_fp16:,.0f} peak ({peak_pct:.1f}%)")
+    # --- Performance ---
+    print("  --- Performance ---")
+    print(f"  {'Time':<24} {ms:.4f} ms/call  ({timing_mode}, {warmup} warmup + {iterations} iters)")
+    print(f"  {'TFLOPS':<24} {tflops:,.1f} / {peak_fp16:,.0f} peak ({peak_pct:.1f}%)")
     print()
 
-    # Memory
-    print(f"  {'Bandwidth':<20} {bandwidth_gbs:,.1f} GB/s ({hbm_pct:.1f}% of {gpu['hbm_bw_gbs']:,.0f} GB/s HBM)")
-    print(f"  {'Arith intensity':<20} {ai:,.0f} FLOP/byte  ({'compute-bound' if ai > 10 else 'memory-bound'})")
-    print(f"  {'gmem I/O':<20} {gmem_bytes / 1e6:,.1f} MB")
-    print()
-
-    # Grid / Block
-    print(f"  {'Grid':<20} {grid_blocks} blocks → {waves:.1f} waves on {gpu['num_sms']} SMs")
-    print(f"  {'Block':<20} {bt} threads ({meta.block_description})")
+    # --- Theoretical Analysis ---
+    print("  --- Theoretical Analysis ---")
+    print(f"  {'Bandwidth':<24} {bandwidth_gbs:,.1f} GB/s ({hbm_pct:.1f}% of {gpu['hbm_bw_gbs']:,.0f} GB/s HBM)")
+    print(f"  {'Arith intensity':<24} {ai:,.0f} FLOP/byte  ({'compute-bound' if ai > 10 else 'memory-bound'})")
+    print(f"  {'gmem I/O':<24} {gmem_bytes / 1e6:,.1f} MB")
+    print(f"  {'Grid':<24} {grid_blocks} blocks -> {waves:.1f} waves on {gpu['num_sms']} SMs")
+    print(f"  {'Block':<24} {bt} threads ({meta.block_description})")
     tile_str = ", ".join(f"{k}={v}" for k, v in meta.tile_dims.items())
-    print(f"  {'Tile':<20} {tile_str}")
-    print(f"  {'SMEM/block':<20} {smem_kb:,.0f} KB / {gpu['max_smem_per_sm'] // 1024} KB per SM")
-    print()
-
-    # Occupancy (theoretical)
+    print(f"  {'Tile':<24} {tile_str}")
+    print(f"  {'SMEM/block':<24} {smem_kb:,.0f} KB / {gpu['max_smem_per_sm'] // 1024} KB per SM")
     print(
-        f"  {'Occupancy (est)':<20} {occ_blocks} block/SM, {occ_threads}/{gpu['max_threads_per_sm']} threads ({occ_pct:.1f}%)"
+        f"  {'Occupancy (est)':<24} {occ_blocks} block/SM, {occ_threads}/{gpu['max_threads_per_sm']} threads ({occ_pct:.1f}%)"
     )
-    print(f"  {'Limiter':<20} {occ_limiter}")
+    print(f"  {'Limiter':<24} {occ_limiter}")
     if ncu_data and ncu_data.get("regs_per_thread") is not None:
         regs = int(ncu_data["regs_per_thread"])
         reg_usage = regs * bt / gpu["max_regs_per_sm"] * 100
         print(
-            f"  {'Registers':<20} {regs}/thread x {bt} = {regs * bt:,}/{gpu['max_regs_per_sm']:,} ({reg_usage:.1f}%)"
+            f"  {'Registers (ncu)':<24} {regs}/thread x {bt} = {regs * bt:,}/{gpu['max_regs_per_sm']:,} ({reg_usage:.1f}%)"
         )
     else:
-        print(f"  {'Registers':<20} unknown (use: --ncu)")
+        print(f"  {'Registers':<24} unknown (use: --ncu)")
     print()
-
-    # Extra operator-specific info
     if meta.extra:
         for label, val in meta.extra.items():
-            print(f"  {label + ' (extra)':<20} {val}")
+            print(f"  {label + ' (extra)':<24} {val}")
         print()
-
-    # L2 / workspace
-    print(f"  {'L2 cache':<20} {l2_mb:,.0f} MB")
-    print(f"  {'Workspaces':<20} {ws_count} x {gmem_bytes / 1e6:,.1f} MB = {ws_bytes / 1e6:,.1f} MB (L2 flush)")
+    print(f"  {'L2 cache':<24} {l2_mb:,.0f} MB")
+    print(f"  {'Workspaces':<24} {ws_count} x {gmem_bytes / 1e6:,.1f} MB = {ws_bytes / 1e6:,.1f} MB (L2 flush)")
     print()
-
-    # GPU hardware
-    print(f"  {'GPU clock':<20} {gpu['clock_mhz']:,.0f} MHz")
+    print(f"  {'GPU clock':<24} {gpu['clock_mhz']:,.0f} MHz")
     print(
-        f"  {'HBM':<20} {gpu['mem_clock_mhz']:,.0f} MHz x {gpu['bus_width_bits']}-bit → {gpu['hbm_bw_gbs']:,.0f} GB/s"
+        f"  {'HBM':<24} {gpu['mem_clock_mhz']:,.0f} MHz x {gpu['bus_width_bits']}-bit -> {gpu['hbm_bw_gbs']:,.0f} GB/s"
     )
     print(
-        f"  {'HW limits/SM':<20} smem {gpu['max_smem_per_sm'] // 1024}KB, threads {gpu['max_threads_per_sm']}, blocks {gpu['max_blocks_per_sm']}, regs {gpu['max_regs_per_sm']}"
+        f"  {'HW limits/SM':<24} smem {gpu['max_smem_per_sm'] // 1024}KB, threads {gpu['max_threads_per_sm']}, blocks {gpu['max_blocks_per_sm']}, regs {gpu['max_regs_per_sm']}"
     )
 
     # ncu actual data
@@ -483,9 +473,8 @@ def parse_ncu_output(text: str) -> dict:
     data: dict = {}
 
     def metric(name: str, default: float | None = None) -> float | None:
-        """Match a table row: '  <name>  <unit>  <value>'."""
-        # ncu table rows: leading spaces, metric name, whitespace, unit, whitespace, numeric value
-        pattern = rf"^\s+{name}\s+\S+\s+([\d.]+)\s*$"
+        """Match a table row and extract the last numeric value on the line."""
+        pattern = rf"^\s+{name}.*?([\d.]+)\s*$"
         m = re.search(pattern, text, re.MULTILINE)
         if m:
             try:
@@ -497,12 +486,17 @@ def parse_ncu_output(text: str) -> dict:
     # Speed of Light
     data["compute_throughput_pct"] = metric(r"Compute \(SM\) Throughput")
     data["sm_active_cycles"] = metric(r"SM Active Cycles")
+    data["sm_busy_pct"] = metric(r"SM Busy")
     data["memory_throughput_pct"] = metric(r"Memory Throughput")
     data["dram_throughput_pct"] = metric(r"DRAM Throughput")
     data["l1_tex_throughput_pct"] = metric(r"L1/TEX Cache Throughput")
     data["l2_throughput_pct"] = metric(r"L2 Cache Throughput")
     sm_freq_ghz = metric(r"SM Frequency")
     data["sm_frequency_mhz"] = sm_freq_ghz * 1000 if sm_freq_ghz is not None else None
+
+    # Compute Workload Analysis
+    data["executed_ipc_active"] = metric(r"Executed Ipc Active")
+    data["issue_slots_busy_pct"] = metric(r"Issue Slots Busy")
 
     # Occupancy
     data["theoretical_occupancy_pct"] = metric(r"Theoretical Occupancy")
@@ -532,6 +526,11 @@ def parse_ncu_output(text: str) -> dict:
     if sp_match:
         data["est_speedup_stall_pct"] = float(sp_match.group(1))
 
+    # SM load imbalance speedup (narrative)
+    imb_match = re.search(r"Est\.\s*Speedup:\s*([\d.]+)%.*?due to.*?[Ss]M\s+[Ll]oad\s+[Ii]mbalance", text, re.DOTALL)
+    if imb_match:
+        data["est_speedup_imbalance_pct"] = float(imb_match.group(1))
+
     # L2 hit rate
     data["l2_hit_rate_pct"] = metric(r"L2 Hit")
 
@@ -544,57 +543,91 @@ def print_ncu_report(
     benchmark_peak_pct: float,
     theoretical_occ_pct: float,
 ) -> None:
-    """Print ncu actual data alongside theoretical analysis + bottleneck summary."""
+    """Print ncu actual hardware data with grouped metrics + bottleneck summary."""
+    W = 24
+
     print()
-    print("  --- ncu Profiling (actual hardware data) ---")
+    print("  --- ncu Profiling (Actual Hardware Data) ---")
 
     # Speed of Light
+    print()
     ct = ncu.get("compute_throughput_pct")
     if ct is not None:
         gap = ct - benchmark_peak_pct
-        print(f"  {'TC Throughput':<20} {ct:.2f}%   (benchmark: {benchmark_peak_pct:.1f}% → gap {gap:+.1f}%)")
+        print(f"  {'TC Throughput':<{W}} {ct:.2f}%   (benchmark: {benchmark_peak_pct:.1f}% -> gap {gap:+.1f}%)")
+    if ncu.get("sm_busy_pct") is not None:
+        print(f"  {'SM Busy':<{W}} {ncu['sm_busy_pct']:.2f}%")
     if ncu.get("memory_throughput_pct") is not None:
-        print(f"  {'Memory Throughput':<20} {ncu['memory_throughput_pct']:.2f}%")
+        print(f"  {'Memory Throughput':<{W}} {ncu['memory_throughput_pct']:.2f}%")
     if ncu.get("dram_throughput_pct") is not None:
-        print(f"  {'DRAM Throughput':<20} {ncu['dram_throughput_pct']:.2f}%")
+        print(f"  {'DRAM Throughput':<{W}} {ncu['dram_throughput_pct']:.2f}%")
+    if ncu.get("l1_tex_throughput_pct") is not None:
+        print(f"  {'L1/TEX Throughput':<{W}} {ncu['l1_tex_throughput_pct']:.2f}%")
+    if ncu.get("l2_throughput_pct") is not None:
+        print(f"  {'L2 Throughput':<{W}} {ncu['l2_throughput_pct']:.2f}%")
     if ncu.get("sm_frequency_mhz") is not None:
-        print(f"  {'SM Frequency':<20} {ncu['sm_frequency_mhz']:.0f} MHz (boost: {gpu['clock_mhz']:.0f} MHz)")
-    print()
+        print(f"  {'SM Frequency':<{W}} {ncu['sm_frequency_mhz']:.0f} MHz (boost: {gpu['clock_mhz']:.0f} MHz)")
 
-    # Occupancy
+    # Compute Workload Analysis
+    print()
+    if ncu.get("executed_ipc_active") is not None:
+        print(f"  {'IPC Active':<{W}} {ncu['executed_ipc_active']:.2f} inst/cycle")
+    if ncu.get("issue_slots_busy_pct") is not None:
+        print(f"  {'Issue Slots Busy':<{W}} {ncu['issue_slots_busy_pct']:.2f}%")
+
+    # Scheduler & Warp State
+    print()
+    ne = ncu.get("no_eligible_pct")
+    if ne is not None:
+        print(
+            f"  {'No Eligible Warps':<{W}} {ne:.2f}%  ({'warps mostly stalled' if ne > 80 else 'some warp parallelism'})"
+        )
+    for key, label in [
+        ("one_or_more_eligible_pct", "One+ Eligible"),
+        ("active_warps_per_sched", "Active Warps/Sched"),
+        ("eligible_warps_per_sched", "Eligible Warps/Sched"),
+        ("issued_warp_per_sched", "Issued Warps/Sched"),
+        ("warp_cycles_per_issued", "Cycles/Issued Inst"),
+    ]:
+        val = ncu.get(key)
+        if val is not None:
+            print(f"  {label:<{W}} {val:.2f}")
+
+    # Stall Analysis
+    if ncu.get("top_stall_reason"):
+        wcpi = ncu.get("warp_cycles_per_issued") or 0
+        cycles = ncu.get("top_stall_cycles", 0)
+        pct = cycles / wcpi * 100 if wcpi else 0
+        reason = ncu["top_stall_reason"].split("\n")[0].strip()[:60]
+        print(f"  {'Top Stall':<{W}} {reason}")
+        print(f"  {'  (detail)':<{W}} {pct:.1f}% of stall time, {cycles:.1f} cycles/inst")
+
+    # Occupancy (Actual)
+    print()
     ao = ncu.get("achieved_occupancy_pct")
     to = ncu.get("theoretical_occupancy_pct")
     if ao is not None:
         theo = to if to is not None else theoretical_occ_pct
         gap = theo - ao
-        print(f"  {'Achieved Occupancy':<20} {ao:.2f}%  (theoretical: {theo:.2f}% → gap {gap:.2f}%)")
+        print(f"  {'Achieved Occupancy':<{W}} {ao:.2f}%  (theoretical: {theo:.2f}% -> gap {gap:.2f}%)")
     if ncu.get("regs_per_thread") is not None:
         regs = int(ncu["regs_per_thread"])
-        print(f"  {'Registers':<20} {regs}/thread")
-    print()
+        print(f"  {'Registers':<{W}} {regs}/thread")
+    for key, label in [
+        ("block_limit_regs", "Block Limit (regs)"),
+        ("block_limit_smem", "Block Limit (smem)"),
+    ]:
+        val = ncu.get(key)
+        if val is not None:
+            print(f"  {label:<{W}} {int(val)} block/SM")
 
-    # Scheduler
-    ne = ncu.get("no_eligible_pct")
-    if ne is not None:
-        print(
-            f"  {'No Eligible Warps':<20} {ne:.2f}%  ({'warps mostly stalled' if ne > 80 else 'some warp parallelism'})"
-        )
-    if ncu.get("eligible_warps_per_sched") is not None:
-        print(f"  {'Eligible Warps/Sched':<20} {ncu['eligible_warps_per_sched']:.2f}")
+    # Memory
     print()
-
-    # Warp State / Stall Analysis
-    wcpi = ncu.get("warp_cycles_per_issued")
-    if wcpi is not None:
-        print(f"  {'Cycles/Issued Inst':<20} {wcpi:.2f}")
-    if ncu.get("top_stall_reason"):
-        cycles = ncu.get("top_stall_cycles", 0)
-        pct = cycles / wcpi * 100 if wcpi else 0
-        reason = ncu["top_stall_reason"].split("\n")[0].strip()[:60]
-        print(f"  {'Top Stall':<20} {reason} ({pct:.1f}%, {cycles:.1f} cycles)")
-    print()
+    if ncu.get("l2_hit_rate_pct") is not None:
+        print(f"  {'L2 Hit Rate':<{W}} {ncu['l2_hit_rate_pct']:.2f}%")
 
     # Bottleneck Summary
+    print()
     print("  --- Bottleneck Summary ---")
     bottlenecks: list[tuple[str, float, str]] = []
 
@@ -610,7 +643,7 @@ def print_ncu_report(
 
     imb = ncu.get("est_speedup_imbalance_pct", 0)
     if imb > 0:
-        bottlenecks.append(("SM load imbalance", imb, "grid tail → Split-K"))
+        bottlenecks.append(("SM load imbalance", imb, "grid tail -> Split-K"))
 
     ct_val = ncu.get("compute_throughput_pct") or 0
     if ct_val > 0:
@@ -624,11 +657,24 @@ def print_ncu_report(
                 )
             )
 
+    ao_val = ncu.get("achieved_occupancy_pct") or 0
+    to_val = ncu.get("theoretical_occupancy_pct") or 0
+    if to_val > 0 and ao_val > 0:
+        occ_gap = to_val - ao_val
+        if occ_gap > 2:
+            bottlenecks.append(
+                (
+                    "Achieved < theoretical occ",
+                    occ_gap,
+                    f"{ao_val:.1f}% vs {to_val:.1f}% (producer idle warps)",
+                )
+            )
+
     for i, (name, speedup, detail) in enumerate(bottlenecks, 1):
         label = "Primary" if i == 1 else f"#{i}"
-        print(f"  {label:<20} {name} → {detail}")
+        print(f"  {label:<{W}} {name} -> {detail}")
         if speedup > 0:
-            print(f"  {'':<20} est. speedup: {speedup:.1f}%")
+            print(f"  {'':<{W}} est. speedup: {speedup:.1f}%")
 
     if not bottlenecks:
         print("  No significant bottlenecks detected.")

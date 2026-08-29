@@ -278,30 +278,39 @@ benchmark 报 1.98 GHz（boost clock）,ncu 实测 1.80 GHz（sustained clock）
 ncu GUI 在 Speed of Light 旁边会显示 **Roofline Chart**——kernel 在 roofline 模型上的位置:
 
 ```
-TFLOPS
-  │
-  │     FP32 peak ────┐
-  │                   ╱
-  │                  ╱  ← compute roofline
-  │                 ╱
-  │    ●kernel     ╱     ← 你的 kernel 在这里
-  │               ╱
-  │              ╱
-  │─────────────╱────────────── AI (FLOP/Byte)
-  0             ↑
-  AI where compute=memory
+  TFLOPS
+    │
+    │         Compute Peak (148T FP16)
+    │  ─ ─ ─ ─┬──────────────────────────
+    │         │              ● kernel (AI=1365, 130.6T)
+    │         │
+    │        /│
+    │       / │
+    │      /  │
+    │     /   │
+    │    /    │
+    │   /     │
+    │  /      │
+    │ /       │
+    │/        │
+    ─────────┼────────────────────────── AI (FLOP/Byte)
+    0       ~37                        1365
+            ↑
+         ridge point
+         (compute = memory crossover)
 ```
 
 **怎么读 Roofline Chart**:
 - **X 轴**: Arithmetic Intensity (FLOP/Byte) — 每 byte 数据做了多少 FLOP
 - **Y 轴**: Achieved TFLOPS — kernel 实际性能
-- **斜线**: Memory Bandwidth Roofline — `TFLOPS = AI × HBM_BW`
-- **水平线**: Compute Peak Roofline — `FP16 peak` / `FP32 peak` / `FP64 peak`
+- **斜线** (从原点上升): Memory Bandwidth Roofline — `TFLOPS = AI × HBM_BW`,斜率 = HBM 带宽
+- **水平线** (顶部): Compute Peak Roofline — `FP16 peak` / `FP32 peak` / `FP64 peak`
+- **ridge point** (两线交点): `AI_ridge = Peak_TFLOPS / HBM_BW`,H20 上 = 148/4.023 ≈ 37 FLOP/Byte
 - **kernel 位置**:
-  - 在斜线上 → **memory-bound**(被带宽限制)
-  - 在水平线上 → **compute-bound**(被算力限制)
-  - 在两线交点左侧 → memory-bound;右侧 → compute-bound
-  - 在两线交点附近 → **balanced**(最优位置)
+  - 在斜线上 → **memory-bound**(被带宽限制,左侧)
+  - 在水平线上 → **compute-bound**(被算力限制,右侧)
+  - AI < ridge → memory-bound;AI > ridge → compute-bound
+  - 在 ridge 附近 → **balanced**(最优位置)
 
 我们的 GEMM:AI = 1365 FLOP/Byte,Achieved = 130.6 TFLOPS → 远在交点右侧 → **compute-bound**(与 Speed of Light 一致)。
 
