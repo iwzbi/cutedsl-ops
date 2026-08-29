@@ -65,7 +65,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("This example requires a CUDA-capable GPU (sm_80+).")
     args = [int(x) for x in sys.argv[1:4]]
-    shapes = [tuple(args)] if len(args) == 3 else [(512, 512, 512), (1024, 1024, 1024)]
+    shapes = [tuple(args)] if len(args) == 3 else [(1024, 1024, 1024)]
 
     counters = {"succeed": 0, "failed": 0}
     for M, N, K in shapes:

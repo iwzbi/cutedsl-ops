@@ -34,6 +34,7 @@ nvidia-cutlass-dsl-libs-base = { path = "vendor/nvidia_cutlass_dsl_libs_base-4.7
 line-length = 119
 indent-width = 4
 target-version = "py310"
+exclude = ["**/.null-ls_*"]
 
 [tool.ruff.lint]
 preview = false
@@ -70,6 +71,7 @@ ignore = [
   "PERF401",
   "PERF403",
   "PLR0913",
+  "PLR0915", # too-many-statements — DSL kernel scaffolds legitimately exceed 50
   "PLR0917", # too-many-positional-arguments — DSL kernels & harness defaults legitimately exceed 5
   "PLR2004",
   "SIM102",

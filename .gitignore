@@ -49,3 +49,6 @@ opencode.local.json
 
 # opencode runtime state (session/continuation tracking)
 .omo/
+.opencode/
+*.bak
+tui.json

@@ -4,6 +4,8 @@
   "plugin": [
     "opencode-pty",
     "oh-my-openagent@latest",
-    "superpowers@git+https://github.com/obra/superpowers.git"
+    "superpowers@git+https://github.com/obra/superpowers.git",
+    "@tarquinen/opencode-dcp",
+    "@mohak34/opencode-notifier"
   ]
 }
