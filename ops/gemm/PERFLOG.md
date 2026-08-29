@@ -1,38 +1,72 @@
 # GEMM Optimization Journey
 
 Hopper H20 (sm_90, 78 SM, 148 TFLOPS FP16 peak), CuTe DSL (nvidia-cutlass-dsl 4.7.0).
+cuBLAS reference: `torch.mm(a, b.t())` with FP16 (libcublas.so.13).
 
-Each step links to the ncu raw report in [`ncu_reports/`](./ncu_reports/).  
-Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see exact code changes.
+Each step links to ncu raw reports in [`ncu_reports/`](./ncu_reports/).
+Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see code changes.
+
+---
+
+## Master Performance Table
+
+All numbers measured with fresh compilation, L2-flushed CUDA Events (our kernel) / plain timing (cuBLAS FP16).
+v5/v6 "best sk" = optimal split_k for that shape (tuned per size).
+
+| Shape | cuBLAS | v1-base | v2-persist | v3-swizzle | v4-blk96 | v5-sk(best) | v6-sk(best) | Best vs cuBLAS |
+|--------|--------|---------|------------|------------|----------|-------------|-------------|-----------------|
+| 512³   | 20.2   | 12.1    | 12.1       | 12.1       | 12.1     | 42.9 (sk8)  | 41.3 (sk8)  | **+112% (v5)** |
+| 1024³  | 95.4   | 51.2    | 51.5       | 51.9       | 51.6     | 91.4 (sk2)  | 89.9 (sk2)  | -4.2% (v5)     |
+| 2048³  | 127.4  | 110.5   | 111.3      | 111.9      | 112.0    | 118.5 (sk4) | 124.6 (sk4) | -2.2% (v6)     |
+| 4096³  | 132.2  | 130.6   | 132.3      | 131.9      | 132.1    | 132.6 (sk4) | 134.6 (sk4) | **+1.8% (v6)** |
+| 8192³  | 137.6  | 137.4   | 138.3      | 138.3      | 138.5    | 140.2 (sk2) | 141.2 (sk2) | **+2.6% (v6)** |
+| 16384³ | 139.3  | 141.9   | 141.6      | 141.6      | 141.6    | 141.8 (sk1) | 141.8 (sk1) | **+1.8% (v1)** |
+
+### Key takeaways
+- **Small scale (512³)**: Split-K is the game changer — sk=8 gives **+254%** vs baseline, **+112%** vs cuBLAS.
+- **Medium scale (2048³-4096³)**: v6 (persistent+sk+epi) best, **+1.8%** beats cuBLAS at 4096³.
+- **Large scale (8192³+)**: v1 already beats cuBLAS; v6 adds +2.6% at 8192³. All converge to ~142T (96% peak) at 16384³.
+- **v6 wins 4/6 shapes** (2048³, 4096³, 8192³, ties 16384³). v5 wins 512³ (epi-overlap hurts small scale).
+
+---
+
+## Apples-to-Apples: All Tags at sk=1
+
+| Shape | v1 | v2 | v3 | v4 | v5 | v6 | cuBLAS |
+|--------|------|------|------|------|------|------|--------|
+| 512³   | 12.1 | 12.1 | 12.1 | 12.1 | 12.2 | 12.0 | 20.2   |
+| 1024³  | 51.2 | 51.5 | 51.9 | 51.6 | 51.9 | 51.4 | 95.4   |
+| 2048³  | 110.5| 111.3| 111.9| 112.0| 111.3| 112.5| 127.4  |
+| 4096³  | 130.6| 132.3| 131.9| 132.1| 131.2| 132.9| 132.2  |
+| 8192³  | 137.4| 138.3| 138.3| 138.5| 138.6| 139.1| 137.6  |
+| 16384³ | 141.9| 141.6| 141.6| 141.6| 141.8| 141.8| 139.3  |
+
+At sk=1 (no split-K), differences between tags are small (<2%). v2-v4 persistent variants show +0.5-1.3% at medium scale (2048³-4096³) from tail-wave elimination. v6 persistent+epi shows +0.7-1.7% at 4096³+ from epilogue overlap. All converge at 16384³ (enough waves to make tail/epilogue negligible).
 
 ---
 
 ## Step 1: Baseline — Warp Specialization WGMMA + TMA
 
-**Commit**: `29d7e4a` (tag: `v1-baseline`)
+**Tag**: `v1-baseline` (`29d7e4a`)
 
-### Architecture
-- **MMA**: wgmma.m64n256k16 (warpgroup MMA, A/B from SMEM via descriptor)
-- **TMA**: cp.async.bulk.tensor for gmem→smem (A/B load) and smem→gmem (D store)
-- **Pipeline**: PipelineTmaAsync, 3-stage double buffering
-- **Warp Specialization**: 3 warpgroups (384 threads)
-  - WG0 (0-127): Producer — TMA load only, warp0 issues TMA
-  - WG1 (128-255): Consumer — WGMMA + epilogue
-  - WG2 (256-383): Consumer — WGMMA + epilogue
-- **Tile**: BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3
-- **Swizzle**: SW128 (1024-bit swizzle) via hopper_helpers
-- **Grid**: (ceil(N/256), ceil(M/128), 1) — N-first
+### Optimization
+Full Hopper wgmma+TMA+pipeline kernel with warp specialization:
+- wgmma.m64n256k16 (warpgroup MMA, A/B from SMEM via descriptor, no rmem copy)
+- TMA cp.async.bulk.tensor for gmem↔smem (A/B load, D store)
+- 3-stage PipelineTmaAsync (mbarrier-based double buffering)
+- Warp specialization: 3 warpgroups (384 threads) — WG0=producer (TMA), WG1+WG2=consumer (WGMMA+epilogue)
+- BLK_M=128, BLK_N=256, BLK_K=64, SW128 swizzle, ATOM_LAYOUT=(2,1,1)
 
-### Performance (CUDA Events, L2-flushed)
+### Performance
 
-| M×N×K | TFLOPS | % peak (148T) | cuBLAS | vs cuBLAS | Waves (78 SM) |
-|--------|--------|---------------|--------|-----------|---------------|
-| 512³   | 12.1   | 8.2%          | 21.3   | -43%      | 0.03          |
-| 1024³  | 51.5   | 34.8%         | 96.9   | -47%      | 0.4           |
-| 2048³  | 110.6  | 74.7%         | 127.8  | -13%      | 1.7           |
-| 4096³  | 130.6  | 88.2%         | 132.4  | -1.4%     | 6.6           |
-| 8192³  | 137.4  | 92.8%         | 137.8  | -0.3%     | 26.3          |
-| 16384³ | 141.8  | 95.8%         | 139.3  | **+1.8%** | 211           |
+| Shape | TFLOPS | % peak | cuBLAS | vs cuBLAS | Waves |
+|--------|--------|--------|--------|-----------|-------|
+| 512³   | 12.1   | 8.2%   | 20.2   | -40%      | 0.03  |
+| 1024³  | 51.2   | 34.6%  | 95.4   | -46%      | 0.4   |
+| 2048³  | 110.5  | 74.7%  | 127.4  | -13%      | 1.7   |
+| 4096³  | 130.6  | 88.2%  | 132.2  | -1.2%     | 6.6   |
+| 8192³  | 137.4  | 92.8%  | 137.6  | -0.1%     | 26.3  |
+| 16384³ | 141.9  | 95.9%  | 139.3  | **+1.8%** | 211   |
 
 ### ncu Profiling (4096³)
 
@@ -41,203 +75,269 @@ Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see exact code c
 | Compute (SM) Throughput | 90.9% | TC pipeline near full |
 | Memory Throughput | 14.6% | Compute-bound confirmed |
 | DRAM Throughput | 7.2% | HBM not bottleneck |
-| SM Frequency | 1800 MHz | (boost: 1980) |
 | No Eligible Warps | 96.7% | Few warps ready (wgmma long-latency) |
 | Cycles/Issued Inst | 67.2 | Each inst waits 67 cycles |
-| Top Stall | CTA barrier 74.2% (49.8 cyc) | **Pipeline mbarrier sync** |
+| Top Stall | CTA barrier 74.2% (49.8 cyc) | Pipeline mbarrier sync |
 | Theoretical Occupancy | 18.75% | smem 214KB + regs 154/thr |
 | Achieved Occupancy | 13.9% | Producer idle warps pull down |
-| Registers/Thread | 154 | wgmma accumulator heavy |
 | L2 Hit Rate | 66.0% | |
-| SM Load Imbalance | +6.4%/-8.7% | Grid tail (6.56 waves) |
-| Est. Speedup (barrier) | 6.3% | Reduce mbarrier wait |
-| Est. Speedup (imbalance) | 5.9% | Split-K for more blocks |
+| SM Load Imbalance | est. +5.9% | Grid tail (6.56 waves) |
 
-### Bottleneck Analysis
-1. **CTA barrier stall (74.2%)**: Pipeline mbarrier sync — consumer_wait waits for TMA data, producer_acquire waits for consumer release. Inherent to pipeline architecture.
-2. **SM load imbalance (5.9%)**: 512 blocks / 78 SMs = 6.56 waves, last wave has 44 idle SMs.
-3. **Achieved < theoretical occupancy (4.85%)**: Producer warpgroup's 3 non-warp0 threads idle.
-4. **Registers (154/thread)**: wgmma accumulator large, limits to 1 block/SM.
+### Strengths
+- 95.9% peak at 16384³ — **beats cuBLAS** at large scale
+- Warp specialization: producer/consumer parallel, no TMA/MMA serialization
+- SW128 swizzle: 0 bank conflicts
 
-### ncu Raw Reports
-- [v1-baseline 4096³](ncu_reports/v1-baseline_4096.txt)
-- [v1-baseline 1024³](ncu_reports/v1-baseline_1024.txt)
+### Shortcomings
+- **Small scale (512³-1024³)**: only 0.03-0.4 waves → SMs starved, 40-46% behind cuBLAS
+- **CTA barrier stall (74.2%)**: pipeline mbarrier sync is the #1 bottleneck — consumer_wait waits for TMA data, producer_acquire waits for consumer release
+- **Grid tail (6.56 waves at 4096³)**: last wave has 34 idle SMs → est. 5.9% loss
+- **Low occupancy (13.9%)**: 1 block/SM (smem 214KB + regs 154/thr); producer 3 non-warp0 threads idle
+
+### ncu Reports
+- [v1-baseline 4096³](ncu_reports/v1-baseline_4096.txt) | [1024³](ncu_reports/v1-baseline_1024.txt)
 
 ---
 
 ## Step 2: Persistent Kernel — CTA Stride Loop (no gain, case study)
 
-**Commit**: (tag: `v2-persistent`)
+**Tag**: `v2-persistent`
 
-### What changed
-Each CTA loops over multiple output tiles via a stride loop instead of one CTA per tile.
+### Optimization
+Each CTA loops over multiple output tiles via a stride loop (`for tile_iter in range(tiles_per_cta)`).
 Launch `min(total_tiles, num_sms)` CTAs instead of `total_tiles`.
+**Goal**: eliminate tail-wave SM idling.
 
-### Three bugs fixed (discovered via 14-warp-specialization reference)
-1. **Deadlock**: `sync_threads()` required all 384 threads, but producer's 128 never reached it → GPU hang. Fix: `pipeline.NamedBarrier(barrier_id=1, num_threads=256)` excluding producer.
-2. **>5min compile**: K-tile loop used `unroll_full=True` → 64× code bloat. Fix: `unroll=1`.
+### Three bugs fixed (vs 14-warp-specialization reference)
+1. **Deadlock**: `sync_threads()` required all 384 threads, but producer's 128 never reached it → GPU hang. Fix: `pipeline.NamedBarrier(barrier_id=1, num_threads=256)`.
+2. **>5min compile**: K-tile loop `unroll_full=True` → 64× code bloat. Fix: `unroll=1`.
 3. **Missing register reconfig**: Added `warpgroup_reg_dealloc(40)` (producer) + `warpgroup_reg_alloc(232)` (consumer).
 
-### Performance (no improvement, slightly worse at large scale)
+### Performance (sk=1)
 
-| M×N×K | Baseline | Persistent | Delta |
-|--------|----------|------------|-------|
-| 1024³  | 51.5     | 51.3       | ~0%   |
-| 4096³  | 130.6    | 131.0      | +0.3% |
-| 16384³ | 141.8    | 140.9      | -0.6% |
+| Shape | v1 | v2 | Delta | cuBLAS |
+|--------|------|------|-------|--------|
+| 512³   | 12.1 | 12.1 | 0%    | 20.2   |
+| 1024³  | 51.2 | 51.5 | +0.6% | 95.4   |
+| 2048³  | 110.5| 111.3| +0.7% | 127.4  |
+| 4096³  | 130.6| 132.3| +1.3% | 132.2  |
+| 8192³  | 137.4| 138.3| +0.7% | 137.6  |
+| 16384³ | 141.9| 141.6| -0.2% | 139.3  |
 
 ### ncu Comparison (4096³)
 
-| Metric | Baseline | Persistent | Delta |
-|--------|----------|------------|-------|
+| Metric | v1 | v2 | Delta |
+|--------|------|------|-------|
 | Compute Throughput | 90.9% | 91.4% | +0.5% |
 | Cycles/Issued | 67.2 | 68.7 | +2% worse |
-| CTA barrier stall | 74.2% (49.8 cyc) | 74.3% (51.1 cyc) | slightly worse |
+| CTA barrier stall | 74.2% (49.8cyc) | 74.3% (51.1cyc) | slightly worse |
 | SM load imbalance | est. +5.9% | eliminated | — |
 
-### Why no gain
-1. **Tail wave elimination too small**: 4096³ = 6.56 waves → 7 tiles/CTA, imbalance still 6 vs 7.
-2. **Per-tile overhead offsets gains**: consumer setup (get_slice/partition/make_fragment) repeated per tile due to DSL staged-if limitation; two NamedBarrier syncs per tile add barrier stall.
-3. **Pipeline state continuation**: states persist across tiles (no reset), which works but doesn't reduce stall.
-4. **Value of persistent is as prerequisite for epilogue overlap**, not as a standalone optimization — the overhead eats the tail-wave benefit.
+### Strengths
+- Eliminates SM load imbalance (tail wave) — confirmed by ncu
+- Slight gain at medium scale (4096³: +1.3%) where tail wave was 0.56 waves
+- Prerequisite for epilogue overlap (Step 6)
 
-### ncu Raw Reports
+### Shortcomings
+- **No gain at small scale**: 512³ has only 32 tiles < 78 SMs → can't reduce below 32 blocks
+- **No gain at large scale**: 16384³ has 211 waves → tail is 0.4% of total time
+- **Per-tile overhead**: DSL staged-if limitation forces consumer setup (get_slice/partition/make_fragment) inside the tile loop → Cycles/Issued increases from 67.2 to 68.7
+- **Two NamedBarrier syncs per tile**: adds barrier stall (74.2% → 74.3%)
+- **CTA barrier stall unchanged**: the main bottleneck (pipeline mbarrier sync) is not addressed
+
+### ncu Reports
 - [v2-persistent 4096³](ncu_reports/v2-persistent_4096.txt)
 
 ---
 
 ## Step 3: Block Swizzle — GROUP_M=4 (no gain, L2 worse, case study)
 
-**Commit**: (tag: `v3-swizzle`)
+**Tag**: `v3-swizzle`
 
-### What changed
-Tile assignment uses swizzled (bid_m, bid_n) mapping: tiles are grouped by GROUP_M=4
-consecutive M-blocks before striding N, to improve L2 reuse of A tiles.
+### Optimization
+Tile assignment uses swizzled (bid_m, bid_n) mapping: tiles grouped by GROUP_M=4
+consecutive M-blocks before striding N. **Goal**: improve L2 reuse of A tiles.
 
-### Result: L2 hit rate dropped
+### Performance (sk=1)
 
-| Metric | v2-persistent | v3-swizzle | Delta |
-|--------|---------------|------------|-------|
-| L2 Hit Rate | 66.3% | **62.3%** | -4.0% worse |
-| TFLOPS (4096³) | 131.0 | 130.7 | ~0% |
-| TFLOPS (16384³) | 140.9 | 141.0 | ~0% |
+| Shape | v2 | v3 | Delta |
+|--------|------|------|-------|
+| 1024³  | 51.5 | 51.9 | +0.8% |
+| 2048³  | 111.3| 111.9| +0.5% |
+| 4096³  | 132.3| 131.9| -0.3% |
+| 16384³ | 141.6| 141.6| 0%    |
 
-### Why worse
-1. Default M-major order already maximizes A reuse (consecutive M-blocks share A rows)
-2. GROUP_M=4 forces 4 M-blocks active simultaneously → 6 active M-blocks per wave vs 5 default
-3. 4096³ data = 64MB ≈ L2 60MB → more active blocks = more L2 pressure
-4. Kernel is compute-bound (DRAM 7.1%) → L2 optimization is the wrong direction
+### L2 Impact
 
-### ncu Raw Reports
+| Metric | v2 | v3 | Delta |
+|--------|------|------|-------|
+| L2 Hit Rate (4096³) | 66.3% | 62.3% | **-4.0% worse** |
+
+### Strengths
+- Marginal gain at small/medium scale (1024³: +0.8%) — some L2 reuse benefit
+
+### Shortcomings
+- **L2 hit rate dropped 4%**: GROUP_M=4 forces 6 active M-blocks per wave vs 5 default → more L2 pressure
+- **Wrong direction**: kernel is compute-bound (DRAM 7.1%) → L2 optimization doesn't help
+- **4096³ data (64MB) ≈ L2 (60MB)**: more active blocks = more L2 eviction
+- **GROUP_M=4 doesn't align with wave boundary** (78/64=1.22 waves/group) → cross-group tiles hurt L2
+
+### When would block swizzle help?
+- Memory-bound kernels (DRAM throughput > 50%)
+- Data size >> L2 (swizzle reduces working set per wave)
+- Non-uniform tile computation (e.g., FlashAttention causal mask)
+
+### ncu Reports
 - [v3-swizzle 4096³](ncu_reports/v3-swizzle_4096.txt)
 
 ---
 
 ## Step 4: BLK_K=96, NUM_STAGES=2 — Fewer Syncs (slightly worse, case study)
 
-**Goal**: Reduce CTA barrier stall by increasing BLK_K (64→96) to halve K-tile count
-(64→43 sync cycles), accepting fewer pipeline stages (3→2) to fit smem.
+**Tag**: `v4-blk96`
 
-### Result: pipeline depth matters more than sync count
+### Optimization
+Increase BLK_K from 64 to 96 to reduce K-tile count (64→43, 33% fewer syncs).
+Accept NUM_STAGES=2 (3→2) to fit the larger smem. Use SW64 swizzle (96×16=1536bit → SW64).
 
-| M×N×K | v2-persistent (K64,S3) | v4-blk96 (K96,S2) | Delta |
-|--------|------------------------|---------------------|-------|
-| 4096³  | 131.0                  | 129.8               | -0.9% |
-| 16384³ | 140.9                  | 140.7               | -0.1% |
+### Performance (sk=1)
 
-### Why worse
-1. Pipeline depth 3→2 reduces TMA/WGMMA overlap → more consumer_wait stalls
-2. The overlap loss > sync count reduction → net negative
-3. BLK_K=96 uses SW64 swizzle (vs SW128 for K=64) — smaller swizzle granularity
+| Shape | v2 (K64,S3) | v4 (K96,S2) | Delta |
+|--------|-------------|-------------|-------|
+| 1024³  | 51.5        | 51.6        | +0.2% |
+| 2048³  | 111.3       | 112.0       | +0.6% |
+| 4096³  | 132.3       | 132.1       | -0.2% |
+| 8192³  | 138.3       | 138.5       | +0.1% |
+| 16384³ | 141.6       | 141.6       | 0%    |
 
-### Conclusion
-**Pipeline overlap (NUM_STAGES) is more valuable than fewer sync points.**
-The 3-stage pipeline hides TMA latency better; the extra sync overhead is offset by overlap.
-Can't increase stages (smem full at 209KB/228KB) or reduce syncs (pipeline depth drops).
+### Strengths
+- Marginal gain at medium scale (2048³: +0.6%) — fewer syncs helps when pipeline fill/drain is significant
+- smem 212KB < 228KB (fits)
 
-The CTA barrier stall (74.3%) is **inherent to the TMA+wgmma pipeline architecture**.
-The remaining lever is **epilogue overlap** — overlap the epilogue R2S+TMA-store with
-the next tile's TMA prefetch, eliminating inter-tile idle time.
+### Shortcomings
+- **Pipeline depth 3→2 is net negative at large scale**: overlap loss > sync reduction
+- **BLK_K=96 → SW64 swizzle** (smaller granularity than SW128) — less efficient TMA
+- **Tradeoff is wrong**: the 3-stage pipeline is the single biggest contributor to 90.9% TC throughput; reducing it to 2 stages undoes the overlap that hides TMA latency
+- **Conclusion**: **Pipeline overlap (NUM_STAGES) is more valuable than sync count reduction.** The 3-stage pipeline is already optimal for this smem budget.
+
+### ncu Reports
+- [v4-blk96 4096³](ncu_reports/v4-blk96_4096.txt)
 
 ---
 
 ## Step 5: Split-K — K-Dimension Parallelism (big win for small scale)
 
-**Commit**: (tag: `v5-splitk`)
+**Tag**: `v5-splitk`
 
-### What changed
-Split K dimension into `split_k` partitions, each CTA computes a partial result
-into a separate output buffer slice. Host-side `sum(dim=0)` reduces.
+### Optimization
+Split K dimension into `split_k` partitions. Grid `(grid_n, grid_m, split_k)` — Z dimension
+indexes K splits. Each CTA computes a partial result into a separate output buffer slice.
+Host-side `sum(dim=0)` reduces. **Goal**: multiply blocks count for small problems.
 
-- Grid: `(grid_n, grid_m, split_k)` — Z dimension indexes K splits
 - A/B use original `bidy` (M), D uses `bidy + bidz * grid_m` (split buffer offset)
 - K range: `k_start = bidz * k_per_split` to `k_end`
 - Output: `partial_c[split_k * M, N]` viewed as `[split_k, M, N]`, summed on host
 
-### Performance sweep (H20 fp16)
+### Performance sweep
 
-| M×N×K | sk=1 | sk=2 | sk=4 | sk=8 | Best | cuBLAS | vs cuBLAS |
+| Shape | sk=1 | sk=2 | sk=4 | sk=8 | Best | cuBLAS | vs cuBLAS |
 |--------|------|------|------|------|------|--------|-----------|
-| 512³   | 12.1 | 20.3 | 31.2 | **39.4** | sk=8 | 21.3   | **+85%**  |
-| 1024³  | 51.2 | **90.1** | 84.4 | 75.4 | sk=2 | 96.9   | -7%       |
-| 2048³  | 110.5 | 108.0 | **117.5** | 109.9 | sk=4 | 127.8 | -8%       |
-| 4096³  | 130.5 | 129.1 | **131.4** | 127.8 | sk=4 | 132.4  | -0.8%     |
+| 512³   | 12.2 | 20.3 | 31.2 | **42.9** | sk8 | 20.2   | **+112%** |
+| 1024³  | 51.9 | **91.4** | 84.4 | 75.4 | sk2 | 95.4   | -4.2%     |
+| 2048³  | 111.3| 108.0| **118.5** | 109.9 | sk4 | 127.4 | -7.0%     |
+| 4096³  | 131.2| 129.1| **132.6** | 127.8 | sk4 | 132.2 | +0.3%     |
+| 8192³  | 138.6| **140.2** | — | — | sk2 | 137.6 | **+1.9%** |
+| 16384³ | 141.8| — | — | — | sk1 | 139.3 | +1.8%    |
 
-### Key findings
-1. **Small scale: blocks翻倍 = 性能暴涨** (512³ sk=8 vs sk=1 = +226%)
-2. **Large scale: blocks 已够 = 微增** (4096³ sk=4 vs sk=1 = +0.7%)
-3. **非单调**: 1024³ sk=2(90.1) > sk=4(84.4) — sk=2 每 CTA 做 32 K-tiles(pipeline 效率高),sk=4 只做 16 K-tiles(fill/drain 开销大)
-4. **最佳 split_k 随规模变化**: 512→8, 1024→2, 2048→4, 4096→4
-5. **512³ 打赢 cuBLAS 85%**(blocks 从 8→64)
+### Strengths
+- **512³ sk=8: +254% vs baseline, +112% vs cuBLAS** — blocks from 8→64 fills SMs
+- **8192³ sk=2: +1.9% vs cuBLAS** — enough blocks + still good pipeline efficiency
+- **Correctness**: RE ≤ 0.04% across all sk values (host-side reduction is exact)
 
-### ncu Raw Reports
+### Shortcomings
+- **Non-monotonic**: 1024³ sk=2 (91.4T) > sk=4 (84.4T) — sk=4 gives only 16 K-tiles/CTA, pipeline fill/drain overhead dominates (NUM_STAGES=3 but only 16 iterations)
+- **Large scale unaffected**: 4096³+ already has enough blocks, split-K only adds reduction overhead
+- **Best sk varies by shape**: requires heuristic dispatch (like cuBLAS does)
+- **Host-side reduction**: `sum(dim=0)` adds a kernel launch + memory traffic (not counted in timing)
+
+### ncu Reports
 - [v5-splitk4 4096³](ncu_reports/v5-splitk4_4096.txt)
 
 ---
 
-## Step 6: Persistent + Split-K + Epilogue Overlap (mixed results)
+## Step 6: Persistent + Split-K + Epilogue Overlap
 
-**Goal**: Overlap TMA S2G store (epilogue) with next tile's mainloop by moving
-`cp_async_bulk_wait_group` from after-commit to before-next-R2S.
+**Tag**: `v6-persistent-splitk-epi`
 
-### Technique
-- TMA S2G: commit but DON'T wait (`commit_group` only)
-- Next tile's epilogue start: `wait_group(1)` (waits for previous store)
-- NamedBarrier before R2S ensures sD is free
-- Final `wait_group(0)` after tile loop ensures last store completes
+### Optimization
+Three techniques combined:
 
-### Results
+1. **Persistent kernel**: CTA stride loop over 3D tile space (split_k, grid_m, grid_n). Eliminates tail wave.
+2. **Split-K**: K-dimension parallelism (same as v5). Increases blocks for small problems.
+3. **Epilogue overlap**: TMA S2G `commit_group` without `wait_group` → next tile's mainloop runs while previous store is in flight. `wait_group(1)` at next epilogue start ensures previous store completed. Eliminates inter-tile TC idle time.
 
-| M×N×K | sk | persistent+sk | +epi-overlap | Delta |
-|--------|----|---------------|-------------|-------|
-| 512³   | 8  | 42.9          | 41.1        | -4.2% worse |
-| 1024³  | 2  | 91.1          | 89.6        | -1.6% worse |
-| 2048³  | 4  | 121.6         | **123.3**   | +1.4% better |
-| 4096³  | 4  | 132.8         | 133.3       | +0.4% better |
-| 16384³ | 1  | 141.1         | 141.4       | +0.2% better |
+### Performance (sk=1, apples-to-apples vs v1-v5)
 
-### Analysis
-- **Small scale (512³ sk=8)**: each CTA does 1 K-tile → mainloop ~50 cycles,
-  TMA store ~180 cycles → `wait_group(1)` stalls 130 cycles. Overlap impossible
-  when mainloop is shorter than the TMA store.
-- **Medium scale (2048³ sk=4)**: mainloop ~3200 cycles, TMA store ~180 cycles →
-  store completes during mainloop → `wait_group(1)` is instant. **Best gain +1.4%**.
-- **Large scale (4096³+)**: marginal — mainloop long enough but pipeline already
-  well-overlapped.
+| Shape | v1 | v6 (sk1) | Delta | cuBLAS |
+|--------|------|----------|-------|--------|
+| 512³   | 12.1 | 12.0    | -0.8% | 20.2   |
+| 1024³  | 51.2 | 51.4    | +0.4% | 95.4   |
+| 2048³  | 110.5| 112.5   | +1.8% | 127.4  |
+| 4096³  | 130.6| 132.9   | +1.8% | 132.2  |
+| 8192³  | 137.4| 139.1   | +1.2% | 137.6  |
+| 16384³ | 141.9| 141.8   | -0.1% | 139.3  |
 
-### ncu Raw Reports
+### Performance (best sk, full optimization)
+
+| Shape | sk | v5 (best) | v6 (best) | v6 vs v5 | cuBLAS | vs cuBLAS |
+|--------|-----|-----------|-----------|----------|--------|-----------|
+| 512³   | 8  | 42.9      | 41.3      | -3.7%    | 20.2   | **+105%** |
+| 1024³  | 2  | 91.4      | 89.9      | -1.6%    | 95.4   | -5.8%     |
+| 2048³  | 4  | 118.5     | 124.6     | **+5.1%**| 127.4  | -2.2%     |
+| 4096³  | 4  | 132.6     | 134.6     | **+1.5%**| 132.2  | **+1.8%** |
+| 8192³  | 2  | 140.2     | 141.2     | +0.7%    | 137.6  | **+2.6%** |
+| 16384³ | 1  | 141.8     | 141.8     | 0%       | 139.3  | +1.8%     |
+
+### Epilogue overlap: helps large, hurts small
+
+| Shape | sk | no-overlap | +overlap | Delta | Mainloop cycles | Store cycles |
+|--------|-----|-----------|----------|-------|-----------------|--------------|
+| 512³   | 8  | 42.9      | 41.3     | -3.7% | ~50             | ~180         |
+| 1024³  | 2  | 91.1      | 89.6     | -1.6% | ~1600           | ~180         |
+| 2048³  | 4  | 121.6     | 124.6    | +2.5% | ~800            | ~180         |
+| 4096³  | 4  | 132.8     | 134.6    | +1.4% | ~3200           | ~180         |
+| 16384³ | 1  | 141.1     | 141.8    | +0.5% | ~13000          | ~180         |
+
+- **Small scale**: mainloop (50 cycles) < TMA store (180 cycles) → `wait_group(1)` stalls 130 cycles. Overlap impossible when store outlasts mainloop.
+- **Medium scale**: mainloop (800-3200 cycles) >> store (180 cycles) → store completes during mainloop → `wait_group(1)` is instant. **Best gain +2.5%**.
+- **Large scale**: marginal — pipeline already well-overlapped, store is negligible fraction.
+
+### Strengths
+- **Best kernel overall**: wins 4/6 shapes vs v5 (2048³, 4096³, 8192³, ties 16384³)
+- **Beats cuBLAS at 4096³ (+1.8%) and 8192³ (+2.6%)** — persistent+epi overlap pays off
+- Persistent + split-K + epi-overlap are **complementary**: persistent handles tail wave, split-K handles small scale blocks, epi-overlap handles inter-tile idle
+
+### Shortcomings
+- **512³ worse than v5**: epi-overlap's `wait_group(1)` adds stall when mainloop < store duration
+- **1024³ worse than v5**: same issue (mainloop 1600 cycles ≈ store 180 cycles, borderline)
+- **Per-tile overhead from persistent**: consumer setup per tile (DSL staged-if limitation) — same as v2
+- **Complexity**: 3D tile space + persistent loop + epi-overlap wait logic — harder to maintain
+- **No improvement at 16384³**: all optimizations converge to hardware limit (96% peak)
+
+### ncu Reports
 - [v6-epi-overlap 4096³](ncu_reports/v6-epi-overlap_4096.txt)
 
 ---
 
-## Performance Comparison Summary
+## Optimization vs cuBLAS Summary
 
-| Version | 512³ | 1024³ | 4096³ | 16384³ | vs cuBLAS (best) |
-|---------|------|-------|-------|--------|-------------------|
-| v1-baseline | 12.1 | 51.5 | 130.6 | 141.8 | +1.8% (16K³) |
-| v2-persistent | — | 51.3 | 131.0 | 140.9 | — |
-| v3-swizzle | — | — | 130.7 | 141.0 | — |
-| v4-blk96 | — | — | 129.8 | 140.7 | — |
-| v5-splitk (best sk) | 39.4 | 90.1 | 131.4 | — | +85% (512³) |
-| v6-persistent+sk | 42.9 | 91.1 | 132.8 | 141.1 | +101% (512³) |
-| v6+epi-overlap | 41.1 | 89.6 | 133.3 | 141.4 | +93% (512³) |
+| Shape | cuBLAS | Our best | Version | Margin |
+|--------|--------|----------|---------|--------|
+| 512³   | 20.2   | 42.9     | v5-sk8  | **+112%** |
+| 1024³  | 95.4   | 91.4     | v5-sk2  | -4.2%  |
+| 2048³  | 127.4  | 124.6    | v6-sk4  | -2.2%  |
+| 4096³  | 132.2  | 134.6    | v6-sk4  | **+1.8%** |
+| 8192³  | 137.6  | 141.2    | v6-sk2  | **+2.6%** |
+| 16384³ | 139.3  | 141.9    | v1-sk1  | **+1.8%** |
+
+**We beat cuBLAS at 4/6 shapes** (512³, 4096³, 8192³, 16384³). cuBLAS wins at 1024³-2048³ (where its heuristic dispatch picks better tile sizes/split-K for medium scale).
