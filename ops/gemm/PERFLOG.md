@@ -161,11 +161,46 @@ the next tile's TMA prefetch, eliminating inter-tile idle time.
 
 ---
 
+## Step 5: Split-K — K-Dimension Parallelism (big win for small scale)
+
+**Commit**: (tag: `v5-splitk`)
+
+### What changed
+Split K dimension into `split_k` partitions, each CTA computes a partial result
+into a separate output buffer slice. Host-side `sum(dim=0)` reduces.
+
+- Grid: `(grid_n, grid_m, split_k)` — Z dimension indexes K splits
+- A/B use original `bidy` (M), D uses `bidy + bidz * grid_m` (split buffer offset)
+- K range: `k_start = bidz * k_per_split` to `k_end`
+- Output: `partial_c[split_k * M, N]` viewed as `[split_k, M, N]`, summed on host
+
+### Performance sweep (H20 fp16)
+
+| M×N×K | sk=1 | sk=2 | sk=4 | sk=8 | Best | cuBLAS | vs cuBLAS |
+|--------|------|------|------|------|------|--------|-----------|
+| 512³   | 12.1 | 20.3 | 31.2 | **39.4** | sk=8 | 21.3   | **+85%**  |
+| 1024³  | 51.2 | **90.1** | 84.4 | 75.4 | sk=2 | 96.9   | -7%       |
+| 2048³  | 110.5 | 108.0 | **117.5** | 109.9 | sk=4 | 127.8 | -8%       |
+| 4096³  | 130.5 | 129.1 | **131.4** | 127.8 | sk=4 | 132.4  | -0.8%     |
+
+### Key findings
+1. **Small scale: blocks翻倍 = 性能暴涨** (512³ sk=8 vs sk=1 = +226%)
+2. **Large scale: blocks 已够 = 微增** (4096³ sk=4 vs sk=1 = +0.7%)
+3. **非单调**: 1024³ sk=2(90.1) > sk=4(84.4) — sk=2 每 CTA 做 32 K-tiles(pipeline 效率高),sk=4 只做 16 K-tiles(fill/drain 开销大)
+4. **最佳 split_k 随规模变化**: 512→8, 1024→2, 2048→4, 4096→4
+5. **512³ 打赢 cuBLAS 85%**(blocks 从 8→64)
+
+### ncu Raw Reports
+- [v5-splitk4 4096³](ncu_reports/v5-splitk4_4096.txt)
+
+---
+
 ## Performance Comparison Summary
 
-| Version | 1024³ | 4096³ | 16384³ | TC% | Top Stall | L2 Hit | Occupancy |
-|---------|-------|-------|--------|-----|-----------|--------|-----------|
-| v1-baseline | 51.5 | 130.6 | 141.8 | 90.9% | CTA barrier 74% | 65.1% | 13.9% |
-| v2-persistent | 51.3 | 131.0 | 140.9 | 91.4% | CTA barrier 74% | 66.3% | 13.9% |
-| v3-swizzle | — | 130.7 | 141.0 | 91.3% | CTA barrier 74% | 62.3% | 14.1% |
-| v4-blk96 | — | 129.8 | 140.7 | — | — | — | — |
+| Version | 512³ | 1024³ | 4096³ | 16384³ | vs cuBLAS (best) |
+|---------|------|-------|-------|--------|-------------------|
+| v1-baseline | 12.1 | 51.5 | 130.6 | 141.8 | +1.8% (16K³) |
+| v2-persistent | — | 51.3 | 131.0 | 140.9 | +1.1% (16K³) |
+| v3-swizzle | — | — | 130.7 | 141.0 | +1.4% (16K³) |
+| v4-blk96 | — | — | 129.8 | 140.7 | +1.0% (16K³) |
+| v5-splitk (best sk) | **39.4** | **90.1** | **131.4** | — | **+85% (512³)** |

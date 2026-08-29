@@ -27,7 +27,6 @@ from common.bench import (
     KernelMeta,
     compare_tensor,
     cuda_bench,
-    get_gpu_info,
     parse_ncu_output,
     print_bench_report,
     run_ncu_gui,
@@ -43,7 +42,7 @@ def torch_ref(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a.float() @ b.float().t()
 
 
-def _make_kernel_meta(total_tiles: int = 0) -> KernelMeta:
+def _make_kernel_meta(total_tiles: int = 0, split_k: int = 1) -> KernelMeta:
     """Build KernelMeta from the kernel module's compile-time constants."""
     return KernelMeta(
         name="GEMM",
@@ -57,10 +56,11 @@ def _make_kernel_meta(total_tiles: int = 0) -> KernelMeta:
         block_description=(
             f"{kern.NUM_WARPGROUPS} warpgroups: {kern.NUM_DMA_WARPGROUPS} DMA + {kern.NUM_MMA_WARPGROUPS} MMA"
         ),
-        grid_mode="persistent",
+        grid_mode="standard",
         extra={
             "MMA atom": f"wgmma m64n{kern.BLK_N}k16, layout={kern.ATOM_LAYOUT_MNK}",
             "total_tiles": str(total_tiles) if total_tiles else "",
+            "split_k": str(split_k) if split_k > 1 else "",
         },
     )
 
@@ -128,9 +128,10 @@ def _compile_and_run(
     M: int,
     N: int,
     K: int,
+    split_k: int = 1,
 ) -> object:
     """Compile the kernel and run it once. Returns the compiled callable."""
-    print(f"Compiling CuTe DSL gemm({M}x{N}x{K}) ...")
+    print(f"Compiling CuTe DSL gemm({M}x{N}x{K}, split_k={split_k}) ...")
     compiled = cute.compile(
         gemm,
         make_cute_tensor(a, leading_dim=1),
@@ -140,6 +141,7 @@ def _compile_and_run(
         M,
         N,
         K,
+        split_k,
         options="--enable-tvm-ffi --generate-line-info",
     )
     compiled(a, b, c)
@@ -158,29 +160,37 @@ def run_case(
     use_ncu: bool = False,
     ncu_raw: bool = False,
     ncu_gui: bool = False,
+    split_k: int = 1,
 ) -> bool:
     torch.cuda.manual_seed_all(9527)
     a = torch.randn(M, K, device="cuda", dtype=dtype) * 0.5
     b = torch.randn(N, K, device="cuda", dtype=dtype) * 0.5
-    c = torch.zeros(M, N, device="cuda", dtype=dtype)
 
-    # When ncu is profiling this process, just compile + run once and exit.
-    # This avoids mixing benchmark output with ncu's profiling report.
+    if split_k > 1:
+        output_buf = torch.zeros(split_k * M, N, device="cuda", dtype=dtype)
+    else:
+        output_buf = torch.zeros(M, N, device="cuda", dtype=dtype)
+
     if os.environ.get("NCU_PROFILING") == "1":
-        _compile_and_run(a, b, c, M, N, K)
+        _compile_and_run(a, b, output_buf, M, N, K, split_k)
         return True
 
-    compiled = _compile_and_run(a, b, c, M, N, K)
+    compiled = _compile_and_run(a, b, output_buf, M, N, K, split_k)
+
+    if split_k > 1:
+        c = output_buf.view(split_k, M, N).sum(dim=0)
+    else:
+        c = output_buf
 
     ref = torch_ref(a, b).to(dtype)
-    ok = compare_tensor(c, ref, name=f"gemm {M}x{N}x{K}")
+    ok = compare_tensor(c, ref, name=f"gemm {M}x{N}x{K} sk={split_k}")
 
     if bench and ok:
         ms, ws_count = _cute_bench(
             compiled,
             a,
             b,
-            c,
+            output_buf,
             M,
             N,
             K,
@@ -207,9 +217,8 @@ def run_case(
         blocks_m = (M + kern.BLK_M - 1) // kern.BLK_M
         blocks_n = (N + kern.BLK_N - 1) // kern.BLK_N
         total_tiles = blocks_m * blocks_n
-        num_sms = get_gpu_info()["num_sms"]
-        grid_blocks = min(total_tiles, num_sms)
-        meta = _make_kernel_meta(total_tiles=total_tiles)
+        grid_blocks = total_tiles * split_k
+        meta = _make_kernel_meta(total_tiles=total_tiles, split_k=split_k)
         flops = 2 * M * N * K
         elt_size = a.element_size()
         gmem_bytes = (M * K + N * K + M * N) * elt_size
@@ -241,7 +250,11 @@ def main() -> None:
     use_ncu = "--ncu" in sys.argv or "--ncu-raw" in sys.argv or "--ncu-gui" in sys.argv
     ncu_raw = "--ncu-raw" in sys.argv
     ncu_gui = "--ncu-gui" in sys.argv
-    sys.argv = [x for x in sys.argv if x not in ("--cuda-graphs", "--cupti", "--ncu", "--ncu-raw", "--ncu-gui")]
+    split_k = 1
+    for arg in sys.argv:
+        if arg.startswith("--split-k="):
+            split_k = int(arg.split("=")[1])
+    sys.argv = [x for x in sys.argv if not x.startswith("--") and not x.startswith("-")]
 
     args = [int(x) for x in sys.argv[1:4]]
     shapes = [tuple(args)] if len(args) == 3 else [(1024, 1024, 1024)]
@@ -258,6 +271,7 @@ def main() -> None:
             use_ncu=use_ncu,
             ncu_raw=ncu_raw,
             ncu_gui=ncu_gui,
+            split_k=split_k,
         ):
             counters["succeed"] += 1
         else:
