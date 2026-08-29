@@ -133,18 +133,31 @@ consecutive M-blocks before striding N, to improve L2 reuse of A tiles.
 
 ---
 
-## Step 4: CTA Barrier Stall Optimization (planned)
+## Step 4: BLK_K=96, NUM_STAGES=2 — Fewer Syncs (slightly worse, case study)
 
-**Goal**: Reduce the 74.3% CTA barrier stall (51.1 cycles/issued instruction).
+**Goal**: Reduce CTA barrier stall by increasing BLK_K (64→96) to halve K-tile count
+(64→43 sync cycles), accepting fewer pipeline stages (3→2) to fit smem.
 
-Current bottleneck: pipeline mbarrier sync — `consumer_wait` waits for TMA data,
-`producer_acquire` waits for consumer release. 64 K-tile sync cycles for 4096³.
+### Result: pipeline depth matters more than sync count
 
-Options:
-- **BLK_K=128, NUM_STAGES=2**: Half the sync points (64→32), but needs BLK_N=128 to fit smem
-- **BLK_K=96, NUM_STAGES=2**: 33% fewer syncs (64→43), smem fits with BLK_N=256
-- **Epilogue overlap**: Overlap epilogue R2S+TMA-store with next tile's TMA prefetch
-- **Batch K-tiles per wait**: Process 2 K-tiles per consumer_wait/release cycle
+| M×N×K | v2-persistent (K64,S3) | v4-blk96 (K96,S2) | Delta |
+|--------|------------------------|---------------------|-------|
+| 4096³  | 131.0                  | 129.8               | -0.9% |
+| 16384³ | 140.9                  | 140.7               | -0.1% |
+
+### Why worse
+1. Pipeline depth 3→2 reduces TMA/WGMMA overlap → more consumer_wait stalls
+2. The overlap loss > sync count reduction → net negative
+3. BLK_K=96 uses SW64 swizzle (vs SW128 for K=64) — smaller swizzle granularity
+
+### Conclusion
+**Pipeline overlap (NUM_STAGES) is more valuable than fewer sync points.**
+The 3-stage pipeline hides TMA latency better; the extra sync overhead is offset by overlap.
+Can't increase stages (smem full at 209KB/228KB) or reduce syncs (pipeline depth drops).
+
+The CTA barrier stall (74.3%) is **inherent to the TMA+wgmma pipeline architecture**.
+The remaining lever is **epilogue overlap** — overlap the epilogue R2S+TMA-store with
+the next tile's TMA prefetch, eliminating inter-tile idle time.
 
 ---
 
@@ -155,4 +168,4 @@ Options:
 | v1-baseline | 51.5 | 130.6 | 141.8 | 90.9% | CTA barrier 74% | 65.1% | 13.9% |
 | v2-persistent | 51.3 | 131.0 | 140.9 | 91.4% | CTA barrier 74% | 66.3% | 13.9% |
 | v3-swizzle | — | 130.7 | 141.0 | 91.3% | CTA barrier 74% | 62.3% | 14.1% |
-| v4-barrier | — | — | — | — | — | — | — |
+| v4-blk96 | — | 129.8 | 140.7 | — | — | — | — |
