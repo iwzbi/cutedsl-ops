@@ -27,6 +27,7 @@ from common.bench import (
     KernelMeta,
     compare_tensor,
     cuda_bench,
+    get_gpu_info,
     parse_ncu_output,
     print_bench_report,
     run_ncu_gui,
@@ -42,7 +43,7 @@ def torch_ref(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a.float() @ b.float().t()
 
 
-def _make_kernel_meta() -> KernelMeta:
+def _make_kernel_meta(total_tiles: int = 0) -> KernelMeta:
     """Build KernelMeta from the kernel module's compile-time constants."""
     return KernelMeta(
         name="GEMM",
@@ -56,8 +57,10 @@ def _make_kernel_meta() -> KernelMeta:
         block_description=(
             f"{kern.NUM_WARPGROUPS} warpgroups: {kern.NUM_DMA_WARPGROUPS} DMA + {kern.NUM_MMA_WARPGROUPS} MMA"
         ),
+        grid_mode="persistent",
         extra={
             "MMA atom": f"wgmma m64n{kern.BLK_N}k16, layout={kern.ATOM_LAYOUT_MNK}",
+            "total_tiles": str(total_tiles) if total_tiles else "",
         },
     )
 
@@ -201,13 +204,15 @@ def run_case(
                     ncu_data = parse_ncu_output(ncu_text)
 
         # Build report metadata
-        meta = _make_kernel_meta()
+        blocks_m = (M + kern.BLK_M - 1) // kern.BLK_M
+        blocks_n = (N + kern.BLK_N - 1) // kern.BLK_N
+        total_tiles = blocks_m * blocks_n
+        num_sms = get_gpu_info()["num_sms"]
+        grid_blocks = min(total_tiles, num_sms)
+        meta = _make_kernel_meta(total_tiles=total_tiles)
         flops = 2 * M * N * K
         elt_size = a.element_size()
         gmem_bytes = (M * K + N * K + M * N) * elt_size
-        blocks_m = (M + kern.BLK_M - 1) // kern.BLK_M
-        blocks_n = (N + kern.BLK_N - 1) // kern.BLK_N
-        grid_blocks = blocks_m * blocks_n
 
         timing_mode = "CUPTI" if use_cupti else ("CUDA Graphs" if use_cuda_graphs else "CUDA Events")
 

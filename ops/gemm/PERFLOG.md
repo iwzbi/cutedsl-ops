@@ -65,7 +65,48 @@ Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see exact code c
 
 ---
 
-## Step 2: Split-K (planned)
+## Step 2: Persistent Kernel — CTA Stride Loop (no gain, case study)
+
+**Commit**: (tag: `v2-persistent`)
+
+### What changed
+Each CTA loops over multiple output tiles via a stride loop instead of one CTA per tile.
+Launch `min(total_tiles, num_sms)` CTAs instead of `total_tiles`.
+
+### Three bugs fixed (discovered via 14-warp-specialization reference)
+1. **Deadlock**: `sync_threads()` required all 384 threads, but producer's 128 never reached it → GPU hang. Fix: `pipeline.NamedBarrier(barrier_id=1, num_threads=256)` excluding producer.
+2. **>5min compile**: K-tile loop used `unroll_full=True` → 64× code bloat. Fix: `unroll=1`.
+3. **Missing register reconfig**: Added `warpgroup_reg_dealloc(40)` (producer) + `warpgroup_reg_alloc(232)` (consumer).
+
+### Performance (no improvement, slightly worse at large scale)
+
+| M×N×K | Baseline | Persistent | Delta |
+|--------|----------|------------|-------|
+| 1024³  | 51.5     | 51.3       | ~0%   |
+| 4096³  | 130.6    | 131.0      | +0.3% |
+| 16384³ | 141.8    | 140.9      | -0.6% |
+
+### ncu Comparison (4096³)
+
+| Metric | Baseline | Persistent | Delta |
+|--------|----------|------------|-------|
+| Compute Throughput | 90.9% | 91.4% | +0.5% |
+| Cycles/Issued | 67.2 | 68.7 | +2% worse |
+| CTA barrier stall | 74.2% (49.8 cyc) | 74.3% (51.1 cyc) | slightly worse |
+| SM load imbalance | est. +5.9% | eliminated | — |
+
+### Why no gain
+1. **Tail wave elimination too small**: 4096³ = 6.56 waves → 7 tiles/CTA, imbalance still 6 vs 7.
+2. **Per-tile overhead offsets gains**: consumer setup (get_slice/partition/make_fragment) repeated per tile due to DSL staged-if limitation; two NamedBarrier syncs per tile add barrier stall.
+3. **Pipeline state continuation**: states persist across tiles (no reset), which works but doesn't reduce stall.
+4. **Value of persistent is as prerequisite for epilogue overlap**, not as a standalone optimization — the overhead eats the tail-wave benefit.
+
+### ncu Raw Reports
+- [v2-persistent 4096³](ncu_reports/v2-persistent_4096.txt)
+
+---
+
+## Step 3: Split-K (planned)
 
 **Goal**: Increase grid size for small problems (4096³ only 512 blocks → 6.56 waves).
 
@@ -80,4 +121,5 @@ Split K dimension into multiple partitions, each CTA computes partial result, at
 | Version | 1024³ | 4096³ | 16384³ | TC% | Top Stall | Occupancy |
 |---------|-------|-------|--------|-----|-----------|-----------|
 | v1-baseline | 51.5 | 130.6 | 141.8 | 90.9% | CTA barrier 74% | 13.9% |
-| v2-splitk | — | — | — | — | — | — |
+| v2-persistent | 51.3 | 131.0 | 140.9 | 91.4% | CTA barrier 74% | 13.9% |
+| v3-splitk | — | — | — | — | — | — |

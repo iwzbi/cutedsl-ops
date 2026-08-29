@@ -188,6 +188,7 @@ class KernelMeta:
     tile_dims: dict[str, int]  # {"BLK_M": 128, "BLK_N": 256, ...}
     block_threads: int  # threads per CTA
     block_description: str  # "3 warpgroups: 1 DMA + 2 MMA"
+    grid_mode: str = "standard"  # "standard" or "persistent"
     extra: dict[str, str] = field(default_factory=dict)  # extra info lines
 
 
@@ -282,6 +283,12 @@ def print_bench_report(
     ai = flops / gmem_bytes if gmem_bytes else 0.0
 
     waves = grid_blocks / gpu["num_sms"]
+    if meta.grid_mode == "persistent":
+        total_tiles = meta.extra.get("total_tiles", "")
+        grid_str = f"{grid_blocks} blocks (persistent, {total_tiles} tiles) -> {waves:.1f} waves"
+    else:
+        grid_str = f"{grid_blocks} blocks -> {waves:.1f} waves on {gpu['num_sms']} SMs"
+    print(f"  {'Grid':<24} {grid_str}")
     smem_bytes = _estimate_smem(meta, elt_size)
     smem_kb = smem_bytes / 1024
     occ_blocks, occ_threads, occ_pct, occ_limiter = theoretical_occupancy(smem_bytes, bt, gpu)
@@ -305,7 +312,6 @@ def print_bench_report(
     print(f"  {'Bandwidth':<24} {bandwidth_gbs:,.1f} GB/s ({hbm_pct:.1f}% of {gpu['hbm_bw_gbs']:,.0f} GB/s HBM)")
     print(f"  {'Arith intensity':<24} {ai:,.0f} FLOP/byte  ({'compute-bound' if ai > 10 else 'memory-bound'})")
     print(f"  {'gmem I/O':<24} {gmem_bytes / 1e6:,.1f} MB")
-    print(f"  {'Grid':<24} {grid_blocks} blocks -> {waves:.1f} waves on {gpu['num_sms']} SMs")
     print(f"  {'Block':<24} {bt} threads ({meta.block_description})")
     tile_str = ", ".join(f"{k}={v}" for k, v in meta.tile_dims.items())
     print(f"  {'Tile':<24} {tile_str}")
