@@ -61,11 +61,13 @@ BLK_K = 64
 NUM_STAGES = 3  # start with 1 to get the single-buffer flow right, then grow
 
 # WGMMA atom is 64x256x16 with atom layout (2, 1, 1) over M -> CTA tile
-# 128x256x16 per issue. Two warpgroups => 256 threads.
+# 128x256x16 per issue. Two MMA warpgroups => 256 MMA threads.
 ATOM_LAYOUT_MNK = (2, 1, 1)
-NUM_WARPGROUPS = ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2]
+NUM_MMA_WARPGROUPS = ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2]
+NUM_DMA_WARPGROUPS = 1  # 1 producer warpgroup for TMA loads
+NUM_WARPGROUPS = NUM_DMA_WARPGROUPS + NUM_MMA_WARPGROUPS  # 3
 NUM_THREADS_PER_WARPGROUP = 128
-NUM_THREADS = NUM_WARPGROUPS * NUM_THREADS_PER_WARPGROUP  # 256
+NUM_THREADS = NUM_MMA_WARPGROUPS * NUM_THREADS_PER_WARPGROUP  # 256 (MMA threads)
 NUM_WARPS = NUM_THREADS // 32  # 8
 
 
@@ -97,13 +99,6 @@ def gemm_kernel(
     bidx, bidy, _ = cute.arch.block_idx()  # NOTE: grid is (N-blocks, M-blocks)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-    # if tid == 0 and bidx == 0 and bidy == 0:
-    #     cute.printf("#" * 60)
-    #     cute.printf(cute.shape(mA))
-    #     cute.print_tensor(mA)
-    # cute.printf(mB)
-    # cute.printf(mC)
-
     # --- 0. Allocate the CTA's smem (barriers + staged A/B + C tile) ---------
     # SharedStorage is a @cute.struct built on the host side; SmemAllocator
     # lays it out. get_tensor re-materializes a cute.Tensor over the swizzled
@@ -116,10 +111,6 @@ def gemm_kernel(
         sA_layout_staged.outer,
         swizzle=sA_layout_staged.inner,
     )
-    # if tid == 0 and bidx == 0 and bidy == 0:
-    #     cute.printf("#" * 60)
-    #     cute.printf(cute.shape(sA_full))
-    #     cute.print_tensor(sA_full)
     sB_full = storage.sB.get_tensor(
         sB_layout_staged.outer,
         swizzle=sB_layout_staged.inner,
@@ -149,9 +140,6 @@ def gemm_kernel(
     gA = cute.local_tile(mA, tiler=tiler, coord=(bidy, bidx, None), proj=(1, None, 1))
     gB = cute.local_tile(mB, tiler=tiler, coord=(bidy, bidx, None), proj=(None, 1, 1))
     gD = cute.local_tile(mD, tiler=tiler, coord=(bidy, bidx, 0), proj=(1, 1, None))
-    # if tid == 0 and bidx == 0 and bidy == 0:
-    #     # cute.print_tensor(gA)
-    #     cute.printf(f"gA layout after local tile: {gA.layout}")
 
     # --- 3. TMA partition: per-K-tile (smem dest, gmem src) views -------------
     # tma_partition(atom, thread=0, ..., smem_view, gmem_view) yields one pair
@@ -159,12 +147,6 @@ def gemm_kernel(
     # folds (BLK_M, BLK_K) into one box mode so a single TMA issues per tile.
     sA_for_tma = cute.group_modes(sA_full, 0, 2)  # ((bM, bK), STAGE)
     gA_for_tma = cute.group_modes(gA, 0, 2)  # ((bM, bK), RestK)
-    if tid == 0 and bidx == 0 and bidy == 0:
-        # cute.print_tensor(gA)
-        cute.printf(f"gA layout after local tile: {gA.layout}")
-        cute.printf(f"sA_full layout: {sA_full.layout}")
-        cute.printf(f"sA_for_tma layout: {sA_for_tma.layout}")
-        cute.printf(f"gA_for_tma layout: {gA_for_tma.layout}")
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
         tma_atom_a,
         0,
@@ -172,9 +154,6 @@ def gemm_kernel(
         sA_for_tma,
         gA_for_tma,
     )
-    if tid == 0 and bidx == 0 and bidy == 0:
-        cute.printf(f"tAsA layout: {tAsA.layout}")
-        cute.printf(f"tAgA layout: {tAgA.layout}")
     sB_for_tma = cute.group_modes(sB_full, 0, 2)
     gB_for_tma = cute.group_modes(gB, 0, 2)
     tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
@@ -203,32 +182,9 @@ def gemm_kernel(
         gD_for_tma,
     )
 
-    # --- 4. Partition the WGMMA across this thread's warpgroup ---------------
-    # Unlike the Ampere path, fragment slicing is per-WARPGROUP, not per-thread.
-    # sA_full is (BLK_M, BLK_K, NUM_STAGES); partition_A walks all three modes
-    # -> tCsA (MMA, MMA_M, MMA_K, NUM_STAGES); make_fragment_* produce smem
-    # descriptors (tCrA/tCrB), indexed (None, None, k_block, stage) later.
+    # --- 4-6. Warp specialization: producer issues TMA, consumers do WGMMA --
     warpgroup_idx = cute.arch.make_warp_uniform(tid // NUM_THREADS_PER_WARPGROUP)
-    warpgroup_thread_layout = cute.make_layout(
-        NUM_WARPGROUPS,
-        stride=NUM_THREADS_PER_WARPGROUP,
-    )
-    thr_mma = tiled_mma.get_slice(warpgroup_thread_layout(warpgroup_idx))
-    if warpgroup_idx == 0:
-        print(thr_mma)
-
-    tCsA = thr_mma.partition_A(sA_full)
-    tCsB = thr_mma.partition_B(sB_full)
-    tCrA = tiled_mma.make_fragment_A(tCsA)
-    tCrB = tiled_mma.make_fragment_B(tCsB)
-    if tid == 0 and bidx == 0 and bidy == 0:
-        cute.printf(tCsA.layout)
-        cute.printf(tCrA.layout)
-
-    # Accumulator (registers) sized to this warpgroup's slice of the CTA tile.
-    tCgD_shape = thr_mma.partition_C(gD).shape
-    accumulators = cute.make_rmem_tensor(tCgD_shape, acc_dtype)
-    accumulators.fill(0.0)
+    is_producer = warpgroup_idx < NUM_DMA_WARPGROUPS
 
     num_k_tiles = cute.size(gA, mode=[2])
 
@@ -241,7 +197,6 @@ def gemm_kernel(
         NUM_STAGES,
     )
 
-    is_producer = warpgroup_idx == 0
     if is_producer:
         if warp_idx == 0:
             for idx in cutlass.range(num_k_tiles, unroll=1):
@@ -261,7 +216,23 @@ def gemm_kernel(
                 mainloop_pipeline.producer_commit(mainloop_prod_state)
                 mainloop_prod_state.advance()
     else:
-        num_k_blocks = cute.size(tCrA, mode=[2])   # MMA_K sub-blocks inside BLK_K
+        mma_warpgroup_idx = warpgroup_idx - NUM_DMA_WARPGROUPS
+        warpgroup_thread_layout = cute.make_layout(
+            NUM_MMA_WARPGROUPS,
+            stride=NUM_THREADS_PER_WARPGROUP,
+        )
+        thr_mma = tiled_mma.get_slice(warpgroup_thread_layout(mma_warpgroup_idx))
+
+        tCsA = thr_mma.partition_A(sA_full)
+        tCsB = thr_mma.partition_B(sB_full)
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrB = tiled_mma.make_fragment_B(tCsB)
+
+        tCgD_shape = thr_mma.partition_C(gD).shape
+        accumulators = cute.make_rmem_tensor(tCgD_shape, acc_dtype)
+        accumulators.fill(0.0)
+
+        num_k_blocks = cute.size(tCrA, mode=[2])
         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
         for k_tile_idx in cutlass.range(num_k_tiles, unroll_full=True):
             mainloop_pipeline.consumer_wait(mainloop_cons_state)
@@ -275,7 +246,7 @@ def gemm_kernel(
             mainloop_pipeline.consumer_release(mainloop_cons_state)
             mainloop_cons_state.advance()
 
-        consumer_tid = tid - 128
+        consumer_tid = tid - NUM_DMA_WARPGROUPS * NUM_THREADS_PER_WARPGROUP
         tCrD = cute.make_fragment_like(accumulators, out_dtype)
         tCrD.store(accumulators.load().to(out_dtype))
         thr_r2s_d = r2s_tiled_copy_d.get_slice(consumer_tid)
@@ -423,7 +394,7 @@ def gemm(
         SharedStorage,
     ).launch(
         grid=(grid_n, grid_m, 1),
-        block=(NUM_THREADS + 128, 1, 1),
+        block=(NUM_WARPGROUPS * NUM_THREADS_PER_WARPGROUP, 1, 1),
         stream=stream,
     )
 
