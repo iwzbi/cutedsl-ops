@@ -527,3 +527,40 @@ Ordered by priority (impact on #1 bottleneck: CTA barrier stall 73.3%).
 **Lesson**: `min_blocks_per_mp=2` on a register-heavy kernel causes **exponential collapse**, not linear degradation. To achieve 2 blocks/SM, you must reduce register demand at the source (fp16 accumulator, smaller tile, fewer pipeline stages) — not ask the compiler to force it.
 
 **Path to 2 blocks/SM** (requires #3 fp16 accumulator): 168 regs → ~84 (fp16 acc) → 65536/(2x256) = 128 budget → 84 < 128 ✅ → `min_blocks_per_mp=2` would then be safe.
+
+---
+
+### #3: FP16 Accumulator + min_blocks_per_mp=2 — case study
+
+**What**: Change `acc_dtype` from `cutlass.Float32` to `cutlass.Float16`. Halves the accumulator register width (32→16 bits per element). Combined with `min_blocks_per_mp=2` on the small tile kernel to test if 2 blocks/SM helps.
+
+**Tested**:
+
+1. **FP16 acc alone (both kernels)**: Performance +0.2-0.5% at large scale (4096³: 133.5T vs 132.8T; 16384³: 142.1T vs 141.8T). 512³ unchanged (48.5T). Correctness: RE 0.09-0.47% (vs 0.01% with FP32 acc — precision loss expected, 10 mantissa bits vs 23). **ncu: Registers Per Thread still 168** — compiler allocates the same amount (no pressure to reduce) but actual usage likely dropped to ~130.
+
+2. **FP16 acc + min_blocks_per_mp=2 (small tile, 256 threads)**: **No crash!** (vs 9000x crash with FP32 acc). Registers forced to 128 (budget 65536/(2×256)=128). Theoretical occupancy 25% (2 blocks/SM). **But performance unchanged**: 4096³ = 118.7T (vs 118.6T with 1 block/SM). 512³ = 48.3T (vs 48.5T, slight loss from register spill overhead).
+
+3. **ncu comparison (4096³, small tile)**:
+
+| Metric | 1 block/SM (168 regs) | 2 blocks/SM (128 regs) | Delta |
+|--------|----------------------|------------------------|-------|
+| Compute Throughput | 83.0% | 83.03% | **identical** |
+| TFLOPS | 118.6 | 118.7 | ~0% |
+| Cycles/Issued | 7.6 | 13.83 | **+82% worse** (register spill) |
+| Theoretical Occupancy | 18.75% | 25.0% | +6.25% |
+| Achieved Occupancy | 14.04% | 7.39% | **-6.65% worse** (problem too small) |
+
+**Root cause: TC is the bottleneck, not occupancy**:
+- Hopper's tensor core (TC) is an SM-level shared resource. A single block's wgmma instructions already saturate it (83% throughput).
+- A second block on the same SM adds more warps, but their wgmma instructions queue behind the first block's — **no parallel TC execution**.
+- The extra block's warps stall at the mbarrier waiting for TC, just like the first block's warps — **2× the stalls, 0× the TC throughput**.
+- Cycles/Issued doubled (7.6→13.83) because forcing 128 regs (vs ~130 actual) causes minor spilling, and the second block adds scheduling overhead.
+
+**Key lesson**: **Occupancy doesn't matter for compute-bound wgmma kernels on Hopper.** The traditional GPU wisdom ("more warps = hide more latency") doesn't apply because:
+1. wgmma is a long-latency instruction that keeps the TC busy for many cycles
+2. TMA pipeline (not warp scheduling) hides the TMA latency
+3. TC is SM-level, shared across all blocks — can't parallelize across blocks
+
+This is the Hopper design philosophy: **long-latency MMA + hardware pipeline replace multi-warp latency hiding**.
+
+**Reverted**: FP16 acc (precision loss not worth +0.2-0.5%), min_blocks_per_mp=2 (no gain, slight loss from spill overhead).
