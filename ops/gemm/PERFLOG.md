@@ -686,3 +686,39 @@ operations on partitioned tensors.
 **Finding**: L2 compression is a hardware feature that depends on data patterns. Random fp16 data (our input) is not compressible (high entropy). There is no CUDA API to "hint" the L2 to try compression — it either works (data is compressible) or doesn't (data is random).
 
 **Conclusion**: Cannot be controlled from software. Would only help with structured/low-entropy data patterns (e.g., sparse tensors, zero-padded regions). Not applicable to dense random GEMM.
+
+### #17: TMA Multicast + Cluster — DSL 4.7.0 two limitations, cancelled
+
+**Goal**: Use `CopyBulkTensorTileG2SMulticastOp` with a 2-CTA cluster. Leader CTA
+issues multicast TMA load for A, broadcasting to both CTAs' smem. Halves gmem
+reads for A tiles. Each CTA computes a different output tile (different bid_n).
+
+**Five approaches tried, all failed**:
+
+| # | Approach | Compile | Run | Failure |
+|---|----------|---------|-----|---------|
+| 1 | Dynamic mask (ternary) `Int16(3) if pos==0 else 1` | ❌ hang | — | MLIR codegen can't handle runtime-conditional multicast TMA |
+| 2 | Dynamic mask (arithmetic) `3 - pos*2` | ❌ hang | — | Same codegen limitation |
+| 3 | Always multicast (mask=3, unconditional) | ✅ | RE=1.0 ❌ | Both CTAs multicast → mbarrier double-counting cascade |
+| 4 | Staged-if `if pos==0:` with constant masks | ❌ hang | — | Multicast TMA in staged-if branch → codegen hang |
+| 5 | Regular TMA + cluster launch (no multicast) | ✅ | K≤256 ✅, K≥320 ❌ | PipelineTmaAsync cluster mode breaks at wrap-around |
+
+**Limitation 1: Multicast TMA codegen**. `CopyBulkTensorTileG2SMulticastOp` with
+any runtime-dependent `mcast_mask` (ternary, arithmetic, or staged-if) causes
+MLIR codegen infinite loop. Only compile-time constant masks compile, but
+unconditional multicast causes mbarrier double-counting.
+
+**Limitation 2: PipelineTmaAsync cluster + wrap-around**. With `cta_layout_vmnk=(1,1,2,1)`,
+the pipeline works for the first round (≤ NUM_STAGES k-tiles). At wrap-around
+(stage index returns to 0 + phase bit flips), cross-CTA mbarrier arrive counts
+are miscalculated → phase mismatch → consumer reads wrong stage → wrong results
+or deadlock. This is a bug in the DSL's pipeline implementation for cluster mode.
+
+**Conclusion**: TMA multicast + cluster is not implementable in CuTe DSL 4.7.0.
+HPC-Ops (production) uses C++ CUDA with manual mbarrier management, bypassing
+these DSL limitations. Requires DSL compiler fixes (multicast codegen + pipeline
+cluster phase management).
+
+**Learning value**: This experiment taught the Hopper cluster programming model
+(cluster launch, `block_in_cluster_idx`, `cta_layout_vmnk`, multicast TMA masks,
+pipeline arrive-count recalculation) even though the DSL can't compile it yet.
