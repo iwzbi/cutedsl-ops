@@ -35,15 +35,19 @@ from common.bench import (
 )
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.gemm import gemm_kernel as kern_large
+from ops.gemm import gemm_kernel_cluster as kern_cluster
 from ops.gemm import gemm_kernel_small as kern_small
 from ops.gemm.gemm_kernel import gemm as gemm_large
+from ops.gemm.gemm_kernel_cluster import gemm as gemm_cluster
 from ops.gemm.gemm_kernel_small import gemm as gemm_small
 
 
 _SMALL_TILE_THRESHOLD = 1024 * 1024
 
 
-def _select_kernel(M: int, N: int) -> tuple:
+def _select_kernel(M: int, N: int, use_cluster: bool = False) -> tuple:
+    if use_cluster:
+        return kern_cluster, gemm_cluster, f"cluster ({kern_cluster.CLUSTER_M}x{kern_cluster.CLUSTER_N})"
     if M * N < _SMALL_TILE_THRESHOLD:
         return kern_small, gemm_small, "small (64x64, S5)"
     return kern_large, gemm_large, "large (128x256, S3)"
@@ -204,13 +208,14 @@ def run_case(
     ncu_raw: bool = False,
     ncu_gui: bool = False,
     split_k: int = 1,
+    use_cluster: bool = False,
 ) -> bool:
     torch.cuda.manual_seed_all(9527)
     a = (torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.5).to(dtype)
     b = (torch.randn(N, K, device="cuda", dtype=torch.float16) * 0.5).to(dtype)
     c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
 
-    kern, gemm_fn, tile_desc = _select_kernel(M, N)
+    kern, gemm_fn, tile_desc = _select_kernel(M, N, use_cluster=use_cluster)
 
     # #10: Pad to tile multiples for non-aligned shapes (TMA OOB reads garbage).
     M_pad = ((M + kern.BLK_M - 1) // kern.BLK_M) * kern.BLK_M
@@ -313,6 +318,7 @@ def main() -> None:
         raise SystemExit("This example requires a CUDA-capable GPU (sm_80+).")
 
     use_fp8 = "--fp8" in sys.argv
+    use_cluster = "--cluster" in sys.argv
     use_cuda_graphs = "--cuda-graphs" in sys.argv
     use_cupti = "--cupti" in sys.argv
     use_ncu = "--ncu" in sys.argv or "--ncu-raw" in sys.argv or "--ncu-gui" in sys.argv
@@ -343,6 +349,7 @@ def main() -> None:
             ncu_raw=ncu_raw,
             ncu_gui=ncu_gui,
             split_k=split_k,
+            use_cluster=use_cluster,
         ):
             counters["succeed"] += 1
         else:
