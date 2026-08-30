@@ -160,6 +160,38 @@ def _compile_and_run(
     return compiled
 
 
+def _setup_l2_pinning(output_tensor: torch.Tensor) -> None:
+    """#13: Pin output tensor in L2 cache for better write-back locality."""
+    from cuda.bindings import driver as cuda_driver
+
+    l2_size = get_gpu_info()["l2_cache_bytes"]
+    pin_bytes = min(output_tensor.nbytes, l2_size // 2)
+    if pin_bytes < 1024:
+        return
+
+    window = cuda_driver.CUaccessPolicyWindow()
+    window.base_ptr = output_tensor.data_ptr()
+    window.num_bytes = pin_bytes
+    window.hitRatio = 1.0
+    window.hitProp = cuda_driver.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING
+    window.missProp = cuda_driver.CUaccessProperty.CU_ACCESS_PROPERTY_NORMAL
+
+    cu_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    attr_value = cuda_driver.CUstreamAttrValue()
+    attr_value.accessPolicyWindow = window
+    cuda_driver.cuStreamSetAttribute(
+        cu_stream,
+        cuda_driver.CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+        attr_value,
+    )
+
+
+def _reset_l2_pinning() -> None:
+    from cuda.bindings import driver as cuda_driver
+
+    cuda_driver.cuCtxResetPersistingL2Cache()
+
+
 def run_case(
     M: int,
     N: int,
@@ -177,40 +209,58 @@ def run_case(
     a = torch.randn(M, K, device="cuda", dtype=dtype) * 0.5
     b = torch.randn(N, K, device="cuda", dtype=dtype) * 0.5
 
-    if split_k > 1:
-        output_buf = torch.zeros(split_k * M, N, device="cuda", dtype=dtype)
+    kern, gemm_fn, tile_desc = _select_kernel(M, N)
+
+    # #10: Pad to tile multiples for non-aligned shapes (TMA OOB reads garbage).
+    M_pad = ((M + kern.BLK_M - 1) // kern.BLK_M) * kern.BLK_M
+    N_pad = ((N + kern.BLK_N - 1) // kern.BLK_N) * kern.BLK_N
+    K_pad = ((K + kern.BLK_K - 1) // kern.BLK_K) * kern.BLK_K
+
+    if M_pad != M or N_pad != N or K_pad != K:
+        a_pad = torch.zeros(M_pad, K_pad, device="cuda", dtype=dtype)
+        a_pad[:M, :K] = a
+        b_pad = torch.zeros(N_pad, K_pad, device="cuda", dtype=dtype)
+        b_pad[:N, :K] = b
+        a_use, b_use = a_pad, b_pad
+        M_use, N_use, K_use = M_pad, N_pad, K_pad
     else:
-        output_buf = torch.zeros(M, N, device="cuda", dtype=dtype)
+        a_use, b_use = a, b
+        M_use, N_use, K_use = M, N, K
+
+    if split_k > 1:
+        output_buf = torch.zeros(split_k * M_use, N_use, device="cuda", dtype=dtype)
+    else:
+        output_buf = torch.zeros(M_use, N_use, device="cuda", dtype=dtype)
 
     if os.environ.get("NCU_PROFILING") == "1":
-        kern, gemm_fn, tile_desc = _select_kernel(M, N)
-        _compile_and_run(gemm_fn, a, b, output_buf, M, N, K, split_k)
+        _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k)
         return True
 
-    kern, gemm_fn, tile_desc = _select_kernel(M, N)
-    compiled = _compile_and_run(gemm_fn, a, b, output_buf, M, N, K, split_k)
+    compiled = _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k)
 
     if split_k > 1:
-        c = output_buf.view(split_k, M, N).sum(dim=0)
+        c = output_buf.view(split_k, M_use, N_use).sum(dim=0)[:M, :N]
     else:
-        c = output_buf
+        c = output_buf[:M, :N]
 
     ref = torch_ref(a, b).to(dtype)
     ok = compare_tensor(c, ref, name=f"gemm {M}x{N}x{K} sk={split_k}")
 
     if bench and ok:
+        _setup_l2_pinning(output_buf)
         ms, ws_count = _cute_bench(
             compiled,
-            a,
-            b,
+            a_use,
+            b_use,
             output_buf,
-            M,
-            N,
-            K,
+            M_use,
+            N_use,
+            K_use,
             dtype,
             use_cuda_graphs=use_cuda_graphs,
             use_cupti=use_cupti,
         )
+        _reset_l2_pinning()
 
         # ncu profiling (optional)
         ncu_data = None

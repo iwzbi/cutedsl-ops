@@ -643,3 +643,46 @@ Element-level access (`tensor[idx]` returns a scalar, not a sub-Tensor view;
 `local_tile(tensor, (1,), (idx,))` in a loop generates excessive MLIR IR and
 may compute wrong pointers). The DSL cannot efficiently do per-element atomic
 operations on partitioned tensors.
+
+### #8: Double accumulator (ping-pong) — DSL limitation, not implemented
+
+**Concept**: Two accumulators alternate per tile. While one is drained (R2S + TMA S2G), the other is filled (next tile's wgmma). Overlaps R2S (LSU pipeline) with wgmma (TC pipeline).
+
+**Why not implemented**: DSL staged-if limitation prevents selecting between two rmem tensors with a runtime condition (`tile_iter % 2`). Variables defined in one staged-if branch can't be used after the branch — would require duplicating the entire mainloop+epilogue code in both branches.
+
+**Analysis**: Even if implemented, the benefit is marginal. The R2S (~20 cycles) is much shorter than wgmma (~100+ cycles). The overlap window is small. The existing epi-overlap (TMA S2G + next tile mainloop) already captures the larger overlap. Double accumulator would only add R2S overlap, saving ~20 cycles/tile = ~0.008% at 4096³.
+
+### #10: Padding for non-aligned shapes — correctness fix ✅
+
+**Problem**: TMA G2S loads a full (BLK_M, BLK_K) box. When K is not a multiple of BLK_K, the last K-tile reads OOB elements — TMA doesn't zero-pad, it reads whatever is in memory (garbage). This causes RE=141% for shapes like 1024×1024×333.
+
+**Fix**: Pad a, b, output_buf to multiples of BLK_M/BLK_N/BLK_K before kernel launch. Extract original (unpadded) result after.
+
+| Shape | Before (RE) | After (RE) | TFLOPS |
+|-------|-------------|------------|--------|
+| 1024×1024×333 | 141.48% ❌ | 0.00% ✅ | — |
+| 1000×777×333 | 141.18% ❌ | 0.00% ✅ | 53.0 |
+| 3000×3000×3000 | 0.00% ✅ | 0.00% ✅ | 122.2 |
+
+**Note**: 3000³ worked before because OOB memory happened to be zeros (from prior allocations). The fix ensures correctness regardless of memory content.
+
+### #13: L2 cache pinning — marginal
+
+**What**: Use `cuStreamSetAttribute` with `CUaccessPolicyWindow` to pin the output tensor in L2 cache. Persistent L2 access improves write-back locality for repeated writes (e.g., persistent kernel writing to same output region).
+
+**Results**:
+
+| Shape | Without pinning | With pinning | Delta |
+|-------|-----------------|--------------|-------|
+| 512³   | 48.5            | 48.2         | -0.6% |
+| 4096³  | 130.6           | 131.8        | +0.9% |
+
+**Analysis**: Marginal — kernel is compute-bound (DRAM 4.3%), so L2 optimization has limited impact. Small scale slightly worse (L2 pollution from pinning evicts A/B data). Large scale slightly better (output write-back more efficient). Net: ~0% — not worth the complexity for production use.
+
+### #14: L2 compression — hardware-controlled, no software hint
+
+**What**: Hopper L2 supports hardware compression. ncu showed 0% compression success rate, est. 1.5% speedup if enabled.
+
+**Finding**: L2 compression is a hardware feature that depends on data patterns. Random fp16 data (our input) is not compressible (high entropy). There is no CUDA API to "hint" the L2 to try compression — it either works (data is compressible) or doesn't (data is random).
+
+**Conclusion**: Cannot be controlled from software. Would only help with structured/low-entropy data patterns (e.g., sparse tensors, zero-padded regions). Not applicable to dense random GEMM.
