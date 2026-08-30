@@ -10,26 +10,28 @@ Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see code changes
 
 ## Master Performance Table
 
-All numbers measured with fresh compilation, L2-flushed CUDA Events (our kernel) / plain timing (cuBLAS FP16).
-v5/v6/v7 "best sk" = optimal split_k for that shape (tuned per size).
+All numbers FP16 input / FP32 accumulator / FP16 output (no FP8).
+Measured with fresh compilation, L2-flushed CUDA Events (our kernel) / plain timing (cuBLAS FP16).
+v5/v6 "best sk" = optimal split_k for that shape (tuned per size).
 
-| Shape | cuBLAS | v1-base | v2-persist | v3-swizzle | v4-blk96 | v5-sk(best) | v6-sk(best) | v7-sk(best) | Dispatch | Best vs cuBLAS |
-|--------|--------|---------|------------|------------|----------|-------------|-------------|-------------|----------|-----------------|
-| 512³   | 20.2   | 12.1    | 12.1       | 12.1       | 12.1     | 42.9 (sk8)  | 41.3 (sk8)  | **48.9 (sk1)** | v7-small | **+142%** |
-| 1024³  | 95.4   | 51.2    | 51.5       | 51.9       | 51.6     | 91.4 (sk2)  | 89.9 (sk2)  | 87.7 (sk2)  | v6-large | -4.2%     |
-| 2048³  | 127.4  | 110.5   | 111.3      | 111.9      | 112.0    | 118.5 (sk4) | 124.6 (sk4) | 108.7 (sk1) | v6-large | -2.2%     |
-| 4096³  | 132.2  | 130.6   | 132.3      | 131.9      | 132.1    | 132.6 (sk4) | 134.6 (sk4) | 118.4 (sk1) | v6-large | **+1.8%** |
-| 8192³  | 137.6  | 137.4   | 138.3      | 138.3      | 138.5    | 140.2 (sk2) | 141.2 (sk2) | 117.5 (sk4) | v6-large | **+2.6%** |
-| 16384³ | 139.3  | 141.9   | 141.6      | 141.6      | 141.6    | 141.8 (sk1) | 141.8 (sk1) | 117.4 (sk8) | v6-large | **+1.8%** |
+| Shape | cuBLAS | v1-base | v2-persist | v3-swizzle | v4-blk96 | v5-sk(best) | v6-sk(best) | v7-dispatch | cluster | Best vs cuBLAS |
+|--------|--------|---------|------------|------------|----------|-------------|-------------|-------------|---------|-----------------|
+| 512³   | 21.1   | 12.1    | 12.1       | 12.2       | 12.2     | 43.0 (sk8)  | 42.0 (sk8)  | **48.4**    | 22.0    | **+129%** |
+| 1024³  | 95.4   | 51.5    | 51.7       | 51.7       | 51.5     | 91.3 (sk2)  | 90.7 (sk2)  | 83.0        | **94.1** | -1.3%     |
+| 2048³  | 127.8  | 110.5   | 111.2      | 111.9      | 112.2    | 118.3 (sk4) | **124.5** (sk4) | 109.8   | —       | -2.6%     |
+| 4096³  | 132.0  | 130.5   | 131.0      | 131.9      | 132.4    | 132.2 (sk4) | **134.7** (sk4) | 119.8   | 130.9   | **+2.0%** |
+| 8192³  | 137.5  | 137.4   | 138.1      | 138.6      | 138.3    | 140.2 (sk2) | **141.2** (sk2) | 113.2   | —       | **+2.7%** |
+| 16384³ | 139.2  | **141.9** | 141.5    | 141.6      | 141.6    | 141.8 (sk1) | 141.8 (sk1) | 111.5       | —       | **+1.9%** |
 
 **Dispatch mode**: `M*N < 1024*1024` → small tile (v7: 64x64, S5, 2 blocks/SM); else → large tile (v6: 128x256, S3, 1 block/SM).
-This gives **5/6 shapes beating cuBLAS** (only 1024³ loses by 4.2%).
+v7 dispatch uses best sk per shape (small tile for 512³, large tile for 4096³+).
 
-### Key takeaways
-- **Small scale (512³)**: Split-K is the game changer — sk=8 gives **+254%** vs baseline, **+112%** vs cuBLAS.
-- **Medium scale (2048³-4096³)**: v6 (persistent+sk+epi) best, **+1.8%** beats cuBLAS at 4096³.
-- **Large scale (8192³+)**: v1 already beats cuBLAS; v6 adds +2.6% at 8192³. All converge to ~142T (96% peak) at 16384³.
-- **v6 wins 4/6 shapes** (2048³, 4096³, 8192³, ties 16384³). v5 wins 512³ (epi-overlap hurts small scale).
+### Key takeaways (FP16 only)
+- **Small scale (512³)**: v7 small tile wins — 48.4T = **+129%** vs cuBLAS
+- **Medium scale (2048³-4096³)**: v6 (persistent+sk+epi) best — 134.7T at 4096³ = **+2.0%** vs cuBLAS
+- **Large scale (8192³+)**: v1 baseline already beats cuBLAS; v6 adds +2.7% at 8192³
+- **v6 wins 3/6 shapes** (2048³, 4096³, 8192³), v7 wins 512³, v1 wins 16384³, cluster wins 1024³ (close to cuBLAS)
+- **We beat cuBLAS at 4/6 shapes** in FP16: 512³ (+129%), 4096³ (+2.0%), 8192³ (+2.7%), 16384³ (+1.9%)
 
 ---
 
@@ -37,12 +39,12 @@ This gives **5/6 shapes beating cuBLAS** (only 1024³ loses by 4.2%).
 
 | Shape | v1 | v2 | v3 | v4 | v5 | v6 | cuBLAS |
 |--------|------|------|------|------|------|------|--------|
-| 512³   | 12.1 | 12.1 | 12.1 | 12.1 | 12.2 | 12.0 | 20.2   |
-| 1024³  | 51.2 | 51.5 | 51.9 | 51.6 | 51.9 | 51.4 | 95.4   |
-| 2048³  | 110.5| 111.3| 111.9| 112.0| 111.3| 112.5| 127.4  |
-| 4096³  | 130.6| 132.3| 131.9| 132.1| 131.2| 132.9| 132.2  |
-| 8192³  | 137.4| 138.3| 138.3| 138.5| 138.6| 139.1| 137.6  |
-| 16384³ | 141.9| 141.6| 141.6| 141.6| 141.8| 141.8| 139.3  |
+| 512³   | 12.1 | 12.1 | 12.2 | 12.2 | 12.2 | 12.0 | 21.1   |
+| 1024³  | 51.5 | 51.7 | 51.7 | 51.5 | 51.9 | 51.4 | 95.4   |
+| 2048³  | 110.5| 111.2| 111.9| 112.2| 111.3| 112.5| 127.8  |
+| 4096³  | 130.5| 131.0| 131.9| 132.4| 131.2| 132.9| 132.0  |
+| 8192³  | 137.4| 138.1| 138.6| 138.3| 138.6| 139.1| 137.5  |
+| 16384³ | 141.9| 141.5| 141.6| 141.6| 141.8| 141.8| 139.2  |
 
 At sk=1 (no split-K), differences between tags are small (<2%). v2-v4 persistent variants show +0.5-1.3% at medium scale (2048³-4096³) from tail-wave elimination. v6 persistent+epi shows +0.7-1.7% at 4096³+ from epilogue overlap. All converge at 16384³ (enough waves to make tail/epilogue negligible).
 
@@ -416,18 +418,19 @@ smem 89KB → 2 blocks/SM → occupancy 25%. 1 MMA WG + 1 DMA WG = 256 threads.
 
 ---
 
-## Optimization vs cuBLAS Summary (with dispatch)
+## Optimization vs cuBLAS Summary (FP16, fresh data)
 
 | Shape | cuBLAS | Our best | Config | Margin |
 |--------|--------|----------|--------|--------|
-| 512³   | 20.2   | **48.9** | v7-small sk1 | **+142%** |
-| 1024³  | 95.4   | 91.4     | v6-large sk2 | -4.2%  |
-| 2048³  | 127.4  | 124.6    | v6-large sk4 | -2.2%  |
-| 4096³  | 132.2  | **134.6**| v6-large sk4 | **+1.8%** |
-| 8192³  | 137.6  | **141.2**| v6-large sk2 | **+2.6%** |
-| 16384³ | 139.3  | **141.9**| v6-large sk1 | **+1.8%** |
+| 512³   | 21.1   | **48.4** | v7 dispatch (small tile) | **+129%** |
+| 1024³  | 95.4   | **94.1** | cluster (no mcast) | -1.3%  |
+| 2048³  | 127.8  | **124.5**| v6 sk4 | -2.6%  |
+| 4096³  | 132.0  | **134.7**| v6 sk4 | **+2.0%** |
+| 8192³  | 137.5  | **141.2**| v6 sk2 | **+2.7%** |
+| 16384³ | 139.2  | **141.9**| v1 sk1 | **+1.9%** |
 
-**With dispatch mode: 5/6 shapes beat cuBLAS** (only 1024³ loses by 4.2%).
+**We beat cuBLAS at 4/6 shapes** in FP16 (512³, 4096³, 8192³, 16384³).
+cuBLAS wins at 1024³ (+1.3%) and 2048³ (+2.6%) — its heuristic dispatch picks better tile sizes for medium scale.
 
 ---
 
