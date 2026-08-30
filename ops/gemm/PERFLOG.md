@@ -564,3 +564,27 @@ Ordered by priority (impact on #1 bottleneck: CTA barrier stall 73.3%).
 This is the Hopper design philosophy: **long-latency MMA + hardware pipeline replace multi-warp latency hiding**.
 
 **Reverted**: FP16 acc (precision loss not worth +0.2-0.5%), min_blocks_per_mp=2 (no gain, slight loss from spill overhead).
+
+### #5: reg_dealloc<24> (producer) — no-op
+
+**What**: Reduce producer register budget from 40 to 24 (matching HPC-Ops). `LOAD_REGISTER_REQUIREMENT = 24`.
+
+**Result**: No change — 512³ 48.6 vs 48.5T, 4096³ 132.8 vs 133.1T, 16384³ 141.2 vs 141.2T.
+
+**Why no-op**: Producer registers don't affect consumer allocation. Consumer already targets 232 regs/thread (budget allows 244). Reducing producer from 40→24 frees 16×128=2048 regs, but consumer doesn't claim them (already has enough). The freed space sits idle.
+
+### #9: K-loop unroll=2/4 — no net gain
+
+**What**: Change consumer K-tile loop `unroll=1` to `unroll=2` or `unroll=4` to increase instruction-level parallelism (ILP).
+
+**Results**:
+
+| unroll | 512³ | 4096³ | 16384³ |
+|--------|------|-------|--------|
+| 1 (baseline) | 48.5 | 132.8 | 141.2 |
+| 2 | 49.0 (+1.0%) | 131.6 (-0.9%) | 140.5 (-0.5%) |
+| 4 | 48.1 (-0.8%) | 131.6 (-0.9%) | 140.9 (-0.2%) |
+
+**Analysis**: ILP vs I-cache tradeoff. Unrolling 2× issues more independent wgmma instructions per fetch, helping small scale (512³ +1%). But the larger code footprint evicts I-cache at larger scale, costing -0.5~0.9%. Net effect negative.
+
+**Reverted** to `unroll=1`.
