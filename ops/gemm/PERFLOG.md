@@ -501,3 +501,29 @@ Ordered by priority (impact on #1 bottleneck: CTA barrier stall 73.3%).
 | 14 | L2 compression hint | Self | Host-side | ~0% | Currently 0% hit, mark compressible |
 | 15 | FP8 dtype | Self | Hard | +50-100%? | 2x peak (need H20 wgmma FP8 support check) |
 | 16 | 2:4 structured sparsity | Self | Hard | +50-100%? | 2x peak (need sparse input) |
+
+---
+
+## Experiment Log
+
+### #2: `__launch_bounds__(384, min_blocks_per_mp)` — case study
+
+**What**: DSL `.launch(min_blocks_per_mp=N)` sets NVVM `minctasm` metadata, telling the compiler to target N blocks/SM for register allocation. `reqntid` (max threads per block) is auto-generated from block size.
+
+**Tested**:
+- `min_blocks_per_mp=1` (both kernels): **no-op**. Compiler already assumes 1 block/SM for register-heavy kernels (154-168 regs/thread). Performance unchanged (48.5 vs 48.9T, 133.1 vs 133.0T — measurement noise).
+- `min_blocks_per_mp=2` (small tile, 256 threads): **kernel hangs >6 minutes** (0.04ms → 360,000ms = 9000x slowdown). Compile only took 0.9s — the hang is purely runtime.
+
+**Root cause of 9000x slowdown** (not just linear spilling):
+
+1. **All variables spill to DRAM**: With 168 regs needed but budget = 65536/(2x256) = 128, 40 registers overflow. But the compiler doesn't just spill 40 — it re-evaluates the entire allocation, spilling pipeline state (count/index/phase), TMA descriptors, wgmma fragments, and potentially parts of the accumulator. Every variable access becomes a ~400-cycle DRAM load.
+
+2. **I-cache explosion**: Spill code inflates SASS (each spill = load + use + store). The kernel binary grows 10x+ → exceeds I-cache (32-64KB) → every instruction fetch misses (~100 cycles instead of ~4).
+
+3. **Near-deadlock pipeline**: Consumer is extremely slow (waiting on DRAM for every variable). Producer fills all 5 pipeline stages quickly, then blocks on `producer_acquire` (stages full). Consumer is stuck loading spilled registers. The mbarrier doesn't deadlock (no timeout on Hopper), but the effective wait time approaches infinity — the consumer takes minutes to complete a single K-tile iteration.
+
+4. **Cascade effect**: Slow consumer → producer stalls → pipeline drains → consumer has nothing to consume → both warps wait → SM idle → entire GPU underutilized.
+
+**Lesson**: `min_blocks_per_mp=2` on a register-heavy kernel causes **exponential collapse**, not linear degradation. To achieve 2 blocks/SM, you must reduce register demand at the source (fp16 accumulator, smaller tile, fewer pipeline stages) — not ask the compiler to force it.
+
+**Path to 2 blocks/SM** (requires #3 fp16 accumulator): 168 regs → ~84 (fp16 acc) → 65536/(2x256) = 128 budget → 84 < 128 ✅ → `min_blocks_per_mp=2` would then be safe.
