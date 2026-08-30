@@ -394,6 +394,7 @@ def gemm(
         grid=(num_persistent, 1, 1),
         block=(NUM_WARPGROUPS * NUM_THREADS_PER_WARPGROUP, 1, 1),
         stream=stream,
+        min_blocks_per_mp=1,
     )
 
 
