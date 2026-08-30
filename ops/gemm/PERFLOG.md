@@ -589,9 +589,12 @@ This is the Hopper design philosophy: **long-latency MMA + hardware pipeline rep
 
 **Reverted** to `unroll=1`.
 
-### #6: In-kernel split-K reduce — DSL limitation, cancelled
+### #6: In-kernel split-K reduce — CopyReduce compilation hang, cancelled
 
-**What**: Fuse the split-K reduction into the GEMM kernel. Instead of host-side `torch.sum`, use `cute.arch.atomic_add` on a per-tile counter; the last CTA for each tile loads all partials, sums, and writes the final result.
+**What**: Fuse the split-K reduction into the GEMM kernel using TMA hardware
+atomic-add (`CopyReduceBulkTensorTileS2GOp(reduction_kind=ADD)`). Each CTA
+would TMA-store directly to the shared `mC` position with atomic add,
+eliminating the separate output buffer and host-side `torch.sum`.
 
 **Measured overhead** (torch.sum, outside kernel timing):
 
@@ -604,11 +607,24 @@ This is the Hopper design philosophy: **long-latency MMA + hardware pipeline rep
 
 The overhead is significant (6-32% of end-to-end time), especially for small scale.
 
-**DSL limitation**: CuTe DSL's `@cute.jit` functions only support 3 `cute.Tensor` parameters (2 inputs + 1 output) followed by `CUstream` and `Constexpr` parameters. Adding a 4th `cute.Tensor` for the atomic counter is silently ignored by the DSL's argument binder — the function signature shows 8 params, not 9.
+**Finding 1: DSL supports 4+ Tensor parameters**. Initial assumption that `@cute.jit`
+limited to 3 Tensor params was **wrong** — adding a `split_counter: cute.Tensor`
+parameter works fine. The earlier error was due to: (a) only modifying the large
+tile kernel while the dispatch mode used the small tile kernel for 512³, and
+(b) `__pycache__` caching stale bytecode.
 
-**Workarounds considered and rejected**:
-1. **Counter pointer as `Constexpr[int]`**: pointer is runtime value, can't be compile-time constant (unless counter is allocated once and never reallocated — fragile for benchmarking)
-2. **Counter embedded in output buffer**: mixed dtype (fp16 output + int32 counter) in same tensor not supported
-3. **Separate CuTe DSL reduction kernel**: not "in-kernel", but could save torch.sum's Python launch overhead
+**Finding 2: `CopyReduceBulkTensorTileS2GOp` causes MLIR compilation hang**.
+The op class exists and can be instantiated, but `make_tiled_tma_atom` +
+`@cute.jit` compilation hangs for >300s (infinite loop or codegen bug in
+nvidia-cutlass-dsl 4.7.0). Three approaches all failed:
+1. `if split_k > 1:` staged-if — op defined inside conditional branch, invisible after
+2. `const_expr(split_k > 1)` — also hangs
+3. Always use CopyReduce (even for sk=1, ADD to zeroed buffer = store) — still hangs
 
-**Decision**: cancelled. The host-side `torch.sum` remains. For production use, a separate `@cute.jit reduce()` kernel could be written, but the DSL limitation prevents true in-kernel fusion.
+**Conclusion**: The theoretical approach (TMA hardware atomic-add) is correct,
+but the DSL compiler (4.7.0) doesn't support `CopyReduceBulkTensorTileS2GOp`
+codegen. Reverted to `CopyBulkTensorTileS2GOp` + output buffer + `torch.sum`.
+
+**Future**: Could be revisited with (a) newer DSL versions, (b) a separate
+`@cute.jit reduce()` kernel using `cute.arch.atomic_add` (SIMT path, not TMA),
+or (c) C++ CUDA kernel for the reduction.
