@@ -34,8 +34,19 @@ from common.bench import (
     run_ncu_profile,
 )
 from common.cute_runtime import make_cute_tensor, make_stream
-from ops.gemm import gemm_kernel as kern
-from ops.gemm.gemm_kernel import gemm
+from ops.gemm import gemm_kernel as kern_large
+from ops.gemm import gemm_kernel_small as kern_small
+from ops.gemm.gemm_kernel import gemm as gemm_large
+from ops.gemm.gemm_kernel_small import gemm as gemm_small
+
+
+_SMALL_TILE_THRESHOLD = 1024 * 1024
+
+
+def _select_kernel(M: int, N: int) -> tuple:
+    if M * N < _SMALL_TILE_THRESHOLD:
+        return kern_small, gemm_small, "small (64x64, S5)"
+    return kern_large, gemm_large, "large (128x256, S3)"
 
 
 def torch_ref(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -43,8 +54,7 @@ def torch_ref(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a.float() @ b.float().t()
 
 
-def _make_kernel_meta(total_tiles: int = 0, split_k: int = 1) -> KernelMeta:
-    """Build KernelMeta from the kernel module's compile-time constants."""
+def _make_kernel_meta(kern, total_tiles: int = 0, split_k: int = 1) -> KernelMeta:
     return KernelMeta(
         name="GEMM",
         tile_dims={
@@ -123,6 +133,7 @@ def _cute_bench(
 
 
 def _compile_and_run(
+    gemm_fn,
     a: torch.Tensor,
     b: torch.Tensor,
     c: torch.Tensor,
@@ -131,10 +142,9 @@ def _compile_and_run(
     K: int,
     split_k: int = 1,
 ) -> object:
-    """Compile the kernel and run it once. Returns the compiled callable."""
     print(f"Compiling CuTe DSL gemm({M}x{N}x{K}, split_k={split_k}) ...")
     compiled = cute.compile(
-        gemm,
+        gemm_fn,
         make_cute_tensor(a, leading_dim=1),
         make_cute_tensor(b, leading_dim=1),
         make_cute_tensor(c, leading_dim=1),
@@ -173,10 +183,12 @@ def run_case(
         output_buf = torch.zeros(M, N, device="cuda", dtype=dtype)
 
     if os.environ.get("NCU_PROFILING") == "1":
-        _compile_and_run(a, b, output_buf, M, N, K, split_k)
+        kern, gemm_fn, tile_desc = _select_kernel(M, N)
+        _compile_and_run(gemm_fn, a, b, output_buf, M, N, K, split_k)
         return True
 
-    compiled = _compile_and_run(a, b, output_buf, M, N, K, split_k)
+    kern, gemm_fn, tile_desc = _select_kernel(M, N)
+    compiled = _compile_and_run(gemm_fn, a, b, output_buf, M, N, K, split_k)
 
     if split_k > 1:
         c = output_buf.view(split_k, M, N).sum(dim=0)
@@ -220,7 +232,8 @@ def run_case(
         total_tiles = blocks_m * blocks_n * split_k
         num_sms = get_gpu_info()["num_sms"]
         grid_blocks = min(total_tiles, num_sms)
-        meta = _make_kernel_meta(total_tiles=total_tiles, split_k=split_k)
+        meta = _make_kernel_meta(kern, total_tiles=total_tiles, split_k=split_k)
+        meta.extra["tile_mode"] = tile_desc
         flops = 2 * M * N * K
         elt_size = a.element_size()
         gmem_bytes = (M * K + N * K + M * N) * elt_size
