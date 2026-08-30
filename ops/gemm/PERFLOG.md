@@ -54,8 +54,9 @@ At sk=1 (no split-K), differences between tags are small (<2%). v2-v4 persistent
 
 **Tag**: `v1-baseline` (`29d7e4a`)
 
-### Optimization
-Full Hopper wgmma+TMA+pipeline kernel with warp specialization:
+### Optimization: Warp Specialization + TMA + Pipeline
+
+**Principle**: WGMMA is a long-latency instruction (~100+ cycles). TMA load is also long-latency (~200+ cycles). Without overlap, they serialize: load → wait → compute → wait → load → ... A **pipeline** with N stages allows the producer to issue TMA loads for the next N tiles while the consumer computes on the current stage — hiding TMA latency behind WGMMA compute. **Warp specialization** further decouples producer (TMA issuer) from consumer (WGMMA compute) — the producer never stalls on MMA and vice versa. Together, pipeline + warp spec achieve ~90% TC throughput on Hopper.
 - wgmma.m64n256k16 (warpgroup MMA, A/B from SMEM via descriptor, no rmem copy)
 - TMA cp.async.bulk.tensor for gmem↔smem (A/B load, D store)
 - 3-stage PipelineTmaAsync (mbarrier-based double buffering)
@@ -108,9 +109,9 @@ Full Hopper wgmma+TMA+pipeline kernel with warp specialization:
 
 **Tag**: `v2-persistent`
 
-### Optimization
-Each CTA loops over multiple output tiles via a stride loop (`for tile_iter in range(tiles_per_cta)`).
-Launch `min(total_tiles, num_sms)` CTAs instead of `total_tiles`.
+### Optimization: Persistent Kernel
+
+**Principle**: In a standard grid, `total_tiles` CTAs are launched. With `total_tiles / num_sms = N` waves, the last wave has `total_tiles % num_sms` active SMs — the rest idle. A persistent kernel launches exactly `num_sms` CTAs, each looping through `ceil(total_tiles / num_sms)` tiles via a stride loop. Every SM works until the last tile is done — **zero tail-wave idle**. The benefit is proportional to `total_tiles % num_sms / num_sms` (the tail fraction).
 **Goal**: eliminate tail-wave SM idling.
 
 ### Three bugs fixed (vs 14-warp-specialization reference)
@@ -725,3 +726,224 @@ cluster phase management).
 **Learning value**: This experiment taught the Hopper cluster programming model
 (cluster launch, `block_in_cluster_idx`, `cta_layout_vmnk`, multicast TMA masks,
 pipeline arrive-count recalculation) even though the DSL can't compile it yet.
+
+---
+
+## Optimization Principles Reference
+
+Each optimization's **theoretical mechanism** — why it can accelerate a GPU kernel,
+even if it didn't help our specific GEMM. Organized by the bottleneck they target.
+
+### Bottleneck 1: CTA Barrier Stall (73.3% of stall time)
+
+The #1 bottleneck in our WGMMA+TMA pipeline. `consumer_wait` blocks the consumer
+until TMA data arrives at the mbarrier; `producer_acquire` blocks the producer until
+the consumer releases a stage. This is **inherent** to the pipeline architecture —
+the question is how to minimize the wait.
+
+#### 1. Pipeline Stages (NUM_STAGES)
+
+**Mechanism**: N-stage pipeline allows producer to issue N TMA loads ahead of the
+consumer's current position. More stages = more TMA overlap = less consumer_wait.
+Diminishing returns: if TMA latency ≈ T cycles and each stage covers T/N overlap,
+beyond N ≈ T/tile_compute, extra stages don't help (pipeline full).
+
+**Our result**: NUM_STAGES=3 is optimal (smem 214KB/228KB limits to 3; 4 doesn't
+fit). Reducing to 2 (v4-blk96) hurt more than the sync reduction helped — **pipeline
+overlap > sync count**.
+
+#### 2. Tile Size vs Pipeline Depth
+
+**Mechanism**: Smaller tile → less smem per stage → more stages fit → more pipeline
+overlap → less barrier wait. Trade-off: smaller tile = less work per wgmma instruction
+= lower TC efficiency (more instructions for same FLOPs).
+
+**Our result**: v7 (64×64, S5) killed barrier stall (74% → 8%, -82%) but TC throughput
+dropped (91% → 83%). Net: small-scale +13% (occupancy wins), large-scale -17% (TC
+efficiency loss). **Optimal tile size varies by problem scale** (cuBLAS does heuristic
+dispatch).
+
+#### 3. Epilogue Overlap
+
+**Mechanism**: After the last WGMMA of a tile, the epilogue (R2S → TMA S2G store)
+takes ~180 cycles with TC idle. If we issue the TMA store but don't wait
+(`cp_async_bulk_commit_group` without `wait_group`), the next tile's mainloop can
+start immediately. `wait_group(1)` at the next epilogue start waits for the previous
+store — by then, the mainloop has run enough cycles to hide the store latency.
+
+**Our result**: +1.4% at 2048³ (mainloop 800 cyc >> store 180 cyc → full overlap).
+-4.2% at 512³ sk=8 (mainloop 50 cyc << store 180 cyc → wait stalls). **Only helps
+when mainloop > store duration**.
+
+#### 4. Per-Warpgroup Barriers
+
+**Mechanism**: Currently both MMA warpgroups share one mbarrier for consumer_release.
+WG1 can't proceed until WG2 also releases. With per-WG barriers, each WG independently
+signals "I'm done with this stage" — no cross-WG waiting.
+
+**Our result**: Cancelled — DSL `PipelineTmaAsync` abstraction doesn't support per-WG
+mbarrier on shared smem. Requires manual mbarrier management (C++ CUDA, like HPC-Ops).
+
+#### 5. Manual Barrier (vs PipelineTmaAsync)
+
+**Mechanism**: PipelineTmaAsync is a high-level abstraction that manages mbarrier
+arrive/wait automatically. Manual mbarrier (`init`/`arrive`/`wait`/`tx_bytes`) gives
+finer control — e.g., separate arrive for A vs B, or per-WG arrive counts. Can reduce
+wait time by matching arrive semantics to actual access patterns.
+
+**Our result**: Cancelled — DSL doesn't expose low-level mbarrier API directly in
+@cute.kernel functions. HPC-Ops uses C++ CUDA with `FullBarrier::init/arrive/wait`.
+
+### Bottleneck 2: SM Underutilization (small scale)
+
+Small problems have too few tiles to fill all SMs (512³ = 8 tiles on 78 SMs = 0.1
+waves → 90% of SMs idle). This is a **parallelism** problem, not a compute problem.
+
+#### 6. Split-K
+
+**Mechanism**: Split K dimension into `split_k` partitions. Each partition computes
+a partial result (partial GEMM over a K slice). Grid grows from `M×N` to `M×N×split_k`
+— more CTAs = more parallelism. Host-side reduction (`torch.sum`) combines partials.
+
+**Our result**: 512³ sk=8 = 42.9T (+254% vs baseline, +129% vs cuBLAS). But non-monotonic:
+1024³ sk=2 (91.3T) > sk=4 (84.4T) because fewer K-tiles/CTA → pipeline fill/drain
+overhead dominates. **Best split_k varies by problem size**.
+
+#### 7. Persistent Kernel
+
+**Mechanism**: Launch `num_sms` CTAs instead of `total_tiles`. Each CTA strides
+through `ceil(total_tiles/num_sms)` tiles. Eliminates the last partial wave where
+`total_tiles % num_sms` SMs are idle.
+
+**Our result**: No gain — 4096³ has 6.56 waves, tail is 0.56 waves = 8% of time, but
+per-tile overhead (consumer setup per tile due to DSL staged-if) ate the benefit.
+512³ has 0.1 waves (fewer tiles than SMs) — persistent can't help. **Only helps
+when total_tiles >> num_sms AND per-tile overhead < tail-wave savings**.
+
+### Bottleneck 3: Register Pressure
+
+WGMMA accumulator uses ~32 fp32 registers per thread (128×256×4B / 256 threads).
+With overhead, total = 154-168 regs/thread → 1 block/SM (register-limited).
+
+#### 8. FP16 Accumulator
+
+**Mechanism**: FP16 accumulator uses half the register width (16-bit vs 32-bit per
+element). ~84 regs/thread instead of 168 → fits 2 blocks/SM (budget 65536/2×256=128).
+More blocks = more warps = better latency hiding.
+
+**Our result**: 2 blocks/SM achieved, but **TC throughput unchanged** (83% → 83%).
+Hopper's TC is SM-level shared — a second block's wgmma queues behind the first.
+**Occupancy doesn't matter for compute-bound wgmma kernels on Hopper.** The TC
+pipeline (not warp scheduling) hides latency.
+
+#### 9. `__launch_bounds__` / `min_blocks_per_mp`
+
+**Mechanism**: Compiler hint `min_blocks_per_mp=N` tells the compiler to target N
+blocks/SM for register allocation. Max regs/thread = 65536/(N×threads). With N=2
+and 256 threads: max=128. If kernel needs 168, the compiler spills 40+ to DRAM.
+
+**Our result**: N=1 = no-op (compiler already assumed 1). N=2 = **9000× slowdown**
+(exponential collapse from cascade: register spill → DRAM access → I-cache miss →
+pipeline near-deadlock). **Must reduce register demand at source, not force it**.
+
+#### 10. `warpgroup_reg_dealloc` / `warpgroup_reg_alloc`
+
+**Mechanism**: Hopper allows different warpgroups within a CTA to have different
+register budgets. Producer warpgroup "deallocates" (returns) registers it doesn't
+need → consumer warpgroup "allocates" (claims) them for accumulator/descriptors.
+
+**Our result**: `reg_dealloc<24>` (40→24) = no-op. Consumer already targets 232
+regs (budget allows 244). The freed 16×128=2048 registers sit idle — consumer
+doesn't claim them. **Producer register savings don't transfer to consumer**.
+
+### Bottleneck 4: Memory Bandwidth (not our bottleneck — DRAM 4.3%)
+
+#### 11. TMA Multicast + Cluster
+
+**Mechanism**: In a cluster of N CTAs, when multiple CTAs need the same A or B data,
+one "leader" CTA issues a multicast TMA load. The TMA hardware reads from gmem once
+and writes to all N CTAs' smem simultaneously via the cluster DSMEM bus. Saves N×
+gmem reads for shared data.
+
+**Important clarification**: "multiple CTAs doing one MMA" is a **misconception**.
+WGMMA is a single-CTA instruction — no cross-CTA compute cooperation. Cluster enables
+**data sharing** (multicast), not **compute cooperation**. Each CTA still runs its
+own wgmma on its own output tile, but they share input data → less gmem bandwidth.
+
+**Our result**: 9 approaches all failed in DSL 4.7.0 (compilation hang, segfault,
+RE=70%). DSL codegen doesn't support `CopyBulkTensorTileG2SMulticastOp` + WGMMA +
+PipelineTmaAsync. Even if it worked: our kernel is compute-bound (DRAM 4.3%), so
+bandwidth savings would give ~0-2%.
+
+#### 12. L2 Cache Pinning
+
+**Mechanism**: `cuStreamSetAttribute` with `CUaccessPolicyWindow` tells the L2 to
+prioritize caching the output tensor. Repeated writes to the same output region
+(e.g., persistent kernel) benefit from L2 persistence — fewer DRAM write-backs.
+
+**Our result**: +0.9% at 4096³ (slight write-back improvement), -0.6% at 512³ (L2
+pollution evicts A/B data). **Marginal for compute-bound kernels** (DRAM < 5%).
+
+#### 13. L2 Compression
+
+**Mechanism**: Hopper L2 hardware automatically attempts to compress cache lines.
+If data has low entropy (e.g., zeros, repeated patterns), compression succeeds →
+more effective L2 capacity → better hit rate.
+
+**Our result**: 0% compression success (random fp16 = high entropy). No software
+API to control this — it's hardware-automatic. **Only helps with structured/low-
+entropy data** (e.g., sparse tensors, zero-padded regions).
+
+### Bottleneck 5: Instruction-Level Parallelism (ILP)
+
+#### 14. K-loop Unroll
+
+**Mechanism**: Unrolling the K-tile loop by factor N issues N independent
+`cute.gemm` calls per loop iteration. The instruction scheduler can issue multiple
+WGMMA instructions in parallel (ILP), potentially filling TC pipeline bubbles.
+
+**Our result**: unroll=2 → 512³ +1.0% (ILP helps when few K-tiles), 4096³ -0.9%
+(larger code → I-cache miss). unroll=4 → worse everywhere. **ILP vs I-cache tradeoff**.
+
+#### 15. Double Accumulator (Ping-Pong)
+
+**Mechanism**: Two accumulators alternate per tile. While accumulator A is being
+drained (R2S → TMA S2G store, ~20 cycles on LSU pipeline), accumulator B is being
+filled (next tile's WGMMA, ~100+ cycles on TC pipeline). Overlaps LSU with TC.
+
+**Our result**: Not implemented — DSL staged-if limitation prevents selecting between
+two rmem tensors with runtime condition (`tile_iter % 2`). Even if implemented: R2S
+(~20 cyc) << WGMMA (~100+ cyc), so overlap window is small. Existing epi-overlap
+already captures the larger TMA-store-vs-mainloop overlap.
+
+### Other Optimizations
+
+#### 16. Block Swizzle (tile reordering)
+
+**Mechanism**: Reorder tile processing so that a group of `GROUP_M` consecutive
+M-tiles are processed together before striding N. Adjacent M-tiles share A rows →
+L2 can serve A from cache instead of gmem. Reduces gmem reads for A by ~GROUP_M×.
+
+**Our result**: L2 hit rate DROPPED 4% (66% → 62%) — GROUP_M=4 increases working set
+(6 active M-blocks vs 5), exceeding L2 capacity (60MB) for 4096³ data (64MB). Also,
+default M-major order already maximizes A reuse. **Only helps for memory-bound
+kernels where L2 is the bottleneck and data fits in L2**.
+
+#### 17. Padding for Non-Aligned Shapes
+
+**Mechanism**: TMA loads a fixed-size (BLK_M, BLK_K) box. When K isn't a multiple
+of BLK_K, the last box reads OOB gmem (TMA doesn't zero-pad). Padding A/B/output
+to tile multiples ensures all TMA boxes are valid.
+
+**Our result**: Fixed RE=141% → 0% for non-aligned shapes (1024×1024×333, 1000×777×333).
+**Correctness fix, not performance optimization.**
+
+#### 18. BLK_K Increase (64→96) + Fewer Stages (3→2)
+
+**Mechanism**: Larger BLK_K means fewer K-tiles → fewer pipeline sync points (64
+→ 43 syncs, -33%). But larger BLK_K means more smem per stage → fewer stages fit
+(3→2) → less pipeline overlap.
+
+**Our result**: -0.9% (pipeline overlap loss > sync reduction). **Pipeline depth
+(NUM_STAGES) is more valuable than sync count**. The 3-stage pipeline hides TMA
+latency better; the extra sync overhead is offset by overlap.
