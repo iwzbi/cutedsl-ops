@@ -206,8 +206,9 @@ def run_case(
     split_k: int = 1,
 ) -> bool:
     torch.cuda.manual_seed_all(9527)
-    a = torch.randn(M, K, device="cuda", dtype=dtype) * 0.5
-    b = torch.randn(N, K, device="cuda", dtype=dtype) * 0.5
+    a = (torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.5).to(dtype)
+    b = (torch.randn(N, K, device="cuda", dtype=torch.float16) * 0.5).to(dtype)
+    c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
 
     kern, gemm_fn, tile_desc = _select_kernel(M, N)
 
@@ -228,9 +229,9 @@ def run_case(
         M_use, N_use, K_use = M, N, K
 
     if split_k > 1:
-        output_buf = torch.zeros(split_k * M_use, N_use, device="cuda", dtype=dtype)
+        output_buf = torch.zeros(split_k * M_use, N_use, device="cuda", dtype=torch.float16)
     else:
-        output_buf = torch.zeros(M_use, N_use, device="cuda", dtype=dtype)
+        output_buf = torch.zeros(M_use, N_use, device="cuda", dtype=torch.float16)
 
     if os.environ.get("NCU_PROFILING") == "1":
         _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k)
@@ -243,8 +244,9 @@ def run_case(
     else:
         c = output_buf[:M, :N]
 
-    ref = torch_ref(a, b).to(dtype)
-    ok = compare_tensor(c, ref, name=f"gemm {M}x{N}x{K} sk={split_k}")
+    ref = torch_ref(a, b).to(torch.float16)
+    tol = 5e-2 if dtype == torch.float8_e4m3fn else 1e-2
+    ok = compare_tensor(c, ref, name=f"gemm {M}x{N}x{K} sk={split_k}", tol=tol)
 
     if bench and ok:
         _setup_l2_pinning(output_buf)
@@ -310,6 +312,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("This example requires a CUDA-capable GPU (sm_80+).")
 
+    use_fp8 = "--fp8" in sys.argv
     use_cuda_graphs = "--cuda-graphs" in sys.argv
     use_cupti = "--cupti" in sys.argv
     use_ncu = "--ncu" in sys.argv or "--ncu-raw" in sys.argv or "--ncu-gui" in sys.argv
@@ -324,12 +327,15 @@ def main() -> None:
     args = [int(x) for x in sys.argv[1:4]]
     shapes = [tuple(args)] if len(args) == 3 else [(1024, 1024, 1024)]
 
+    dtype = torch.float8_e4m3fn if use_fp8 else torch.float16
+
     counters = {"succeed": 0, "failed": 0}
     for M, N, K in shapes:
         if run_case(
             M,
             N,
             K,
+            dtype=dtype,
             bench=True,
             use_cuda_graphs=use_cuda_graphs,
             use_cupti=use_cupti,

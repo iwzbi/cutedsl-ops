@@ -168,6 +168,7 @@ def get_gpu_info() -> dict:
         "bus_width_bits": bus_width,
         "hbm_bw_gbs": hbm_bw_gbs,
         "peak_fp16_tflops": peak_fp16,
+        "peak_fp8_tflops": peak_fp16 * 2,  # FP8 = 2x FP16 throughput on Hopper sm_90
     }
     return _GPU_INFO
 
@@ -275,8 +276,10 @@ def print_bench_report(
 
     # --- compute metrics ---
     tflops = flops / ms / 1e9
-    peak_fp16 = gpu["peak_fp16_tflops"]
-    peak_pct = tflops / peak_fp16 * 100 if peak_fp16 else 0.0
+    is_fp8 = "float8" in str(dtype)
+    peak_key = "peak_fp8_tflops" if is_fp8 else "peak_fp16_tflops"
+    peak = gpu[peak_key] if gpu.get(peak_key) else gpu["peak_fp16_tflops"]
+    peak_pct = tflops / peak * 100 if peak else 0.0
 
     bandwidth_gbs = gmem_bytes / ms / 1e6
     hbm_pct = bandwidth_gbs / gpu["hbm_bw_gbs"] * 100 if gpu["hbm_bw_gbs"] else 0.0
@@ -304,7 +307,7 @@ def print_bench_report(
     # --- Performance ---
     print("  --- Performance ---")
     print(f"  {'Time':<24} {ms:.4f} ms/call  ({timing_mode}, {warmup} warmup + {iterations} iters)")
-    print(f"  {'TFLOPS':<24} {tflops:,.1f} / {peak_fp16:,.0f} peak ({peak_pct:.1f}%)")
+    print(f"  {'TFLOPS':<24} {tflops:,.1f} / {peak:,.0f} peak ({peak_pct:.1f}%)")
     print()
 
     # --- Theoretical Analysis ---

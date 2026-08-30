@@ -286,10 +286,11 @@ def gemm(
     acc_dtype = cutlass.Float32
     out_dtype = mC.element_type
 
-    op = cute.nvgpu.warpgroup.MmaF16BF16Op(
+    op = cute.nvgpu.warpgroup.MmaF8Op(
         mA.element_type,
+        mB.element_type,
         acc_dtype,
-        (64, BLK_N, 16),
+        (64, BLK_N, 32),
         OperandSource.SMEM,
         OperandMajorMode.K,
         OperandMajorMode.K,
