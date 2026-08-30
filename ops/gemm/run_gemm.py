@@ -69,7 +69,12 @@ def _make_kernel_meta(kern, total_tiles: int = 0, split_k: int = 1) -> KernelMet
         },
         block_threads=kern.NUM_WARPGROUPS * kern.NUM_THREADS_PER_WARPGROUP,
         block_description=(
-            f"{kern.NUM_WARPGROUPS} warpgroups: {kern.NUM_DMA_WARPGROUPS} DMA + {kern.NUM_MMA_WARPGROUPS} MMA"
+            f"{kern.NUM_WARPGROUPS} warpgroups"
+            + (
+                f": {kern.NUM_DMA_WARPGROUPS} DMA + {kern.NUM_MMA_WARPGROUPS} MMA"
+                if hasattr(kern, "NUM_DMA_WARPGROUPS")
+                else " (no warp spec)"
+            )
         ),
         grid_mode="persistent",
         extra={
