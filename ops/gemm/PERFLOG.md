@@ -254,6 +254,33 @@ Host-side `sum(dim=0)` reduces. **Goal**: multiply blocks count for small proble
 - **8192³ sk=2: +1.9% vs cuBLAS** — enough blocks + still good pipeline efficiency
 - **Correctness**: RE ≤ 0.04% across all sk values (host-side reduction is exact)
 
+### L2 Cache Impact (split-K reduces working set)
+
+Split-K increases L2 hit rate from 66% (v1) to 88% (v6) — not by adding L2 capacity, but by **reducing the per-CTA data footprint** so the wave's working set fits in L2.
+
+For 4096³ fp16 (BLK_M=128, BLK_N=256, BLK_K=64):
+
+| | sk=1 (v1) | sk=4 (v6) |
+|---|---|---|
+| K-tiles/CTA | 64 | 16 (K/4) |
+| A data/CTA | 128×4096×2B = 1MB | 128×1024×2B = 256KB |
+| B data/CTA | 256×4096×2B = 2MB | 256×1024×2B = 512KB |
+| Total/CTA | 3MB | 768KB |
+
+One wave = 78 CTAs. With data sharing (same bidy → share A, same bidx → share B):
+
+| | sk=1 | sk=4 |
+|---|---|---|
+| Unique M-blocks/wave | 5 | ~2/split × 4 = 8 |
+| Unique N-blocks/wave | 16 | ~10/split × 4 = 40 |
+| **Wave working set** | **37MB** (5×1MB + 16×2MB) | **22MB** (4 × 5.5MB) |
+| L2 = 60MB | borderline (37MB + pipeline overhead) | comfortable (22MB << 60MB) |
+| **L2 Hit Rate** | 66% | **88%** |
+
+Note: the "70MB" figure sometimes cited is the total A+B matrix size (67MB), not the working set. The working set is smaller due to data sharing across CTAs.
+
+Caveat: L2 improvement has limited impact on our compute-bound kernel (DRAM 4.4%). The TFLOPS gain comes mainly from more blocks, not better L2.
+
 ### Shortcomings
 - **Non-monotonic**: 1024³ sk=2 (91.4T) > sk=4 (84.4T) — sk=4 gives only 16 K-tiles/CTA, pipeline fill/drain overhead dominates (NUM_STAGES=3 but only 16 iterations)
 - **Large scale unaffected**: 4096³+ already has enough blocks, split-K only adds reduction overhead
@@ -341,3 +368,51 @@ Three techniques combined:
 | 16384³ | 139.3  | 141.9    | v1-sk1  | **+1.8%** |
 
 **We beat cuBLAS at 4/6 shapes** (512³, 4096³, 8192³, 16384³). cuBLAS wins at 1024³-2048³ (where its heuristic dispatch picks better tile sizes/split-K for medium scale).
+
+---
+
+## HPC-Ops Reference Analysis (Tencent production kernel)
+
+Source: `/home/code/hpc-ops/src/gemm/sm90/gemm.cu` (557 lines, C++ CUDA, H20-optimized).
+This is a BF16×FP32 GEMM (router GEMM), not our FP16×FP16, but the optimization techniques are transferable.
+
+### Techniques HPC-Ops uses that we also use
+- ✅ Persistent kernel (`while(true)` + `iblock += gridDim.x`)
+- ✅ Block swizzle (`kBlockSwizzle=4` + flat fallback for tail)
+- ✅ Split-K (`kSplitK` parameter, in-grid Z stride)
+- ✅ Epilogue overlap (TMA store arrive without wait, wait at next tile)
+- ✅ Warp specialization (producer/consumer split, reg_dealloc/alloc)
+- ✅ SW128 swizzle
+
+### Techniques HPC-Ops uses that we DON'T (key findings)
+
+| # | Technique | HPC-Ops | Our kernel | Impact |
+|---|---|---|---|---|
+| 1 | **Smaller tiles + more stages** | 64×64×64, kStage=**5** | 128×256×64, kStage=3 | More pipeline overlap → less CTA barrier stall |
+| 2 | **Per-warpgroup B barriers** | Each WG has own barrier for W | All WGs share one mbarrier | WG0 starts as soon as its W arrives, doesn't wait for WG1's W |
+| 3 | **In-kernel split-K reduction** | atomicAdd flag + spin-wait + reduce() in same kernel | Host-side torch.sum(dim=0) | No extra kernel launch + memory traffic |
+| 4 | **launch_bounds** | `__launch_bounds__(384, 1)` | none | Compiler optimizes reg allocation for 1 block/SM |
+| 5 | **Manual barrier management** | Raw barriers (init/wait/arrive/tx_bytes) | PipelineTmaAsync abstraction | More fine-grained control over sync timing |
+| 6 | **Lower producer regs** | reg_dealloc<24> | reg_dealloc<40> | Producer uses fewer regs, more for consumer |
+| 7 | **Block swizzle with flat fallback** | Swizzle for main tiles, flat for tail | GROUP_M=4 everywhere (no fallback) | Tail tiles don't get swizzle overhead |
+| 8 | **Per-warpgroup W partitioning** | Each WG loads own W slice via TMA | All WGs share one full W TMA load | Smaller TMA per WG, independent arrival |
+
+### Key insight: smaller tiles → more pipeline stages → less barrier stall
+
+Our kernel: BLK_M=128, BLK_N=256 → smem 214KB → only fits kStage=3
+HPC-Ops: BLK_M=64, BLK_N=64 → smem ~88KB → fits kStage=**5**
+
+```
+Our kStage=3:    3 stages of overlap → CTA barrier stall 74.3%
+HPC kStage=5:    5 stages of overlap → more TMA latency hidden → less stall
+```
+
+This is the single most actionable finding: **reduce tile size to increase pipeline depth**.
+The tradeoff: smaller tiles = more tiles = more grid overhead + smaller wgmma atom (less work per instruction). HPC-Ops uses `SM90_64x64x16` (half our 64x256x16) — same K but smaller N.
+
+### What we should try next (prioritized by HPC-Ops findings)
+1. **launch_bounds** (#4) — trivial, 1 line, helps compiler
+2. **kStage=5 with smaller tiles** (#1) — the big one, addresses 74.3% barrier stall
+3. **Per-warpgroup B barriers** (#2) — requires manual barrier management
+4. **In-kernel split-K reduction** (#3) — eliminates host-side reduction
+5. **reg_dealloc<24>** (#6) — lower producer reg budget
