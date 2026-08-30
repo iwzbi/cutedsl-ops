@@ -588,3 +588,27 @@ This is the Hopper design philosophy: **long-latency MMA + hardware pipeline rep
 **Analysis**: ILP vs I-cache tradeoff. Unrolling 2× issues more independent wgmma instructions per fetch, helping small scale (512³ +1%). But the larger code footprint evicts I-cache at larger scale, costing -0.5~0.9%. Net effect negative.
 
 **Reverted** to `unroll=1`.
+
+### #6: In-kernel split-K reduce — DSL limitation, cancelled
+
+**What**: Fuse the split-K reduction into the GEMM kernel. Instead of host-side `torch.sum`, use `cute.arch.atomic_add` on a per-tile counter; the last CTA for each tile loads all partials, sums, and writes the final result.
+
+**Measured overhead** (torch.sum, outside kernel timing):
+
+| Shape | sk | torch.sum | GEMM kernel | Reduction % of total |
+|-------|----|-----------|-------------|----------------------|
+| 512³  | 8  | 0.010ms   | 0.02ms      | **32%**              |
+| 1024³ | 2  | 0.010ms   | 0.04ms      | **20%**              |
+| 4096³ | 4  | 0.088ms   | 1.3ms       | 6.3%                 |
+| 8192³ | 2  | 0.364ms   | 4.7ms       | 7.2%                 |
+
+The overhead is significant (6-32% of end-to-end time), especially for small scale.
+
+**DSL limitation**: CuTe DSL's `@cute.jit` functions only support 3 `cute.Tensor` parameters (2 inputs + 1 output) followed by `CUstream` and `Constexpr` parameters. Adding a 4th `cute.Tensor` for the atomic counter is silently ignored by the DSL's argument binder — the function signature shows 8 params, not 9.
+
+**Workarounds considered and rejected**:
+1. **Counter pointer as `Constexpr[int]`**: pointer is runtime value, can't be compile-time constant (unless counter is allocated once and never reallocated — fragile for benchmarking)
+2. **Counter embedded in output buffer**: mixed dtype (fp16 output + int32 counter) in same tensor not supported
+3. **Separate CuTe DSL reduction kernel**: not "in-kernel", but could save torch.sum's Python launch overhead
+
+**Decision**: cancelled. The host-side `torch.sum` remains. For production use, a separate `@cute.jit reduce()` kernel could be written, but the DSL limitation prevents true in-kernel fusion.
