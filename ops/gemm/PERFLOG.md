@@ -625,6 +625,21 @@ nvidia-cutlass-dsl 4.7.0). Three approaches all failed:
 but the DSL compiler (4.7.0) doesn't support `CopyReduceBulkTensorTileS2GOp`
 codegen. Reverted to `CopyBulkTensorTileS2GOp` + output buffer + `torch.sum`.
 
-**Future**: Could be revisited with (a) newer DSL versions, (b) a separate
-`@cute.jit reduce()` kernel using `cute.arch.atomic_add` (SIMT path, not TMA),
-or (c) C++ CUDA kernel for the reduction.
+**Future**: Could be revisited with (a) newer DSL versions, (b) a TMA-based
+reduction (TMA G2S load partials + S2R + add + TMA S2G store), or (c) C++ CUDA
+kernel for the reduction.
+
+**Finding 3: SIMT atomic_add also fails**. After CopyReduce failed, tried
+element-wise `cute.arch.atomic_add` from registers directly to gmem output:
+
+| Variant | Compiles | Correctness | Performance | Issue |
+|---------|----------|-------------|-------------|-------|
+| fp16 atomic_add | ✅ | RE=0.04% ✅ | 62.9T (vs 129T) ❌ | Hopper fp16 has no hardware atomic — uses CAS loop (~100 cycles/op) |
+| fp16 + local_tile pointer | ✅ | — | — | `local_tile` in loop generates excessive MLIR IR |
+| fp32 atomic_add | ✅ | RE=141% ❌ | — | `local_tile` pointer computation wrong in loop, most elements not written |
+
+**Root cause**: CuTe DSL is designed for **tile-level operations** (TiledCopy, TMA).
+Element-level access (`tensor[idx]` returns a scalar, not a sub-Tensor view;
+`local_tile(tensor, (1,), (idx,))` in a loop generates excessive MLIR IR and
+may compute wrong pointers). The DSL cannot efficiently do per-element atomic
+operations on partitioned tensors.
