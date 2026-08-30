@@ -416,3 +416,28 @@ The tradeoff: smaller tiles = more tiles = more grid overhead + smaller wgmma at
 3. **Per-warpgroup B barriers** (#2) — requires manual barrier management
 4. **In-kernel split-K reduction** (#3) — eliminates host-side reduction
 5. **reg_dealloc<24>** (#6) — lower producer reg budget
+
+---
+
+## Unified Optimization Roadmap (16 items, merged self-research + HPC-Ops)
+
+Ordered by priority (impact on #1 bottleneck: CTA barrier stall 73.3%).
+
+| # | Optimization | Source | Difficulty | Expected | Attacks |
+|---|---|---|---|---|---|
+| 1 | Small tile + more stages (64×64×64, kStage=5) | HPC-Ops | Medium | +5-10% | smem 88KB→5 stage→67% more overlap→barrier stall ↓ |
+| 2 | __launch_bounds__(384, 1) | HPC-Ops | 1 line | +1-2% | Better reg allocation, hint 1 block/SM |
+| 3 | FP16 accumulator (acc_dtype=fp16) | Self | 1 line | +2-5%? | regs 168→~84→potential 2 blocks/SM |
+| 4 | Per-WG B/W barrier | HPC-Ops | Medium | +2-3% | Each WG independent mbarrier→no cross-WG wait |
+| 5 | reg_dealloc<24> (producer) | HPC-Ops | 1 line | +0.5% | Producer fewer regs (24 vs 40) |
+| 6 | In-kernel split-K reduce | HPC-Ops | Medium | +1-2% | atomicAdd+spin-wait+reduce in-kernel→no host torch.sum |
+| 7 | Manual barrier (vs PipelineTmaAsync) | HPC-Ops | Medium-Hard | +1-2% | Finer-grained sync→reduce wait |
+| 8 | Double accumulator (ping-pong) | Self | Medium | +1-2% | Overlap accumulator fill/drain with epilogue |
+| 9 | K-loop unroll=2/4 | Self | 1 line | +0.5-1% | ILP, more work per instruction fetch |
+| 10 | Swizzle + flat fallback | HPC-Ops | Medium | Edge case | Swizzle main tiles, flat tail→non-aligned shapes |
+| 11 | K-tile residue handling | Self | Medium | Functional | Support arbitrary K (non-BLK_K multiples) |
+| 12 | BF16 dtype | Self | 1 line | ~0% | Same throughput, precision comparison |
+| 13 | L2 cache pinning | Self | Host-side | ~0% | cudaAccessPolicyWindow pin output (compute-bound) |
+| 14 | L2 compression hint | Self | Host-side | ~0% | Currently 0% hit, mark compressible |
+| 15 | FP8 dtype | Self | Hard | +50-100%? | 2x peak (need H20 wgmma FP8 support check) |
+| 16 | 2:4 structured sparsity | Self | Hard | +50-100%? | 2x peak (need sparse input) |

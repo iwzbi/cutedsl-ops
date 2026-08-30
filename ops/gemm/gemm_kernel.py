@@ -19,12 +19,12 @@ from cutlass.cute.nvgpu.warpgroup import OperandMajorMode, OperandSource
 from cutlass.utils.layout import LayoutEnum
 
 
-BLK_M = 128
-BLK_N = 256
+BLK_M = 64
+BLK_N = 64
 BLK_K = 64
-NUM_STAGES = 3
+NUM_STAGES = 5  # small tile → less smem → deeper pipeline → hides barrier stall
 
-ATOM_LAYOUT_MNK = (2, 1, 1)
+ATOM_LAYOUT_MNK = (1, 1, 1)
 NUM_MMA_WARPGROUPS = ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2]
 NUM_DMA_WARPGROUPS = 1
 NUM_WARPGROUPS = NUM_DMA_WARPGROUPS + NUM_MMA_WARPGROUPS
