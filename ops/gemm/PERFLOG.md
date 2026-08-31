@@ -732,6 +732,341 @@ pipeline arrive-count recalculation) even though the DSL can't compile it yet.
 
 ## Optimization Principles (Detailed)
 
+### 1. Pipeline Stages (NUM_STAGES)
+
+`NUM_STAGES` is the **software‑pipelining depth** of a GEMM loop: the number of distinct shared‑memory buffer slots used to keep multiple async tile‑loads (`cp.async` on Ampere, **TMA** on Hopper) in flight behind in‑flight `WGMMA` compute. It is the single most important knob for turning a load‑bound kernel into a compute‑bound one — and the most expensive one in shared memory.
+
+---
+
+#### 1. The problem it solves
+
+A GEMM kernel's inner loop is, at the hardware level, two alternating phases per K‑tile:
+
+| phase | instruction | latency (H20, FP16) |
+|---|---|---|
+| load DRAM → smem | `TMA_LOAD` | **~200 cyc** |
+| compute smem → TC | `WGMMA` (M=128,N=256,K=64) | **~100 cyc** |
+
+Run serially (S = 1, single buffer), each K‑iteration costs `200 + 100 = 300` cycles and the tensor cores sit idle for 200 of them:
+
+```
+S=1  iter:  |====TMA 200====|==WGMMA 100==|====TMA 200====|==WGMMA 100==|
+              TC idle ▲▲▲▲▲▲▲▲▲▲                TC idle ▲▲▲▲▲▲▲▲▲▲
+```
+
+TC utilization ceiling here is `100 / 300 = 33 %`. The fix is to **decouple** the two phases: while iteration *k* computes, iteration *k+1, k+2, …* loads. Each in‑flight load needs its **own smem buffer** (you cannot overwrite a buffer still being read by WGMMA). That count of independent buffers is `NUM_STAGES`.
+
+---
+
+#### 2. The latency‑hiding inequality
+
+Steady‑state compute‑bound requires that the compute time per iteration be large enough to **cover** the load latency:
+
+```
+NUM_STAGES * T_compute  ≥  T_load
+```
+
+For the H20 numbers above (`T_load = 200`, `T_compute = 100`):
+
+| NUM_STAGES | `S * T_compute` | covers 200? | regime |
+|---|---|---|---|
+| 1 | 100 | ❌ (deficit 100) | load‑bound, TC ≤ 33 % |
+| 2 | 200 | ⚠️ exact | boundary — any jitter stalls |
+| 3 | 300 | ✅ (slack 100) | compute‑bound, TC → 100 % |
+| 4 | 400 | ✅ (slack 200) | compute‑bound, slack wasted |
+
+The threshold is **`S* = ⌈T_load / T_compute⌉ = ⌈200/100⌉ = 2`**, and you want one extra stage of slack → **S = 3 is the sweet spot** for this kernel. Going to S = 4 doubles the smem cost of the extra stage without raising TC utilization — pure waste unless the load latency itself grows (e.g. DRAM contention).
+
+---
+
+#### 3. Timeline: S = 3 in steady state
+
+`K = 4096, BLK_K = 64 → 64 K‑tiles`. Prologue issues 3 loads ahead; then each iteration issues one load and consumes one.
+
+```
+t→      0       100      200      300      400      500      600      700  (cyc)
+load 0  |=======TMA=======|
+load 1          |=======TMA=======|
+load 2                   |=======TMA=======|
+load 3                            |=======TMA=======|        ← issued while W1 runs
+load 4                                     |=======TMA=======|
+wgmma0                          |=W=100=|          ← consumes buf0
+wgmma1                                   |=W=100=|  ← consumes buf1
+wgmma2                                            |=W=100=|  ← consumes buf2
+                                  ▲
+                          steady state: every 100 cyc a WGMMA retires,
+                          TMA completely hidden behind it.
+```
+
+Prologue cost = `(S−1) * T_compute` to fill ≈ 200 cyc amortized over 64 tiles → <0.5 % overhead. Throughput in steady state = `1 WGMMA / 100 cyc` → TC utilization ≈ 100 %, matching the measured **90.9 %**.
+
+---
+
+#### 4. The shared‑memory cost (the catch)
+
+Each stage owns a private copy of the A and B tiles it is loading into:
+
+```
+smem_per_stage = BLK_M * BLK_K * bytes + BLK_N * BLK_K * bytes
+```
+
+For FP16 (2 B), `BLK_M=128, BLK_N=256, BLK_K=64`:
+
+```
+A_tile = 128 * 64 * 2 = 16 384 B = 16 KiB
+B_tile = 256 * 64 * 2 = 32 768 B = 32 KiB
+smem_per_stage = 48 KiB
+```
+
+Total smem budget for the kernel:
+
+```
+smem_total = NUM_STAGES * smem_per_stage + smem_epilogue
+```
+
+With S = 3 and a 64 KiB epilogue (C‑tile accumulation in smem before final r2g):
+
+```
+smem_total = 3 * 48 + 64 = 208 KiB   (~214 KiB with padding/fragments)
+```
+
+H20 per‑SM shared memory ceiling is **228 KiB** — so S = 3 fits with only ~14 KiB headroom. S = 4 would need `4*48 + 64 = 256 KiB` → **does not fit**, would force shrinking `BLK_M`/`BLK_N` and slash arithmetic intensity. This is why the chosen config stops at 3.
+
+---
+
+#### 5. Reading the ncu profile
+
+| metric | value | interpretation |
+|---|---|---|
+| **TC utilization** | 90.9 % | WGMMA pipeline nearly saturated — S=3 is doing its job |
+| **DRAM utilization** | 7.2 % | **not** bandwidth‑bound; loads are tiny and TMA‑prefetched |
+| **barrier stall** | 74.3 % | dominant stall reason |
+
+The **barrier stall = 74.3 %** is *not* "74 % of time wasted" — it is "of the cycles threads spent stalled, 74 % were at a barrier". With TC at 90.9 % that is the **expected healthy signature** of a pipelined kernel: threads finish their WGMMA, walk into `mbarrier.try_wait` for the next tile, and sleep precisely there until the next TMA completes. That is the *right* place to wait. The kernel is compute‑bound, not barrier‑bound.
+
+A red flag would be: TC ≤ 50 % **and** barrier stall dominant → pipeline depth too small, threads idle on a load that hasn't returned. TC 90.9 % rules that out here.
+
+---
+
+#### 6. Pipeline depth vs sync count — the subtle failure mode
+
+There are **two different "depth" notions** that get conflated:
+
+- **Pipeline depth** = `NUM_STAGES` = number of smem buffer slots.
+- **Sync count** = number of outstanding async‑ops a thread actually `wait_group`s on at each barrier.
+
+> **Pipeline depth > sync count** → you have allocated more buffer slots than the runtime number of in‑flight loads. Smem is spent, latency is *not* hidden — you are paying the cost without the benefit. The extra buffers are filled but the scheduler cannot actually keep them all in flight because the wait granularity is too coarse. This is the failure mode that produces **‑0.9 %** vs the baseline: the kernel looks more pipelined (more stages, more smem) but is actually slower because the sync pattern doesn't match.
+
+Concretely: if you have 3 buffer slots but your `cp.async.wait_group<2>` only keeps 2 loads in flight, the third buffer is decorative — its smem just squeezes the epilogue and increases register pressure. The fix is **not** to add stages; it is to align `wait_group` granularity (or `mbarrier` phase count) with `NUM_STAGES`.
+
+Rule of thumb:
+
+```
+sync_count == NUM_STAGES - 1   # one slot being computed on, rest in flight
+```
+
+---
+
+#### 7. When increasing NUM_STAGES helps — and when it doesn't
+
+**Helps when:**
+
+- `NUM_STAGES * T_compute < T_load` (load‑latency bound regime — see inequality §2).
+- DRAM or L2 utilization is high (long‑latency loads, contention) so `T_load` grows beyond the static 200 cyc.
+- There is **free smem** after the epilogue — i.e. increasing S does not force a tile‑size shrink.
+
+**Doesn't help (and can hurt) when:**
+
+- Already compute‑bound (TC ≥ ~90 %). Extra stages buy no throughput, see diminishing‑returns threshold `S*+1`.
+- Smem is the constraint: pushing S past the budget forces `BLK_M`/`BLK_N` down, which **lowers arithmetic intensity** `2*M*N*K / (M*K + N*K + M*N)` and reduces TC occupancy — a net loss.
+- **Sync count mismatch** (§6): more buffers than the wait pattern can actually overlap.
+- The kernel is **barrier‑stall‑dominant with low TC** — adding stages without fixing the sync granularity amplifies the stall, it doesn't cure it.
+
+---
+
+#### 8. Concrete case: `v4-blk96` with S = 2 → **−0.9 %**
+
+Reducing `BLK_M`/`BLK_N` to 96 and dropping to `NUM_STAGES = 2`:
+
+```
+S=2: 2 * 100 = 200  ≟  T_load = 200   ← exactly at the boundary
+```
+
+No slack. Any TMA jitter (L2 miss, DRAM row conflict, TMA‑unit contention from a neighbor SM) pushes a load past 200 cyc → WGMMA stalls at the barrier → TC drops below 90 %, **−0.9 %** vs the S=3 baseline. The smaller tile also lowered arithmetic intensity, so even at 100 % TC the per‑SM throughput was lower. Two compounding losses from one knob.
+
+Lesson: **S = 2 is the knife‑edge; S = 3 buys the 100‑cyc slack that absorbs the real‑world variance.** Don't tune `NUM_STAGES` without simultaneously checking TC %, barrier‑stall share, and the smem headroom for the tile size you actually want.
+
+---
+
+#### 9. Quick tuning checklist
+
+1. Compute `S* = ⌈T_load / T_compute⌉` (H20 FP16 TMA/WGMMA → `S* = 2`).
+2. Pick `NUM_STAGES = S* + 1` for slack (→ 3) — **if smem fits**.
+3. Verify `smem_total = S * (BLK_M*BLK_K + BLK_N*BLK_K) * bytes + smem_epilogue ≤ 228 KiB`.
+4. Ensure **sync count == S − 1** (wait granularity matches buffer count, §6).
+5. Run ncu: want TC ≥ 90 %, DRAM low, barrier stall dominant *with* high TC. If TC ≤ 50 % and barrier stall high → depth/sync mismatch, **don't** just bump S.
+6. If TC is already ≥ 95 %, **stop**: more stages cannot help, only the tile size / MMA atom / epilogue can.
+
+---
+
+### 2. Tile Size vs Pipeline Depth
+
+The fundamental budget equation. Shared memory is the hard constraint that links tile size to pipeline depth:
+
+```
+smem_per_block ≈ (BLK_M·BLK_K + BLK_N·BLK_K) · sizeof(elem) · NUM_STAGES  +  epilogue
+              ≤  smem_per_SM                                  (H20: 228 KB)
+```
+
+For FP16 on our kernel (BLK_M=128, BLK_N=256, BLK_K=64, S=3):
+`(128+256)·64·2·3 = 147 KB` of pipeline buffers, plus epilogue/double‑buffer → **214 KB total**, which fits exactly **one CTA per SM** (228 KB limit). This single fact drives almost every other number: occupancy collapses to **13.9%** (384 threads / 2048 max, capped to 1 CTA by smem), and with only one resident CTA the scheduler has nothing else to run when the resident warps block → **No‑Eligible 96.7%**.
+
+The latency‑hiding condition. A pipeline hides producer (TMA) latency only if the consumer cannot outrun the buffered stages:
+
+```
+NUM_STAGES · max(TMA_cyc, ~0)  ≳  WGMMA_cyc_per_iter
+```
+
+But the *real* trade is arithmetic intensity, not just stage count. TMA fetches `(BLK_M·BLK_K + BLK_N·BLK_K)·2` bytes and WGMMA does `2·BLK_M·BLK_N·BLK_K` FLOPs on them, so the **bytes‑per‑FLOP ratio shrinks as the tile grows**:
+
+| Tile (M·N·K) | Bytes/stage | FLOPs/stage | AI (FLOP/B) | smem/S3 |
+|---|---|---|---|---|
+| 128·256·64 (large) | 49 KB | 4.19M | 86 | 147 KB |
+| 64·64·64 (small)   | 16 KB | 0.52M | 33 | 80 KB  (→ fits 2 CTA/SM) |
+
+Large tile → high AI → WGMMA stays busy → **TC 90.9%**, but only S=3 fits, so when a stage isn't ready the consumer stalls hard → **CTA‑barrier stall 74.3%**. Small tile (v7, 64×64, S=5): half the smem → 5 stages → the next stage is almost always already arrived → **barrier stall 74%→8% (−82%)**, but each WGMMA does 8× less work, so launch/epilogue overhead and the relatively‑slower TMA dominate → **TC 91%→83% (−8%)**.
+
+Measured net effect on the H20 vs cuBLAS:
+
+| Problem | cuBLAS | large tile (S3) | small tile (S5) | Δ small vs large |
+|---|---|---|---|---|
+| 512³    | 21.1 T | — | — | **+13%** |
+| 4096³   | 132.2 T | large wins | — | **−12%** |
+| 16384³  | 139.2 T (≈94% of 148 T peak) | large wins | — | large |
+
+**When it helps.** Small tiles win in the **latency‑bound / small‑N regime** (512³): pipeline stalls dominate and extra stages + 2× occupancy compensate for the TC efficiency loss. Large tiles win in the **compute‑bound / large‑N regime** (4096³+): TC utilization is the bottleneck and must be maximized. cuBLAS does exactly this — it heuristic‑dispatches tile shape by problem size, which is why a single fixed‑tile kernel always loses to it on at least one scale.
+
+---
+
+### 3. Epilogue Overlap
+
+After the last WGMMA of a tile, the accumulator (in registers) must leave the SM: `rmoreg → smem` (R2S, warp‑level store) then `smem → gmem` (S2G, TMA store). On our kernel this epilogue costs **~180 cycles**, and during every one of them the Tensor Core is **idle** — no WGMMA can issue because the next tile's data isn't ready and the accumulator is still being drained.
+
+The overlap trick. Issue the store but **do not wait for it** — `commit_group` on the TMA store *without* a matching `wait_group`. Immediately start the next tile's mainloop (next TMA prefetch + WGMMA). Only at the *next* epilogue do you call `wait_group(1)`, which waits for the oldest outstanding store to complete before reusing its smem store‑buffer slot.
+
+With `NUM_STAGES` buffers this gives you exactly **1 iteration of slack** to hide the store. The overlap is net‑positive only when:
+
+```
+mainloop_cyc_per_iter  ≥  store_cyc                (≈180 cyc on H20)
+```
+
+If the inequality holds, the store completes during the next mainloop and is fully hidden. If it fails, the deferred `wait_group(1)` blocks immediately (the previous store is still in flight), you pay the store latency anyway, *and* you've created smem‑port contention with the next mainloop → net loss.
+
+Concrete numbers from the kernel:
+
+| Problem | mainloop/iter | store | overlap? | Δ vs sync‑epilogue |
+|---|---|---|---|---|
+| 4096³   | ~6400 cyc | 180 cyc | yes (6400 ≫ 180) | **+1.4%** |
+| 512³, sk=8 | ~50 cyc | 180 cyc | no (50 ≪ 180) | **−4.2%** |
+
+Theoretical ceiling: `min(store, mainloop) / (mainloop + store)`. For 4096³ that's `180/6580 ≈ 2.7%`; the measured +1.4% is roughly half because the overlap is imperfect (smem bank conflicts on R2S, TMA descriptor issue cost, and the final‑tile drain still serializes). For 512³ sk=8 the ceiling is `50/230 ≈ 22%` — but the inequality is violated, so instead of saving ~22% you lose 4.2%.
+
+**When it helps.** Only in the **compute‑bound regime where mainloop ≫ store** (large tiles, deep K‑iteration count). At small N_K or with tiny tiles the store outlasts the mainloop and the trick backfires — just `wait_group` synchronously. The gain is also intrinsically capped near ~2–3% because the epilogue is a small fraction of total time, so at large scale expect only marginal improvement on top of an already‑90%+ TC kernel.
+
+---
+
+### 4. Per‑Warpgroup Barriers
+
+The sync structure. Our kernel runs **3 warpgroups** (384 threads): WG0 = DMA producer (TMA), WG1+WG2 = MMA consumers (WGMMA). Producer and consumers synchronize per pipeline stage through an mbarrier: the producer does `arrive_expect_tx(bytes)` when it has issued the TMA for stage `i`, and each consumer `wait()`s on that barrier before reading stage `i` from smem.
+
+The problem with one shared mbarrier. The DSL's `PipelineTmaAsync` uses a **single mbarrier** for `consumer_release` across *both* MMA warpgroups. Both WGs wait on the same barrier object with the same arrival count, so per stage:
+
+```
+WG1 wait ─┐
+          ├─ single mbarrier ─→ released once, both wake together
+WG2 wait ─┘
+```
+
+If WG1 finishes its WGMMA for stage `i+1` early and reaches the `wait()` for stage `i+2`, it cannot proceed until the producer has arrived *and* WG2 has also moved on — i.e., **WG1 is serialized to the speed of the slower of {producer, WG2}**. On a balanced 2‑WG consumer this is a small but real per‑stage skew (~a few % of one WGMMA duration), multiplied across all K‑iterations.
+
+Per‑WG barriers fix this. Give each MMA warpgroup its own mbarrier; the producer arrives on **both** independently:
+
+```
+producer ──arrive──► mbar_A ──► WG1 wait   (independent)
+producer ──arrive──► mbar_B ──► WG2 wait   (independent)
+```
+
+Now WG1 releases as soon as *its* data is ready, regardless of WG2's progress. Expected gain **~1–2%** — small because the two WGs are doing identical work and the skew is only the variance, not the mean.
+
+Why we didn't ship it. The DSL abstraction `PipelineTmaAsync` hard‑codes one mbarrier over the shared smem pipeline and does not expose per‑WG mbarrier partitioning from inside `@cute.kernel` — the arrive/wait counts are inferred from the copy descriptor, not user‑settable per consumer. HPC‑Ops achieves it in raw **C++** by manually instantiating two `mbarrier` objects in smem and calling `mbarrier.arrive_expect_tx` / `mbarrier.wait` per WG with explicit transaction‑byte counts.
+
+**When it helps.** Whenever you have ≥2 consumer warpgroups sharing one pipeline (always, for a 2‑WG‑MMA Hopper GEMM). Gain is bounded by inter‑WG skew, so ~1–2% in practice; unreachable from the DSL without dropping to C++.
+
+---
+
+### 5. Manual Barrier (vs PipelineTmaAsync)
+
+What `PipelineTmaAsync` does. It is the high‑level DSL primitive for the producer side: you call `cute.copy(tiled_copy, gA, sA)` with a `TiledCopy` that has TMA semantics, and the pipeline *automatically* (a) issues the TMA `cp.async.bulk.tensor`, (b) `arrive_expect_tx` on the stage's mbarrier with the byte count it computed from the copy shape, and (c) lets the consumer `wait()`. One barrier, one arrive, one byte count, bundled for the whole `A+B` fetch of a stage.
+
+What you lose. Because A and B are different tensors with different shapes (A is M×K, B is N×K), different TMA descriptors, and different byte counts, bundling them into one arrive/wait means:
+
+- **The consumer can't start until *both* A and B have fully arrived**, even if one operand was ready first. For a tall‑thin A and fat B this serializes the ready‑earlier operand behind the ready‑later one.
+- The arrive count is fixed (one producer arrive per stage), so you can't do **per‑WG** arrival (see §4) or partial arrival.
+- You can't overlap A‑arrive with B‑issue — they're committed together.
+
+Manual mbarrier. Drop to the low‑level ops and drive the barrier yourself:
+
+```
+mbarrier.init(sA_ptr, 1)
+mbarrier.arrive_expect_tx(sA_ptr, bytes_A)      # A's TMA issued, arrive now
+mbarrier.arrive_expect_tx(sB_ptr, bytes_B)      # B's TMA issued, arrive now (separate or same bar)
+...
+mbarrier.wait(sA_ptr, phase)                    # consumer waits per‑operand
+```
+
+Benefits: (1) **separate A vs B arrival** → release the consumer for the operand that's ready first; (2) **per‑WG arrive counts** (ties into §4 — each WG's mbarrier can require N arrives, enabling per‑WG release); (3) **finer‑grained overlap** of A‑arrive with B‑issue. Expected gain **~1–2%**, of the same order as §4 because the dominant serialization being removed is the same kind (a few cycles per stage of forced bundling).
+
+Why we didn't ship it. `@cute.kernel` does not expose `mbarrier_init` / `arrive_expect_tx` / `wait` intrinsics — they are deliberately hidden behind `PipelineTmaAsync` to keep the Python‑DSL surface safe. To get them you write the kernel in **C++ (HPC‑Ops `FullBarrier`)**, where you own the mbarrier objects in smem and call the `mbarrier` PTX intrinsics directly.
+
+**When it helps.** Any time you want operand‑level or WG‑level release granularity — i.e., exactly the situations where §4 helps. Stand‑alone gain is ~1–2%; combined with per‑WG barriers (§4) the two are somewhat additive because they remove different serializations, but both require leaving the DSL.
+
+---
+
+### 6. Warp Specialization (Producer/Consumer Split)
+
+Without WS. A single warpgroup does **both** TMA issue and WGMMA, serially, in the same warps. Within one warp you cannot issue a TMA `cp.async.bulk` and a WGMMA in the same cycle, so the ~200‑cycle TMA latency lands on the critical path of every iteration:
+
+```
+iter (no WS):  TMA_issue ──200 cyc──► arrive ──► WGMMA(100 cyc) ──► TMA_issue ...
+                                     ▲ TMA latency fully serial, TC idle 200 cyc ▲
+```
+
+With WS. Split the 3 warpgroups by role:
+
+| WG | threads | role | regs/thread | why |
+|----|---------|------|-------------|-----|
+| WG0 | 128 (4 warps) | producer: TMA only | 24–40 | only needs descriptors + pointers, no accumulator |
+| WG1 | 128 (4 warps) | consumer: WGMMA | ~232 | holds the accumulator + A/B register fragments |
+| WG2 | 128 (4 warps) | consumer: WGMMA | ~232 | second consumer for 2× WGMMA issue rate |
+
+Producer and consumer run **concurrently**, synchronizing per stage via the mbarrier from §4/§5. TMA latency is now hidden behind the consumer's WGMMA stream rather than sitting on the critical path:
+
+```
+WG0:  TMA(i) TMA(i+1) TMA(i+2) ...         (producer stays ahead)
+WG1:  ........wait(i) WGMMA(i) wait(i+1) WGMMA(i+1) ...
+```
+
+Costs.
+- **128 threads do no MACs** (1/3 of the CTA). But TC throughput is fed by the 2 consumer WGs (256 threads), which is enough to saturate the WGMMA issue rate — so the "lost" 128 threads weren't going to add TC FLOPs anyway; they would just have competed for the same instruction slots.
+- **Register split is asymmetric, not transferable**: regs are per‑thread, so WG0's spare regs don't move to WG1. But the split means WG0 threads don't need an accumulator, so the CTA's reg profile is balanced to ~154–168/thread avg, fitting in `65536 / 384 = 170.7` regs/thread — just barely. Without WS, every thread would need accumulator regs → would blow the per‑SM reg limit and cut occupancy further.
+- **Epilogue**: only the MMA WGs own the accumulator, so the R2S+S2G epilogue (§3) must run on WG1/WG2. Coordination uses a `NamedBarrier(256)` across just the two MMA WGs (not all 384), plus the producer↔consumer mbarrier for the mainloop.
+
+Measured result. v1 (with WS): **TC 90.9%**, 130.6 T at large scale. A cluster‑style kernel that does TMA+WGMMA in the same warpgroup (no WS): 129.7 T. WS gain **+0.7%**, i.e. ~1% at large scale. Small because at 16384³ the deep pipeline (S=3 + large tile) already hides most TMA latency, so the WS‑induced overlap is worth little extra. Where WS pays more: **shallow pipelines / small tiles / latency‑bound regimes** (exactly where §2's small‑tile config lives) — there the producer/consumer split is the *only* thing hiding TMA latency, since NUM_STAGES can't.
+
+**When it helps.** It is most valuable for **correctness and small‑tile / shallow‑pipeline regimes**: it gives a clean producer/consumer programming model and is the only latency‑hiding mechanism when stage depth is insufficient. At large scale with a deep pipeline it's ~1% and arguably more important as a structuring / correctness device than as a perf knob.
+
+---
+
 ### 7. Split-K
 
 **Idea.** When the natural tile grid `ceil(M/BLK_M) × ceil(N/BLK_N)` under-fills the GPU, slice the K-loop and distribute the slices across CTAs. The grid becomes `M_tiles × N_tiles × sk`; each CTA owns a K-slice of length `K/sk`, writes a partial accumulation `Cₚ` into a **private buffer** (`sk` partials per output tile), and the host does `torch.stack(...).sum(dim=0)` to combine them.
