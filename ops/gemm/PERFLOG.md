@@ -732,264 +732,777 @@ pipeline arrive-count recalculation) even though the DSL can't compile it yet.
 
 ## Optimization Principles (Detailed)
 
-Each optimization's **theoretical mechanism**, **concrete formula**, **our experimental result**, and **when it would help**. Organized by the bottleneck they target.
+### 7. Split-K
 
-Hopper H20 baseline: 78 SM, 148 TFLOPS FP16 peak, 228KB smem/SM, 65536 regs/SM. Our kernel: BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3, 3 warpgroups (1 DMA + 2 MMA), 384 threads, smem 214KB, regs 154-168/thread. ncu: TC 90.9%, DRAM 7.2%, CTA barrier stall 74.3%, No Eligible 96.7%, Occupancy 13.9%.
+**Idea.** When the natural tile grid `ceil(M/BLK_M) × ceil(N/BLK_N)` under-fills the GPU, slice the K-loop and distribute the slices across CTAs. The grid becomes `M_tiles × N_tiles × sk`; each CTA owns a K-slice of length `K/sk`, writes a partial accumulation `Cₚ` into a **private buffer** (`sk` partials per output tile), and the host does `torch.stack(...).sum(dim=0)` to combine them.
 
-### Bottleneck 1: CTA Barrier Stall (74.3% of stall time)
+**Formula.**
+```
+tiles_base      = ceil(M/BLK_M) * ceil(N/BLK_N)
+tiles_split     = tiles_base * sk
+K_tiles_per_CTA = K / (BLK_K * sk)        # must be ≥ ~NUM_STAGES to amortize the pipeline
+partial_buffers = sk  (per output tile)
+```
 
-The #1 bottleneck. `consumer_wait` blocks the consumer until TMA data arrives at the mbarrier; `producer_acquire` blocks the producer until the consumer releases a stage. The question is how to minimize the wait.
+**Why it works on small GEMMs.** Baseline `512³` with `BLK_M=128, BLK_N=256` yields only `4 × 2 = 8` tiles for 78 SMs → 70 SMs idle for the whole kernel. `sk=8` lifts that to `64` CTAs ≈ 0.82 CTAs/SM, recovering the idle silicon.
 
-#### 1. Pipeline Stages (NUM_STAGES)
+| M=N=K | baseline | best sk | split-K TFLOPS | vs baseline | vs cuBLAS |
+|------|----------|---------|----------------|-------------|-----------|
+| 512  | 12.1 T   | 8       | 42.9 T         | +254%       | +129% (cuBLAS 21.1 T) |
+| 1024 | —        | 2       | 91.3 T         | —           | — |
+| 2048 | —        | 4       | —              | —           | — |
+| 4096 | —        | 4       | —              | —           | — |
 
-**Mechanism**: A GEMM mainloop has two long-latency operations per K-tile: TMA load (~200+ cycles from issue to data-visible-in-smem) and WGMMA compute (~100+ cycles per tile). Without pipelining, they serialize: `TMA0 → wait → MMA0 → TMA1 → wait → MMA1 → ...`. Total = N_ktiles × (TMA + MMA). With N-stage pipeline, the producer issues N loads ahead of the consumer into N independent smem buffers, each with its own mbarrier. The consumer computes on buffer k while TMA loads buffer k+N. Total drops to max(N_ktiles × TMA, N_ktiles × MMA) + (N-1) × TMA (fill/drain).
+**Non-monotonic scaling — the gotcha.** More `sk` is *not* always better. At `1024³`:
+- `sk=2` → `K_tiles_per_CTA = 1024/(64×2) = 8` → 91.3 T ✅
+- `sk=4` → `K_tiles_per_CTA = 1024/(64×4) = 4` → 84.4 T ❌ (slower)
 
-**Depth rule**: NUM_STAGES >= 1 + ceil(TMA_latency / tile_compute_time). With 200/100: 1 + 2 = 3. Below this, the consumer starves (TMA not fast enough). Above this, diminishing returns (consumer never starves, extra buffers only add smem pressure).
+With `NUM_STAGES=3`, each CTA spends the first `~3` and last `~3` K-tiles in pipeline fill/drain (no steady-state overlap). When `K_tiles_per_CTA` drops toward `NUM_STAGES`, the fill/drain fraction `2·NUM_STAGES / K_tiles_per_CTA` explodes and erodes the gain. Pick `sk` to keep `K_tiles_per_CTA ≫ NUM_STAGES` *and* to lift tile count above `~num_SMs`.
 
-**Smem budget**: Each stage holds A tile (128×64×2B = 16KB) + B tile (256×64×2B = 32KB) = 48KB. Plus 64KB D epilogue smem + mbarrier array. NUM_STAGES=3 → 214KB of 228KB. A 4th stage (+48KB → 262KB) doesn't fit.
+**Best `sk` by size:** `512→8`, `1024→2`, `2048→4`, `4096→4`. Always sweep; never assume monotonicity.
 
-**Our result**: NUM_STAGES=3 optimal. v4-blk96 tried BLK_K=96 + NUM_STAGES=2 (fewer syncs: 64→43 K-tiles, -33%): result -0.9% (pipeline overlap loss > sync reduction). **Pipeline depth is more valuable than sync count.**
+---
 
-**When it helps**: Always (pipelining is fundamental). More stages help when TMA latency > compute time (TMA-bound regime). In compute-bound regime (our case), 2 stages already hide TMA in steady state; 3rd stage absorbs jitter (L2 misses, TMA queue contention).
+### 8. Persistent Kernel
 
-#### 2. Tile Size vs Pipeline Depth
+**Idea.** Stop launching one CTA per tile. Launch `min(tiles, num_SMs)` CTAs and let each CTA loop over `ceil(tiles/num_SMs)` tiles, striding through the grid. This collapses the launch tail — the last partial wave where some SMs sit idle — and turns the kernel into a software-scheduled wave loop.
 
-**Mechanism**: Smaller tile → less smem per stage → more stages fit → more pipeline overlap → less barrier wait. But smaller tile = less work per WGMMA instruction = lower TC efficiency (more instructions for same FLOPs). This is a fundamental tradeoff: TC efficiency (large tile) vs pipeline depth/occupancy (small tile).
+**Formula.**
+```
+launched_CTAs = min(tiles, num_SMs)              # 78 on H20
+tiles_per_CTA  = ceil(tiles / num_SMs)
+tail_waste     = (num_SMs - (tiles mod num_SMs)) / num_SMs   # when tiles mod num_SMs ≠ 0
+```
 
-**Concrete example**: Our v1 (128×256, S3) uses 48KB/stage, 3 stages, 214KB smem, 1 block/SM. v7 (64×64, S5) uses 12KB/stage, 5 stages, 89KB smem, 2 blocks/SM. The 5-stage pipeline cuts barrier stall from 74.3% (41.5 cyc) to 8% (7.6 cyc) — the producer runs 5 loads ahead, so TMA jitter is fully absorbed. But TC throughput drops 91% → 83% because the 64×64 tile generates 4× more WGMMA instructions per output element (128×256 = 32K elements/tile vs 64×64 = 4K elements/tile).
+**Worked example — `4096³`.** Tiles `= (4096/128) × (4096/256) = 32 × 16 = 512`. Waves `= 512/78 = 6.56`. Last wave carries `512 − 6·78 = 44` CTAs, so `34` SMs idle → tail-wave efficiency `44/78 = 56%`, whole-kernel SM-efficiency `512/(7·78) = 93.8%`. Persistent variant: launch `78` CTAs, each does `ceil(512/78) = 7` tiles, no tail. Theoretical ceiling: `+6.2%`.
 
-**Our result**: v7 wins small scale (512³: +13% from 2 blocks/SM eliminating SM starvation) but loses large scale (4096³: -12%, 16384³: -17% from TC efficiency loss). We use dispatch: v7 for M×N < 1024², v1 for larger. **Optimal tile size varies by problem scale** (cuBLAS does exactly this heuristic dispatch).
+**Actual result: `+1.3%` only.** Why the let-down? In CuTe DSL the per-tile loop body is guarded by a `staged-if` on the tile boundary; that conditional forces the **consumer (wgmma) pipeline to be re-set-up for every tile**. The re-setup overhead lands on the critical path of a kernel already at `TC = 90.9%` (compute-bound), eating most of the tail-wave saving.
 
-#### 3. Epilogue Overlap
+| Size | Waves | Persistent gain |
+|------|-------|----------------|
+| 4096³ | 6.56 | +1.3% (marginal) |
+| 512³ | 0.10 | 0% (can’t help — under one wave) |
 
-**Mechanism**: After the last WGMMA of a tile, the epilogue (R2S → TMA S2G store) takes ~180 cycles with TC idle. If we issue the TMA store but don't wait (`cp_async_bulk_commit_group` without `wait_group`), the next tile's mainloop starts immediately. `wait_group(1)` at the next epilogue start waits for the previous store — by then, the mainloop has run enough cycles to hide the store latency.
+**Takeaways.**
+1. Persistent kernels *cannot* help when `tiles < num_SMs` (e.g. `512³` = 8 tiles → 0.1 waves).
+2. The win shrinks toward zero as TC% → 100% (compute-bound); tail-wave math only matters when you have spare SM cycles.
+3. The real value is **not** the tail elimination — it is that a kernel-owned tile loop is the *prerequisite* for **epilogue overlap**: overlapping the `C`-tile store with the next tile’s MMA compute, which needs the persistent structure to exist at all.
 
-**Overlap condition**: The overlap works only when mainloop duration > TMA store duration. mainloop ≈ num_k_tiles × WGMMA_per_tile ≈ 64 × 100 = 6400 cycles (4096³). TMA store ≈ 180 cycles. So 6400 >> 180 → store completes during mainloop → `wait_group(1)` is instant. For 512³ sk=8: mainloop = 1 K-tile × 100 = 50 cycles. 50 < 180 → `wait_group(1)` stalls 130 cycles → worse than no overlap.
+---
 
-**Our result**: +1.4% at 2048³ (mainloop 800 cyc >> store 180 cyc → full overlap). -4.2% at 512³ sk=8 (mainloop 50 cyc << store 180 cyc → wait stalls). **Only helps when mainloop > store duration.**
+### 9. FP16 Accumulator + Occupancy
 
-#### 4. Per-Warpgroup Barriers
+**Idea.** Store the MMA accumulator in FP16 instead of FP32. The accumulator fragment lives in registers for the whole K-loop, so halving its width cuts register pressure dramatically, opening the door to `2` blocks/SM.
 
-**Mechanism**: Currently both MMA warpgroups (WG1, WG2) share one mbarrier for consumer_release. If WG1 finishes its WGMMA before WG2, it must wait for WG2 to also release before the producer can reuse the stage. With per-WG barriers, each WG independently signals "I'm done with this stage" — no cross-WG waiting.
+**Register math (H20, 256 threads/block, 65536 regs/SM).**
+```
+FP32 acc: ~168 regs/thread  →  65536 / (1 × 256) = 256  → 1 block/SM  (168 ≤ 256)
+FP16 acc: ~84  regs/thread  →  65536 / (2 × 256) = 128  → 2 blocks/SM (84  ≤ 128) ✓
+```
 
-**Example**: WG1 finishes K-tile k at cycle 100, WG2 finishes at cycle 120 (different accumulator sizes). With shared barrier, producer can't start loading stage k+3 until cycle 120. With per-WG barrier, WG1 signals at 100, producer can start loading WG1's portion of stage k+3 immediately while waiting for WG2.
+**Result: occupancy doubled, TC unchanged (83% → 83%).** This breaks the "more blocks = more TC throughput" intuition, and it tells you something specific about Hopper:
 
-**Our result**: Cancelled — DSL `PipelineTmaAsync` doesn't support per-WG mbarrier on shared smem. Requires manual mbarrier management (C++ CUDA, like HPC-Ops). **Expected gain ~1-2%** (A is decoupled, B is still shared).
+- `wgmma` (warpgroup MMA) is a **long-latency async instruction issued to an SM-level tensor core** — not a per-warp FMA. A second resident block’s `wgmma` simply **queues behind** the first block’s `wgmma` on the same SM’s TC. No parallelism gain on the TC.
+- The classic "many warps hide FMA latency" model does **not** apply: `wgmma` latency is hidden by the **TMA multi-stage pipeline** (`NUM_STAGES=3` producer/consumer overlap), i.e. *instruction-level* pipelining, not *warp-level* interleaving.
+- For a compute-bound `wgmma` kernel, occupancy is nearly irrelevant — the TC is the bottleneck, and the TC is already saturated at one block/SM.
 
-#### 5. Manual Barrier (vs PipelineTmaAsync)
+**Correctness cost.** FP16 accumulation truncates intermediate sums; the kernel reported `RE = 0.09–0.47%`, above the FP16-GEMM tolerance. The precision loss was unacceptable, so the change was **reverted** even though it "succeeded" at raising occupancy.
 
-**Mechanism**: PipelineTmaAsync is a high-level abstraction managing mbarrier arrive/wait automatically. Manual mbarrier (`init`/`arrive`/`wait`/`tx_bytes`) gives finer control: separate arrive for A vs B, per-WG arrive counts, custom tx_count per stage. Can reduce wait time by matching arrive semantics to actual access patterns.
+**Lesson.** Don’t chase occupancy on Hopper compute-bound kernels — measure TC%, and if it’s already ≥ ~85%, occupancy tuning is the wrong lever. The only honest path to 2 blocks/SM is reducing *real* consumer register usage (see §10/§11), and only if you have headroom on the TC.
 
-**Our result**: Cancelled — DSL doesn't expose low-level mbarrier API in `@cute.kernel`. HPC-Ops uses C++ CUDA with `FullBarrier::init/arrive/wait`. **Expected gain ~1-2%** from finer sync granularity.
+---
 
-### Bottleneck 2: SM Underutilization (small scale)
+### 10. `launch_bounds` / `min_blocks_per_mp`
 
-Small problems have too few tiles to fill all SMs (512³ = 8 tiles on 78 SMs = 0.1 waves → 90% of SMs idle). This is a parallelism problem, not a compute problem.
+**Idea.** `@cuda.annotate(max_blocks_per_mp=N)` (aka `launch_bounds` / `min_blocks_per_mp`) is a *compiler hint*: "I want N blocks resident per SM." The compiler honors it by **capping register allocation** so N blocks fit:
 
-#### 6. Split-K
+**Formula.**
+```
+max_regs_per_thread = floor( 65536 / (min_blocks_per_mp × threads_per_block) )
+```
 
-**Mechanism**: Split K dimension into `split_k` partitions. Each partition computes a partial GEMM over a K-slice into a separate output buffer. Grid grows from `grid_m × grid_n` to `grid_m × grid_n × split_k` — more CTAs = more parallelism. Host-side `torch.sum` combines partials.
+With `threads_per_block = 256`:
+| `min_blocks_per_mp` | max regs/thread | kernel needs 168 | effect |
+|---------------------|-----------------|-------------------|--------|
+| 1 | 256 | 168 ≤ 256 | no-op (no constraint added) |
+| 2 | 128 | 168 > 128 | ❌ force **40+ register spill** |
 
-**Concrete numbers**: 512³ with BLK_M=128, BLK_N=256: grid = 4×2 = 8 tiles. 8 tiles / 78 SMs = 0.1 waves (90% SMs idle). With sk=8: grid = 8×8 = 64 tiles → 0.8 waves (20% idle). With sk=16: grid = 128 tiles → 1.6 waves (fully loaded). The TFLOPS gain is nearly linear with sk until SMs saturate.
+**The catastrophic cascade.** Forcing `min_blocks_per_mp=2` on a kernel that genuinely needs 168 regs doesn’t magic extra capacity into the register file — it makes the compiler **spill** the overflow to *local memory* (DRAM-backed). On a tightly-scheduled `wgmma` + TMA pipeline this is devastating:
 
-**Non-monotonic**: 1024³ sk=2 (91.3T) > sk=4 (84.4T). Why? sk=4 gives 128 tiles but each CTA does only 16 K-tiles (BLK_K=64, K=1024). Pipeline fill/drain = (NUM_STAGES-1)/num_k_tiles = 2/16 = 12.5% overhead. sk=2: 64 tiles, 32 K-tiles/CTA, fill/drain = 2/32 = 6.25%. Fewer K-tiles → pipeline efficiency drops.
+```
+spill → extra DRAM local loads/stores (≈400 cyc each)
+      → wgmma operands not ready → async pipeline stalls
+      → spill save/restore bloats code → I-cache misses
+      → producer/consumer handshake can't progress → pipeline deadlock
+```
 
-**Our result**: 512³ sk=8 = 42.9T (+254% vs baseline, +129% vs cuBLAS). **Best split_k varies by problem size** — requires heuristic dispatch like cuBLAS.
+**Measured impact: ~9000× slowdown** (`0.04 ms` → `360 s`). The kernel didn’t get "slightly slower" — it effectively hung.
 
-#### 7. Persistent Kernel
+**Lesson.** `launch_bounds` is a *declaration of intent*, not a *source of capacity*. To legitimately reach `2` blocks/SM you must **reduce register pressure at the source** — smaller fragments, fewer simultaneously-live accumulators, FP16 accumulator (if precision allows), reordering to shorten live ranges — *then* the compiler will fit `2` blocks naturally. Forcing the hint while the IR still needs 168 regs just relocates the shortfall into the worst possible place: DRAM spill inside a latency-sensitive async pipeline.
 
-**Mechanism**: Instead of launching `total_tiles` CTAs (one per tile), launch `min(total_tiles, num_sms)` CTAs. Each CTA strides through `ceil(total_tiles/num_sms)` tiles via a `for tile_iter in range(tiles_per_cta)` loop. Eliminates the last partial wave where `total_tiles % num_sms` SMs are idle.
+---
 
-**Example**: 4096³ = 512 tiles / 78 SMs = 6.56 waves. Without persistent: 7 waves, last wave has 512 - 6×78 = 44 active SMs (34 idle). With persistent: 78 CTAs, each does ceil(512/78) = 7 tiles. No tail wave — all 78 SMs work until the last tile.
+### 11. `reg_dealloc` / `reg_alloc`
 
-**Our result**: No gain (v2-persistent: 4096³ = 132.3T vs 130.6T baseline = +1.3%, but per-tile overhead from DSL staged-if limitation ate the benefit). 512³: 0.1 waves (fewer tiles than SMs) — persistent can't help. **Only helps when total_tiles >> num_sms AND per-tile overhead < tail-wave savings.** Value is as prerequisite for epilogue overlap.
+**Idea.** Hopper `wgmma` programs partition the warpgroup’s register file between the **producer** (TMA-copy warps, issue `cp.async`/TMA loads) and the **consumer** (wgmma warps, issue `wgmma`). Two knob-style directives set the split:
+- `reg_dealloc = P` — producer *releases* P registers per producer thread after its work.
+- `reg_alloc   = C` — consumer *claims* C registers per consumer thread from the freed pool.
 
-### Bottleneck 3: Register Pressure
+**Budget formula.** With `prod_threads` producer threads and `cons_threads` consumer threads sharing one SM’s 65536 regs:
+```
+consumer_max = (65536 − prod × prod_threads) / cons_threads
+```
+Worked: `prod=24, prod_threads=128, cons_threads=256` → `(65536 − 24·128)/256 = (65536 − 3072)/256 = 244`. Consumer asks `C=232 ≤ 244` ✓ fits.
 
-WGMMA accumulator uses ~32 fp32 registers per thread (128×256×4B / 256 threads). With overhead, total = 154-168 regs/thread → 1 block/SM (register-limited: 168×384 = 64,512 > 65,536/2 = 32,768).
+**But the knob is a no-op here.** The catch: the consumer’s *actual* register usage is only `154–168`; `232` is a **ceiling/declaration**, not measured need. Because `244 (available) > 232 (declared) > 168 (actual)`, the consumer already has comfortable headroom. Lowering the producer `reg_dealloc` from `40` to `24` frees more regs on the producer side, but **those freed regs do not transfer** to the consumer’s budget — the two pools are independently bounded by the directive, and the consumer was never the constraint.
 
-#### 8. FP16 Accumulator + Occupancy
+| Knob change | Effect |
+|-------------|--------|
+| `reg_dealloc 40 → 24` (producer) | **no-op** — consumer already had enough; producer savings don’t flow across |
+| `reg_alloc 232 → 200` (consumer) | would actually free budget for a 2nd block, **iff** real usage ≤ 200 |
 
-**Mechanism**: FP16 accumulator uses half the register width (16-bit vs 32-bit per element). ~84 regs/thread instead of 168. Budget for 2 blocks/SM: 65536/(2×256) = 128. 84 < 128 → fits. More blocks = more warps = better latency hiding (traditional GPU wisdom).
+**Lesson.** `reg_dealloc`/`reg_alloc` are *declarative ceilings*, not a reallocation pump. Producer savings **do not** become consumer capacity automatically; the only way to relax the consumer’s footprint (and so enable 2 blocks/SM) is to cut the consumer’s *actual* `wgmma` register demand — same conclusion as §10. The knobs describe the budget; they don’t create headroom. Tune the consumer’s `reg_alloc` to match its true usage, and reduce that true usage at the source (fragments, accumulators, live ranges) if you need another resident block.
 
-**Hopper reality check**: We achieved 2 blocks/SM (FP16 acc + min_blocks_per_mp=2), but **TC throughput was identical** (83% → 83%). Hopper's TC is an SM-level shared resource — a single block's WGMMA instructions already saturate it. A second block's WGMMA queues behind the first (no parallel TC execution). The extra block's warps stall at the mbarrier, just like the first block's warps. 2× stalls, 0× TC throughput.
+---
 
-**Key lesson**: **Occupancy doesn't matter for compute-bound WGMMA kernels on Hopper.** The traditional GPU wisdom ("more warps = hide more latency") doesn't apply because: (1) WGMMA is long-latency (keeps TC busy for many cycles), (2) TMA pipeline (not warp scheduling) hides TMA latency, (3) TC is SM-level, shared across all blocks.
+### 12. TMA Multicast + Cluster
 
-#### 9. `__launch_bounds__` / `min_blocks_per_mp`
+**Mechanism.** A *cluster* groups N CTAs (cooperative thread arrays) that share a Distributed Shared Memory (DSMEM) bus across the SMs they land on. One CTA is elected the *leader*; it issues a single **multicast TMA** descriptor. The TMA engine reads the source tile from global memory **once**, then fans the payload out to all N CTAs' shared memory in one transaction.
 
-**Mechanism**: Compiler hint `min_blocks_per_mp=N` tells the compiler to target N blocks/SM for register allocation. Max regs/thread = 65536/(N×threads). With N=2, 256 threads: max=128. If kernel needs 168, the compiler must spill 40+ registers to DRAM (local memory).
+**Bandwidth savings formula.**
 
-**Cascade failure**: Spilling registers to DRAM is not linear degradation — it's exponential collapse. Each spilled register access = DRAM latency (~400 cycles) instead of register file (~1 cycle). The 40 spilled registers × 400 cycles = 16,000 extra cycles per K-tile. With 64 K-tiles: 1,024,000 extra cycles. Plus I-cache misses from larger code (spill save/restore instructions). Plus pipeline near-deadlock (all warps waiting on DRAM). Result: 9000× slowdown (0.04ms → 360s).
+$$\text{gmem\_reads\_saved}(N) = N - 1 \quad\text{per multicast tile}$$
 
-**Our result**: N=1 = no-op (compiler already assumed 1 block/SM). N=2 = 9000× collapse. **Must reduce register demand at source (FP16 acc, smaller tile), not force it via launch_bounds.**
+$$\text{DRAM\_bytes}_{\text{cluster}} = \frac{\text{DRAM\_bytes}_{\text{nomcast}}}{N}$$
 
-#### 10. `warpgroup_reg_dealloc` / `warpgroup_reg_alloc`
+For the H20 GEMM baseline (BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3, 384 threads), DRAM utilization is already only **7.2%** with **TC 90.9%** and **L2 hit 66%** — the kernel is compute-bound, so the saved gmem bandwidth has no place to convert back into speed.
 
-**Mechanism**: Hopper allows different warpgroups within a CTA to have different register budgets. Producer warpgroup "deallocates" (returns) registers it doesn't need → consumer warpgroup "allocates" (claims) them for accumulator/descriptors. Formula: consumer_max = (65536 - producer_budget × producer_threads) / consumer_threads. With producer=24, consumer=232: (65536 - 24×128)/256 = 244, so 232 fits with margin.
+**Critical correction of a common misconception.** "Multiple CTAs doing one MMA cooperatively" is **wrong**. `wgmma` (warpgroup MMA) is a strictly **single-CTA** instruction — it operates on one CTA's rmem and smem. The cluster primitive enables **data sharing** (one read, many smem copies), *not* **compute cooperation**. Confusing the two leads to invalid schedules where different CTAs try to feed a single MMA.
 
-**Our result**: `reg_dealloc<24>` (40→24) = no-op. Consumer already targets 232 regs (budget allows 244). The freed 16×128=2048 registers sit idle — consumer doesn't claim them because it doesn't need more than 154-168 actual. **Producer register savings don't transfer to consumer** (consumer already has enough).
+**Expected speedup by regime.**
 
-### Bottleneck 4: Memory Bandwidth (not our bottleneck — DRAM 4.3%)
+| Regime | DRAM util | Gain |
+|---|---|---|
+| Compute-bound | ≤ 5% | ~0–2% |
+| Memory-bound | ≥ 40% | +10–20% |
 
-#### 11. TMA Multicast + Cluster
+**Implementation status (CuTe DSL 4.7.0).** Nine distinct approaches were attempted; all failed:
 
-**Mechanism**: In a cluster of N CTAs (e.g., 2×2 = 4 CTAs), when multiple CTAs need the same A or B data, one "leader" CTA issues a multicast TMA load. The TMA hardware reads from gmem once and writes to all N CTAs' smem simultaneously via the cluster DSMEM bus. Saves N× gmem reads for shared data.
+- codegen hang (compiler does not terminate)
+- segfault in compiled artifact
+- RE = 70% (relative error vs. torch reference, far above tolerance)
 
-**"Multiple CTAs doing one MMA" is a misconception**: WGMMA is a single-CTA instruction — no cross-CTA compute cooperation. Cluster enables **data sharing** (multicast), not **compute cooperation**. Each CTA still runs its own WGMMA on its own output tile, but they share input data → less gmem bandwidth. For a 2×1 cluster along M: both CTAs share the same B tile (same N index, different M). Leader issues B multicast TMA → 1 gmem read serves 2 CTAs.
+Working reference implementations exist in **HPC-Ops (C++)** and the **12-lesson SM80-MMA** series, confirming the technique is sound — the gap is DSL frontend support, not the hardware feature.
 
-**When it helps**: For memory-bound kernels (DRAM > 50%): +10-20% from halved gmem reads. For compute-bound (our case, DRAM 4.3%): ~0-2% — TC is the bottleneck, not memory bandwidth. The L2 pressure reduction might indirectly help (more L2 for A/B reuse).
+---
 
-**Our result**: 9 approaches all failed in DSL 4.7.0. `CopyBulkTensorTileG2SMulticastOp` with any `mcast_mask` (dynamic ternary, arithmetic, staged-if, or constant) → MLIR codegen hang, segfault, or RE=70%. Cluster pipeline (PipelineTmaAsync with `cta_layout_vmnk`) also has a wrap-around bug at phase flip. HPC-Ops (C++ CUDA, manual mbarrier) and 12-lesson (SM80 warp-MMA, NUM_STAGES=1) both work — the bug is specific to DSL 4.7.0 + WGMMA + PipelineTmaAsync + multicast.
+### 13. L2 Cache Pinning
 
-#### 12. L2 Cache Pinning
+**Mechanism.** The CUDA driver exposes a stream-level cache policy via `cuStreamSetAttribute(stream, CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW, &policy)`. The `CUaccessPolicyWindow` struct names a byte range `[base_ptr, base_ptr+num_bytes)` and a `hitRatio` ∈ [0,1]; the L2 then biases evictions to **persist** that region across the window's lifetime. For GEMM, the output matrix C is the natural pin target because every K-iteration writes back into the same M×N tile repeatedly.
 
-**Mechanism**: `cuStreamSetAttribute` with `CUaccessPolicyWindow` tells the L2 to prioritize caching the output tensor. Repeated writes to the same output region (e.g., persistent kernel writing to same M-blocks) benefit from L2 persistence — fewer DRAM write-backs. The L2 reserves a portion of its capacity for the pinned data.
+**Bandwidth formula.**
 
-**Our result**: +0.9% at 4096³ (slight write-back improvement), -0.6% at 512³ (L2 pollution evicts A/B data). **Marginal for compute-bound kernels** (DRAM < 5%). Would help more for memory-bound kernels with large output reuse.
+$$\text{effective\_L2\_hit}(C) = \min\!\left(\text{hitRatio},\ \frac{\text{L2\_size\_pinned}}{|C_{\text{tile}}|}\right)$$
 
-#### 13. L2 Compression
+$$\text{DRAM\_writeback}(C) = |C| \cdot (1 - \text{effective\_L2\_hit}(C))$$
 
-**Mechanism**: Hopper L2 hardware automatically attempts to compress cache lines. If data has low entropy (e.g., zeros, repeated patterns, small value range), compression succeeds → more effective L2 capacity → better hit rate. The hardware tries this transparently — no software API to control it.
+H20 L2 = **60 MB**. A single 4096³ fp16 output tile is 4096×4096×2 B = **32 MB**, which fits in L2 — so pinning converts repeated write-backs into L2 hits.
 
-**Our result**: 0% compression success (random fp16 = high entropy, 16-bit values with 10 mantissa bits are incompressible). ncu estimated 1.5% speedup if compression worked. **Only helps with structured/low-entropy data** (e.g., sparse tensors, zero-padded regions, quantized values).
+**Measured results.**
 
-### Bottleneck 5: Instruction-Level Parallelism (ILP)
+| Problem size | Output tile | Δ throughput | Cause |
+|---|---|---|---|
+| 4096³ | 32 MB | **+0.9%** | write-back persistence improves |
+| 512³  | 512 KB | **−0.6%** | L2 pollution evicts A/B, hurts reads |
 
-#### 14. K-loop Unroll
+**Verdict.** Marginal for compute-bound kernels (DRAM < 5%). The H20 baseline sits at DRAM 7.2% and TC 90.9%, so the headroom for any L2-side optimization is fundamentally capped near 1%. Pinning only pays when the **output reuse × output size** product is large enough to amortize the eviction cost on inputs.
 
-**Mechanism**: Unrolling the K-tile loop by factor N issues N independent `cute.gemm` calls per loop iteration. The instruction scheduler can issue multiple WGMMA instructions in parallel (ILP), potentially filling TC pipeline bubbles. Unroll=N also reduces loop overhead (branch, counter update) by N×.
+---
 
-**Tradeoff**: Larger code footprint → I-cache pressure. WGMMA instructions are long (each ~100+ cycles), so N=2 doubles code size for the loop body. At large scale (64 K-tiles × 2 = 128 unrolled iterations), the code may exceed I-cache (48KB on Hopper), causing I-cache misses that cost ~20 cycles each.
+### 14. L2 Compression
 
-**Our result**: unroll=2 → 512³ +1.0% (ILP helps when few K-tiles, I-cache not pressured), 4096³ -0.9% (I-cache miss dominates). unroll=4 → worse everywhere. **ILP vs I-cache tradeoff — net negative for our tile size and K range.**
+**Mechanism.** Hopper (sm_90) L2 has hardware **automatic line compression**: each cache line is compressed on fill and decompressed on access, transparent to software. Lines with low entropy (many repeated bytes, runs of zeros) compress to a fraction of their physical size, so more logical data fits in the same physical L2 capacity.
 
-#### 15. Double Accumulator (Ping-Pong)
+**Effective capacity formula.**
 
-**Mechanism**: Two accumulators alternate per tile. While accumulator A is being drained (R2S → TMA S2G store, ~20 cycles on LSU pipeline), accumulator B is being filled (next tile's WGMMA, ~100+ cycles on TC pipeline). Overlaps LSU with TC.
+$$\text{L2}_{\text{eff}} = \text{L2}_{\text{phys}} \cdot \frac{1}{\overline{\text{compression\_ratio}}}, \qquad \overline{\text{compression\_ratio}} \in (0, 1]$$
 
-**Overlap window**: R2S (~20 cyc) << WGMMA (~100+ cyc), so the overlap window is only 20 cycles out of 100+. The existing epi-overlap (TMA store vs next mainloop) already captures the larger 180-cycle overlap. Double accumulator would add only the 20-cycle R2S overlap → ~0.008% improvement at 4096³.
+For random fp16 noise, $\overline{\text{compression\_ratio}} \approx 1$ (incompressible). For sparse/zero-padded data it can drop to ~0.5 or lower.
 
-**Our result**: Not implemented — DSL staged-if limitation prevents selecting between two rmem tensors with runtime condition (`tile_iter % 2`). Variables defined in one staged-if branch can't be used after the branch. Would require duplicating the entire mainloop+epilogue in both branches.
+**Empirical results on the GEMM workload.**
 
-### Other Optimizations
+| Data pattern | Observed gain | Reason |
+|---|---|---|
+| Random fp16 (default benchmark) | **0%** | high entropy, no compression |
+| ncu *estimated* ceiling | ~1.5% | if compression worked |
 
-#### 16. Block Swizzle (tile reordering)
+**Key constraints.**
+- **No software API.** Compression is purely hardware; you cannot hint, control, or query it.
+- **Conditional benefit.** Only helps *structured / low-entropy* data: sparse matrices, zero-padded NLP tensors, block-quantized (INT4/FP8) weights, masked attention regions. Dense random GEMM sees nothing.
 
-**Mechanism**: Reorder tile processing so that a group of `GROUP_M` consecutive M-tiles are processed together before striding N. Adjacent M-tiles share A rows → L2 can serve A from cache instead of gmem. Reduces gmem reads for A by ~GROUP_M×.
+For the H20 baseline (DRAM 7.2%, L2 hit 66%, L2 phys 60 MB), even a perfect 2× compression would only lift the effective L2 to 120 MB — and since the kernel is TC-bound (90.9%), the extra L2 capacity cannot translate into FLOPs.
 
-**Working set analysis**: Without swizzle (M-major): 78 CTAs each load different A tiles, but consecutive CTAs share M-rows → working set = 5 M-blocks × 1MB + 16 N-blocks × 2MB = 37MB (fits in 60MB L2). With GROUP_M=4: 4 M-blocks active simultaneously → 6 active M-blocks × 1MB + ... = larger working set → L2 pressure increases.
+---
 
-**Our result**: L2 hit rate DROPPED 4% (66% → 62%) — GROUP_M=4 increases working set, exceeding L2 capacity. Default M-major order already maximizes A reuse. Kernel is compute-bound (DRAM 7.2%), so L2 optimization is wrong direction. **Only helps for memory-bound kernels where L2 is the bottleneck and data fits in L2.**
+### 15. K-loop Unroll
 
-#### 17. Padding for Non-Aligned Shapes
+**Mechanism.** The K-reduction loop iterates `K // BLK_K` times. Unrolling by N emits N consecutive `cute.gemm(...)` invocations per source-level iteration. Because each `wgmma` is an *asynchronous* instruction, the instruction scheduler can issue all N before the first completes — instruction-level parallelism (ILP) fills the warp-scheduler bubbles that occur between dependent MMAs.
 
-**Mechanism**: TMA loads a fixed-size (BLK_M, BLK_K) box. When K isn't a multiple of BLK_K, the last box reads OOB gmem (TMA doesn't zero-pad — it reads whatever is in memory). Garbage data corrupts the result.
+**ILP vs I-cache tradeoff formula.**
 
-**Example**: 1024×1024×333 with BLK_K=64: K-tiles = ceil(333/64) = 6, last tile reads K[320:384] but K only has 333 elements → 13 OOB elements read as garbage. If OOB memory is non-zero (from prior allocations), RE = 141%.
+$$\text{speedup}(N) \approx \underbrace{\frac{N}{N - \text{bubbles}_{\text{rel}}}}_{\text{ILP gain}} - \underbrace{\text{Icache\_miss\_penalty}(N)}_{\text{code-size cost}}$$
 
-**Fix**: Pad a, b, output_buf to multiples of BLK_M/BLK_N/BLK_K before kernel launch. Extract original (unpadded) result after.
+$$\text{loop\_body\_size}(N) \approx N \cdot |{\text{wgmma\_seq}}|$$
 
-**Our result**: Fixed RE=141% → 0% for non-aligned shapes (1024×1024×333, 1000×777×333). 3000³ worked before because OOB memory happened to be zeros. **Correctness fix, not performance optimization.**
+Hopper has a **48 KB per-SM instruction cache**. A single WGMMA instruction sequence is ~100+ cycles and encodes to a sizable instruction footprint; doubling it (N=2) nearly doubles the loop body's I-cache demand.
 
-#### 18. BLK_K Increase (64→96) + Fewer Stages (3→2)
+**Measured results.**
 
-**Mechanism**: Larger BLK_K means fewer K-tiles → fewer pipeline sync points (64 → 43 syncs, -33%). But larger BLK_K means more smem per stage (48KB → 72KB) → fewer stages fit (3→2, smem 212KB) → less pipeline overlap.
+| Unroll N | 512³ | 4096³ | Verdict |
+|---|---|---|---|
+| 1 (baseline) | — | — | best overall |
+| 2 | **+1.0%** | **−0.9%** | small kernels win, large lose |
+| 4 | worse | worse | I-cache thrash everywhere |
 
-**Tradeoff**: Pipeline overlap (NUM_STAGES) hides TMA latency. Reducing 3→2 loses 33% overlap. Reducing sync count 33% saves ~33% of barrier stall. But barrier stall is only 74.3% of total stall — and the overlap loss affects ALL K-tiles, while sync reduction only affects the sync point count.
+**Interpretation.**
+- **512³:** the loop executes many times over a *small* working set; ILP gain (1.0%) exceeds the I-cache pressure.
+- **4096³:** the same loop body now competes with the larger epi/mainloop code; I-cache misses cost more than ILP recovers (−0.9%).
 
-**Our result**: -0.9% (4096³: 132.1 vs 132.3 TFLOPS). **Pipeline depth (NUM_STAGES) is more valuable than sync count.** The 3-stage pipeline is the single biggest contributor to 90.9% TC throughput; reducing it undoes the overlap that hides TMA latency. Also, BLK_K=96 uses SW64 swizzle (vs SW128 for K=64) — smaller swizzle granularity.
+Because each WGMMA ≈ 100+ cycles, the scheduler already has substantial latency-hiding depth at N=1; the marginal ILP from N=2 rarely beats the I-cache cost at production problem sizes. **Default: do not unroll.**
 
-### Bottleneck 6: Warp Scheduling and Specialization
+---
 
-#### 19. Warp Specialization (Producer/Consumer Split)
+### 16. Double Accumulator (Ping-Pong)
 
-**Mechanism**: Without warp specialization, a single warp (warp 0) issues TMA loads and then immediately does WGMMA. TMA issue and WGMMA compute serialize on the same warp: while warp 0 waits for TMA data (mbarrier), it can't issue WGMMA. With warp specialization, one warpgroup (WG0 = 128 threads) is dedicated to TMA issuing, while WG1+WG2 (256 threads) do WGMMA. The producer issues TMA loads continuously; the consumer does WGMMA continuously. They run in parallel on different warpgroups.
+**Mechanism.** Maintain two register-memory accumulators $C_0, C_1$. On even K-iterations, accumulate into $C_0$ while $C_1$ is being drained to shared memory (R2S) and stored to gmem via TMA (S2G); on odd iterations, swap roles. The goal is to overlap the long **TMA store tail** of one tile with the **MMA compute** of the next tile.
 
-**Concrete timeline**: Without warp spec (256 threads, 2 WG): `warp0: [TMA0][wait][MMA0][TMA1][wait][MMA1]...`. With warp spec (384 threads, 3 WG): `WG0: [TMA0][TMA1][TMA2]...` (continuous) parallel with `WG1+WG2: [wait][MMA0][MMA1][MMA2]...` (continuous). The producer never waits for MMA; the consumer never waits for TMA issue (only for data arrival at mbarrier).
+**Overlap window formula.**
 
-**Cost**: 128 extra threads (384 vs 256) that only do TMA issuing (1 thread active, 127 idle). Register budget split: producer gets 24-40 regs, consumer gets 232 regs. Epilogue sync needs NamedBarrier (256 threads, excludes producer) instead of sync_threads (384 threads).
+$$\text{overlap}_{\text{available}} = \min(\text{drain\_cost},\ \text{fill\_cost})$$
 
-**Our result**: Used from v1 baseline. TC throughput 90.9% at 4096³ — among the best achievable. Without warp spec (cluster kernel): 129.7T vs 130.6T (-0.7%). **Warp spec gives ~1% at large scale** (TMA/MMA overlap is already handled by pipeline; warp spec mainly helps fill/drain). More important for correctness (producer can run ahead without blocking consumer).
+$$\text{drain\_cost} = \text{R2S} + \text{TMA\_S2G} \approx 20\ \text{cyc (LSU)}$$
 
-#### 20. Swizzle Patterns (Shared Memory Bank Conflict Avoidance)
+$$\text{fill\_cost} = \text{WGMMA} \approx 100+\ \text{cyc (TC)}$$
 
-**Mechanism**: Shared memory on Hopper has 32 banks (4 bytes each, 128B per cycle). Naive row-major layout: consecutive elements map to consecutive banks. WGMMA's `ldmatrix` reads 8 rows × 128B per instruction. If 8 consecutive rows start at the same column offset, they all access the same set of banks → bank conflict (serialized access, 8× slower). Swizzle XORs the row index into the column offset, distributing accesses across banks. SW128 = 1024-bit swizzle unit (8 rows × 128B), SW64 = 512-bit (4 rows × 128B), SW32 = 256-bit.
+$$\Rightarrow \text{overlap}_{\text{available}} \approx 20\ \text{cyc}$$
 
-**Selection**: `get_smem_layout_atom(LayoutEnum.ROW_MAJOR, dtype, major_mode_size)` picks swizzle based on `major_mode_size × dtype_width`. For FP16 K-major with BLK_K=64: 64×16=1024 bits → SW128. For BLK_K=96: 96×16=1536 bits, 1536/512=3 → SW64. Larger swizzle = fewer bank conflicts but requires larger contiguous blocks.
+The drain path is **5× shorter** than the fill path, so the ping-pong only recovers ~20 cycles per tile — far less than the **~180-cycle TMA-store overlap** the existing epilogue/mainloop overlap already captures. Marginal upside.
 
-**Our result**: ncu showed 0 bank conflicts with SW128. WGMMA reads smem via descriptor (not LSU), so bank conflicts don't affect WGMMA directly. TMA writes smem via DMA engine (not LSU), also no bank conflicts. The only LSU smem access is epilogue R2S (make_tiled_copy_C from TiledMma), which uses derived layout — no conflicts. **Swizzle is necessary for correctness** (wgmma descriptor expects specific pattern) and **free for performance** (0 conflicts).
+**Why it is not implemented in the DSL.**
+- The CuTe DSL **staged-if** construct performs *compile-time* selection between tensor variables; it cannot express a runtime `tile_iter % 2` index that alternates between two rmem tensors across loop iterations.
+- A workaround would require **duplicating the entire mainloop + epilogue** into two static branches (one per accumulator), doubling compile time and code size, with the ~20-cyc ceiling above capping the upside.
 
-### Bottleneck 7: Launch Overhead
+**Verdict.** Conceptually valid for memory-bound kernels where drain ≈ fill, but for this Hopper WGMMA kernel (TC 90.9%, DRAM 7.2%) the arithmetic intensity already saturates the tensor cores, leaving the ping-pong trick with <1% headroom. Skip unless the store path becomes the bottleneck.
 
-#### 21. CUDA Graphs
+---
 
-**Mechanism**: Each kernel launch via `cudaLaunchKernel` has ~5-10µs CPU-side overhead (driver API call, stream submission, context switch). For small kernels (512³ = 0.02ms = 20µs), launch overhead is 25-50% of total time. CUDA Graphs captures the launch sequence into a graph, replaying it with a single `cudaGraphLaunch` call (~1µs overhead).
+### 17. Block Swizzle (tile reordering)
 
-**Our result**: `--cuda-graphs` flag in run_gemm.py. But CuTe DSL's compiled function uses TVM-FFI DLPack conversion per call, incompatible with CUDA Graphs capture (graph capture needs fixed memory addresses, but DLPack creates new tensors each call). Auto-fallback to cuda_bench. **Launch overhead is 5-10µs, significant only for sub-100µs kernels.**
+**Goal.** Reorder the `(M-tile, N-tile)` CTA schedule so consecutive CTAs reuse each other's input stripes in L2, instead of thrashing L2 with disjoint working sets.
 
-### Bottleneck 8: Precision and Sparsity
+**Default M-major order (the baseline scheduler).** For each M-block `m`, stream all N-blocks `n = 0..N/BLK_N-1`. Per-stripe footprint at 4096³:
 
-#### 22. FP8 / Mixed Precision
+```
+A-stripe = BLK_M × K × sizeof(FP16) = 128 × 4096 × 2 = 1 MiB
+B-stripe = BLK_N × K × sizeof(FP16) = 256 × 4096 × 2 = 2 MiB
+```
 
-**Mechanism**: Hopper supports FP8 (e4m3, e5m2) WGMMA with `MmaF8Op(a_dtype, b_dtype, acc_dtype, ...)`. FP8 elements are 8-bit (vs 16-bit for FP16), so TC does 2× FMA per cycle. Peak: 296 TFLOPS (2× FP16's 148T). K dimension in instruction_shape doubles (16→32) to maintain the same data volume per instruction.
+Resident working set (5 active M-blocks, 16 N-blocks, deduped B-stripes):
 
-**Precision tradeoff**: FP8 e4m3 has 3 mantissa bits (~1 decimal digit precision). RE for 4096³ FP8: 0.14% (vs 0.01% for FP16). Acceptable for inference (attention scores, MoE experts) but not for training gradients.
+```
+WS_M-major = 5 × 1 MiB + 16 × 2 MiB = 5 + 32 = 37 MiB   (< 60 MiB L2 ✓)
+```
 
-**smem benefit**: FP8 = 1 byte/elem (vs 2 for FP16). smem halves: 105KB vs 214KB → room for more stages or 2 blocks/SM. But TC throughput is already 90%+ with FP16, so the extra smem doesn't translate to performance gain.
+Adjacent M-tiles for the same `n` share the **same B-stripe** → B stays resident in L2; A is re-streamed per M-tile (cheap, 1 MiB). M-major therefore already maximizes A-row reuse by construction.
 
-**Our result**: 280.4T at 16384³ (95% FP8 peak). 2× speedup with zero algorithm change (just dtype swap). User decided FP8 doesn't count as "real breakthrough" — it's a hardware feature, not an algorithmic optimization.
+**Group-M swizzle (GROUP_M=4).** Schedule `GROUP_M` consecutive M-tiles before striding N:
 
-#### 23. Sparse GEMM (2:4 Structured Sparsity)
+```
+(m=0,n=0),(m=1,n=0),(m=2,n=0),(m=3,n=0),
+(m=0,n=1),(m=1,n=1), ...
+```
 
-**Mechanism**: Hopper supports 2:4 structured sparsity — for every 4 elements, at most 2 are non-zero (50% sparse). The hardware skips zero elements in WGMMA, doing 2× effective FMA per cycle. Peak: 296 TFLOPS FP16 (2× dense 148T). Requires sparse input matrices with 2:4 pattern.
+Active footprint grows (4 current M + 2 in-flight overlap):
 
-**Limitation**: Input must be pre-sparsified (pruned to 2:4 pattern with metadata). Not applicable to dense GEMM. Only useful when input naturally has 50% sparsity (e.g., pruned weights in inference). Our random dense GEMM can't benefit.
+```
+WS_GROUP_M=4 ≈ 6 × 1 MiB + N-stripes ≈ 6 + 32 = 38+ MiB   (more L2 pressure)
+```
 
-**Our result**: Not tried (input is dense random). Would give 2× peak if input is 2:4 sparse. **Only applicable with sparse weights, not dense GEMM.**
+**Measured (H20, 4096³, SW128):**
 
-### Bottleneck 9: Scheduling and Tuning
+| Scheduler        | L2 hit | TC    | DRAM  |
+|------------------|--------|-------|-------|
+| M-major (default)| 66 %   | 90.9 %| 7.2 % |
+| GROUP_M=4        | 62 %   | 90.9 %| 7.2 % |
 
-#### 24. Autotuning / Heuristic Dispatch
+L2 hit **drops 66 %→62 %**: more resident M-blocks = larger working set, and at 4096³ the inputs (A+B = 64 MiB) already saturate the 60 MiB L2, so any extra MiB evicts useful lines.
 
-**Mechanism**: No single tile size / NUM_STAGES / split_k is optimal for all problem sizes. Small problems need small tiles (more occupancy) or split-K (more parallelism). Large problems need large tiles (TC efficiency). cuBLAS internally has hundreds of kernel variants and a heuristic dispatch function that picks the best based on M, N, K.
+**When it helps.** Only memory-bound kernels where (a) DRAM is the bottleneck (`DRAM % ≫ TC %`) and (b) total working set fits comfortably in L2. For this H20 GEMM — TC-bound at 90.9 %, DRAM only 7.2 % — L2 is not the bottleneck → group-M is net negative; the default M-major scheduler wins.
 
-**Our dispatch**: `run_gemm.py` uses `M*N < 1024*1024` to select v7 (64×64, S5, small tile) vs v1 (128×256, S3, large tile). Split-K best value varies by shape: 512³→sk8, 1024³→sk2, 2048³→sk4, 4096³→sk4. A production library would have a lookup table or cost model.
+---
 
-**Principle**: The optimal configuration is a function of (M, N, K, dtype, SM count, smem size, register budget). Systematic parameter sweep (autotuning) finds the Pareto frontier. CUTLASS 3.x has `KernelRuntimeFactory` for this. Our PERFLOG.md's performance tables are a manual version of autotuning results.
+### 18. Padding for Non-Aligned Shapes
 
-#### 25. Work Stealing (Dynamic Tile Scheduling)
+**Problem.** TMA loads a fixed `(BLK_M, BLK_K)` box from gmem in one transactional descriptor read. When `K` is not a multiple of `BLK_K`, the last K-tile overhangs the true K extent:
 
-**Mechanism**: Instead of static tile assignment (each CTA gets a fixed set of tiles), CTAs dynamically grab the next available tile from a global atomic counter. Fast CTAs do more tiles; slow CTAs do fewer. Eliminates load imbalance from grid tail and per-tile variance.
+```
+K = 333, BLK_K = 64
+num_K_tiles = ceil(333 / 64) = 6
+last tile covers K[320 : 384]   (64 wide)
+valid range   K[320 : 333]     (13 valid)
+OOB garbage   K[333 : 384]     (51 garbage elements)
+```
 
-**When it helps**: Uniform-workload GEMM (all tiles same compute) → no variance to balance → no gain. FlashAttention with causal mask (upper-triangle tiles are masked, faster) → significant gain. Non-uniform shapes (boundary tiles with residue handling) → moderate gain.
+TMA does **not** zero-pad OOB (unlike `cp.async` with `.zfill`). The 51 OOB elements are whatever bytes live past the allocation and feed directly into the MMA as real data.
 
-**Our result**: Not implemented — DSL staged-if limitation prevents cross-warp tile_idx broadcast (atomic_add by tid==0, then smem + NamedBarrier to broadcast to 384 threads, but the broadcast barrier call must be outside the if is_producer/else split). `cute.arch.atomic_add` exists but element-level tensor access doesn't work well in DSL. **Only useful for non-uniform tile workloads.**
+**Symptom.** `run_gemm.py` prints:
 
-#### 26. ncu Profiling Methodology
+```
+RE = 141 %   → Failed
+```
 
-**Mechanism**: ncu (Nsight Compute) provides hardware-level metrics that reveal bottlenecks invisible to timing alone. The profiling workflow: (1) Roofline analysis (theoretical peak), (2) ncu Speed of Light (which pipeline is saturated), (3) stall reasons (why warps wait), (4) hypothesis → fix → verify.
+51/333 ≈ 15 % of the K-axis is garbage, weighted by whatever those bytes happen to be → relative error comparable to the true GEMM magnitude.
 
-**Key ncu metrics**: `sm__pipe_tensor_op_hmma_cycles_active.pct_of_peak_sustained_active` (TC utilization), `dram__throughput.avg.pct_of_peak_sustained_elapsed` (HBM bandwidth), `smsp__pcsamp_warps_issue_stalled_*` (stall reasons), `sm__warps_active.avg.pct_of_peak_sustained_active` (achieved occupancy).
+**Why 3000³ "worked" before.** `3000 % 64 = 32`, so the last tile overhangs by 32 elements. By luck those 32 gmem bytes happened to be zeros (allocator alignment fill), so the MMA accumulated `+0` and correctness held. This is **luck, not correctness** — shift the allocation or change allocator behavior and it breaks (as 333 demonstrates).
 
-**Stall reason taxonomy**: `stalled_barrier` (waiting at mbarrier/sync — our 74.3%), `stalled_imc_miss` (waiting for HBM), `stalled_long_scoreboard` (waiting for smem load), `stalled_not_selected` (warp eligible but not selected — resource contention), `stalled_short_scoreboard` (waiting for arithmetic result).
+**Fix.** Pad inputs and output to tile multiples, run the kernel, then slice back:
 
-**Our workflow**: ncu → identify CTA barrier stall 74.3% → hypothesis: reduce sync count → try v4-blk96 (fewer syncs) → verify: -0.9% (pipeline depth matters more) → new hypothesis: reduce barrier wait via more stages → try v7 (5-stage) → verify: stall 8% but TC drops 83% → understand tradeoff. This hypothesis-fix-verify loop is the core of kernel optimization.
+```python
+M_pad = ceil(M, BLK_M) * BLK_M
+K_pad = ceil(K, BLK_K) * BLK_K
+a = F.pad(a, (0, K_pad - K))  # (M, K_pad)
+b = F.pad(b, (0, K_pad - K))  # (N, K_pad)
+c = torch.zeros(M_pad, N_pad, ...)
+run_kernel(a, b, c, M_pad, N_pad, K_pad)
+c = c[:M, :N]  # restore original shape
+```
 
-### Bottleneck 10: Fusion and Epilogue
+Padding guarantees every TMA box reads in-bounds real data (the padded region is explicit zeros, contributing `+0` to the accumulation).
 
-#### 27. Fused Epilogue (GEMM + Activation)
+**Cost.** Correctness fix, not a performance lever. Worst-case padding ≤ `(BLK − 1)/BLK ≈ 50 %` extra work on the smallest dimension, amortized to ~0 % at large shapes. Apply whenever `K % BLK_K ≠ 0` or `M % BLK_M ≠ 0` or `N % BLK_N ≠ 0`.
 
-**Mechanism**: After GEMM computes C = A×B, many applications apply element-wise operations: C = ReLU(A×B + bias), C = GELU(A×B), C = sigmoid(A×B). Doing these in a separate kernel requires: (1) write C to gmem (TMA S2G), (2) read C back from gmem (TMA G2S), (3) apply activation, (4) write result to gmem. Fusing: in the epilogue, after R2S (register → smem), apply activation in registers before writing to smem. Saves one gmem round-trip.
+---
 
-**Epilogue fusion pattern**: `tCrD = make_fragment_like(accumulators, out_dtype)` → `tCrD.store(activation(accumulators.load().to(out_dtype)))` → R2S → TMA S2G. The activation function runs on the TC's output while it's still in registers — no extra gmem access.
+### 19. BLK_K Increase (64 → 96) + Fewer Stages (3 → 2)
 
-**Our result**: Not implemented (our kernel does plain GEMM, no activation). CUTLASS 3.x has `EpiOp` for this. The official `dense_gemm_fp8_gelu_persistent.py` example fuses GELU. **Saves one gmem read + one kernel launch per fused operation.**
+**Lever.** Larger `BLK_K` reduces the K-loop trip count and thus barrier/sync count:
 
-#### 28. K-Major Data Layout
+```
+num_K_tiles(64) = ceil(4096 / 64) = 64
+num_K_tiles(96) = ceil(4096 / 96) = 43
+Δ syncs = (64 − 43) / 64 = −33 %
+```
 
-**Mechanism**: GEMM computes C = A×B where A is (M,K) and B is (N,K) (transposed). The "major mode" (K-major vs M-major) determines which dimension is contiguous in memory. K-major A means K is the fast-varying dimension — consecutive K elements are adjacent in memory. WGMMA's `OperandMajorMode.K` expects K-major input because the MMA instruction strides along K.
+**Cost (smem pressure).** Each pipeline stage holds one A-box + one B-box:
 
-**Impact on TMA**: TMA descriptor captures the gmem tensor's shape and stride. K-major layout means TMA loads consecutive K elements in one memory transaction (coalesced). M-major layout would scatter K elements across memory (uncoalesced, slower). The swizzle pattern also depends on major mode: `get_smem_layout_atom` selects SW128/SW64/SW32 based on `major_mode_size = K dimension`.
+```
+stage_size(64) = BLK_M·BLK_K·2 + BLK_N·BLK_K·2
+               = 128·64·2 + 256·64·2  = 16 KiB + 32 KiB = 48 KiB
+stage_size(96) = 128·96·2 + 256·96·2 = 24 KiB + 48 KiB = 72 KiB   (+50 %)
+```
 
-**Our result**: We use `LayoutEnum.ROW_MAJOR` for both A and B. For A (M,K) row-major: K is the fast dimension → K-major → `is_k_major_a() = True`. For B (N,K) row-major: K is the fast dimension → K-major → `is_k_major_b() = True`. Both are K-major, matching `OperandMajorMode.K` in our WGMMA atom. **Layout must match major mode — mismatch causes correctness failure (wgmma reads wrong data).**
+H20 smem budget = 228 KiB. With 214 KiB already committed by the CTA:
+
+```
+NUM_STAGES(64, 48 KiB) = floor(214 / 48) = 4  →  configured = 3  (room)
+NUM_STAGES(96, 72 KiB) = floor(214 / 72) = 2  →  configured = 2  (maxed)
+```
+
+Increasing `BLK_K 64→96` therefore **forces the pipeline depth 3→2**.
+
+**Trade-off.** A 3-stage mainloop overlaps `i+3` gmem→smem TMA copy, `i+2` rmem load/wait, and `i+1` rmem→rmem MMA. With only 2 stages the producer can no longer fully hide consumer latency → one bubble per K-iteration. **Lost overlap > saved syncs.**
+
+**Measured (4096³):**
+
+```
+v4-baseline (BLK_K=64, STAGES=3, SW128):  TC = 90.9 %   TFLOPS = ref
+v4-blk96    (BLK_K=96, STAGES=2, SW64):   TC ≈ 90 %     TFLOPS = ref × 0.991   (−0.9 %)
+```
+
+**Secondary effect: swizzle granularity.** `BLK_K=64` selects SW128 (1024-bit unit); `BLK_K=96` selects SW64 (512-bit unit, finer granularity, marginally more swizzle compute). Both remain bank-conflict-free (see §20).
+
+**Conclusion.** Pipeline depth `NUM_STAGES` is the **single biggest contributor** to the 90.9 % Tensor Core throughput — the 3-stage overlap hides the ~600-cycle WGMMA latency behind TMA+rmem copy. Reducing sync count by 33 % does not compensate for collapsing the pipeline to 2 stages. Keep `BLK_K=64, NUM_STAGES=3`.
+
+---
+
+### 20. Swizzle Patterns (Bank Conflict Avoidance)
+
+**Bank geometry.** Hopper shared memory = **32 banks × 4 B/bank = 128 B per cycle**. A naïve row-major layout places a 128-B `ldmatrix`/rmem-load vector in 8 consecutive 4-B words hitting the same 8 banks:
+
+```
+row r:  bank b  bank b  ... bank b   (8 × 16 B = 128 B, all in 8 banks)
+        → 8-way bank conflict → 8 cycles instead of 1
+```
+
+**Swizzle.** XOR the row index into the column offset:
+
+```
+swizzled_col(r, c) = c  XOR  f(r)
+```
+
+Adjacent rows land in different banks → 8 words spread across all 32 banks → 0 conflicts, 1 cycle/transfer.
+
+**Granularities** (selected by `get_smem_layout_atom`):
+
+| Pattern | Unit (bits) | Unit (bytes) | Layout        |
+|---------|-------------|--------------|---------------|
+| SW128   | 1024        | 128 B        | 8 rows × 16 B |
+| SW64    | 512         | 64 B         | 4 rows × 16 B |
+| SW32    | 256         | 32 B         | 2 rows × 16 B |
+
+Selection rule (verified in the installed DSL):
+
+```
+atom = get_smem_layout_atom(ROW_MAJOR, dtype=Float16, major_mode_size=BLK_K)
+# BLK_K=64 → 64 × 16b = 1024 bit → SW128
+# BLK_K=96 → 96 × 16b = 1536 bit → SW64 (round down to power-of-2 unit)
+```
+
+**Measured.** `ncu --section MemoryWorkloadAnalysis_Shared`:
+
+```
+Bank conflicts per shared-mem transaction: 0.00   (SW128, baseline)
+```
+
+**Why conflicts don't appear elsewhere.**
+
+- **WGMMA reads smem via the descriptor path** — bypasses the LSU/bank-arbitration path entirely; descriptor issues async gmem-style accesses, no per-thread bank arbitration.
+- **TMA writes smem via the DMA path** — bulk async copy, no bank arbitration.
+- **Only the epilogue `R2S` (rmem→smem) / `S2G` (smem→gmem) use the LSU path**, and there the layout is *derived* from the swizzled atom to stay conflict-free automatically.
+
+**Takeaways.**
+1. Swizzle is **required for correctness** — the WGMMA descriptor expects the exact bit-pattern produced by `get_smem_layout_atom`; an unswizzled or mismatched layout yields wrong MMA operands.
+2. Swizzle is **free for performance** — eliminates what would otherwise be 8-way bank conflicts on every `ldmatrix`, at zero extra instruction cost (the XOR is folded into address generation).
+3. The pattern (SW128/SW64/SW32) is **derived from dtype and `BLK_K`**, never chosen by hand.
+
+---
+
+### 21. K-Major Data Layout
+
+**GEMM convention.** `C = A · Bᵀ` with `A ∈ R^{M×K}`, `B ∈ R^{N×K}` (B stored row-major as N×K so K is the fast axis), `C ∈ R^{M×N}`.
+
+**K-major.** The K dimension is **contiguous in memory** — successive K elements occupy adjacent addresses. `A(M, K)` row-major: `&A[m, k+1] − &A[m, k] = 1 element` → K is fast → K-major. Likewise `B(N, K)` row-major is K-major.
+
+**Why the MMA needs K-major.** The WGMMA accumulates over K:
+
+```
+C[m, n] = Σ_{k} A[m, k] · B[n, k]
+```
+
+and strides along K on both operands. `cute.nvgpu.warpgroup.MmaF16BF16Op(..., OperandMajorMode.K)` declares the *major* (fast-varying) axis of each operand is K. The hardware streams K-contiguous vectors and fuses multiply-adds without address arithmetic on the K stride.
+
+**Why TMA needs K-major.** TMA loads a contiguous `(BLK_M, BLK_K)` box. If K is contiguous in memory (K-major), one TMA descriptor issues **coalesced** transfers — `BLK_K` consecutive FP16s in adjacent addresses pack into minimal 128-B sectors. If layout were M-major (M fast), the same box would be `BLK_M` disjoint K-strided rows → uncoalesced, `BLK_M×` more sectors, `BLK_M×` the DRAM transactions.
+
+**Concrete (baseline kernel).**
+
+```python
+mA = cute.make_tensor(ptr_a, cute.make_layout((M, K), stride=(K, 1)))  # row-major → K-fast
+mB = cute.make_tensor(ptr_b, cute.make_layout((N, K), stride=(K, 1)))  # row-major → K-fast
+```
+
+Both match `OperandMajorMode.K`. The `make_cute_tensor(t)` helper in `common/cute_runtime.py` forwards the torch tensor's existing strides, so passing contiguous `(M, K)` and `(N, K)` torch tensors is sufficient.
+
+**Correctness invariant.**
+
+```
+layout(A).fast_axis == K   ⟺   WGMMA op's MajorMode.K   ⟺   TMA coalesced
+```
+
+Break any link and the kernel produces garbage:
+- Pass `A` as `(K, M)` (M-major) but tell the op `MajorMode.K` → MMA reads wrong operand → `RE ≫ tol`.
+- Mismatch `B`'s major axis → same.
+- Transpose one operand only → silent wrong-accumulator.
+
+**M-major is a trap.** Learners sometimes store `A` as `(K, M)` "because the K loop is innermost and we want K contiguous in the *other* direction." Wrong: K-major means K contiguous **in memory**, not "K is the inner loop variable." The inner loop is always K (that's what the MMA does); the **memory layout** must put K adjacent so those inner-loop loads are coalesced.
+
+---
+
+### 22. CUDA Graphs
+
+**Launch overhead anatomy.** Every `cudaLaunchKernel` traverses the driver API: argument marshalling, stream submission, context validation, and kernel-descriptor setup. Measured cost on H20: **5–10 µs per launch**, serialized on the launch thread.
+
+**Overhead fraction** = `t_overhead / (t_overhead + t_kernel)`:
+
+| Problem | Kernel runtime | Overhead fraction (5–10 µs) |
+|---------|---------------|-----------------------------|
+| 512³    | ~20 µs (0.02 ms) | **25–50 %** |
+| 1024³   | ~150 µs        | 3–6 % |
+| 4096³   | ~1.5 ms        | 0.3–0.7 % |
+| 16384³  | ~24 ms         | <0.05 % |
+
+Rule of thumb: launch overhead is only material for **sub-100 µs** kernels. Above that it disappears into the noise — which is why our 4096³/16384³ numbers are clean but the 512³ point looks artificially slow.
+
+**CUDA Graphs.** Capture the launch sequence once (`cudaStreamBeginCapture` → run launches → `cudaStreamEndCapture` → `cudaGraphExec`), then replay with a single `cudaGraphLaunch` ≈ **1 µs**. All kernel arguments (pointers, scalars) are **baked in at capture time**; the graph replays the exact same addresses and parameter block.
+
+**Incompatibility with our CuTe DSL path.** The compiled DSL function is dispatched through TVM-FFI: each call wraps `torch.Tensor` into `cute.Tensor` via `from_dlpack`, which **constructs a fresh `cute.Tensor` object per invocation**. Even though the underlying `torch.Tensor` data pointer is stable, the FFI conversion re-extracts pointers at call time, and graph capture requires them fixed at capture time. Result: `--cuda-graphs` cannot bind to the `cute.compile` callable.
+
+**Auto-fallback.** When `--cuda-graphs` is requested but the compiled kernel is incompatible, we fall back to `cuda_bench` (manual `cudaEvent` timing around each launch). Reported numbers are then *kernel time + launch overhead* — for large problems indistinguishable from pure kernel time, but for 512³ it inflates the measurement by 25–50 %, exactly the regime where graphs would have helped.
+
+**Practical takeaway.** For the 512³ PERFLOG point, the apparent inefficiency vs cuBLAS (21.1 T vs theoretical peak) is partly launch overhead, not TC utilization. CUDA Graphs would close that gap. For 4096³+ graphs are a no-op.
+
+---
+
+### 23. Fused Epilogue (GEMM + Activation)
+
+**The unfused cost.** Many workloads apply a pointwise op after the GEMM:
+- `C = ReLU(A·B + bias)`
+- `C = GELU(A·B)`
+- `C = softmax(A·B)` (attention)
+
+Naive two-kernel pipeline:
+
+```
+GEMM kernel:  reg(C) ──R2S──▶ smem(C) ──TMA S2G──▶ gmem(C)            [write 1]
+ACT  kernel:  gmem(C) ──TMA G2S──▶ smem ──S2R──▶ reg(C)              [read]
+              reg(C) ──act()──▶ reg(C) ──R2S──▶ smem ──S2G──▶ gmem(C)  [write 2]
+```
+
+That is **one extra gmem round-trip + one extra kernel launch** for the intermediate `C`.
+
+**Quantifying on 4096³ FP16.** `C` = `4096² × 2 B = 33.5 MB`. H20 HBM3 bandwidth ≈ 4 TB/s, so one round-trip (read + write):
+
+```
+t_rt = 2 × 33.5 MB / 4 TB/s ≈ 16.8 µs
+t_launch ≈ 5–10 µs
+t_epilogue_penalty ≈ 22–27 µs
+```
+
+Against a 1.5 ms GEMM that is ~1.5 % — small but real, and it scales linearly with `M·N`.
+
+**Fused path.** Apply the activation **in registers** right after the WGMMA accumulators produce `D`, before any shared-memory or gmem write:
+
+```python
+# After the K-loop's final cute.gemm(tiled_mma, tCrD, tCrA, tCrB, tCrD)
+acc = tCrD.load().to(out_dtype)  # WGMMA accumulator → out dtype
+acc = activation(acc)  # pointwise, in registers
+tCrD.store(acc)  # back into the store fragment
+cute.copy(r2s_copy, tCrD, sC)  # R2S
+cute.copy(s2g_tma, sC, mC)  # TMA S2G — single gmem write
+```
+
+Single gmem write, single kernel launch. Activation cost in registers is negligible: ReLU is 1 `max` op; even GELU's tanh approximation (~10 FMAs) is dwarfed by the hundreds of cycles each WGMMA instruction takes.
+
+**CUTLASS 3.x abstraction.** `EpilogueOp` / `EpiOp` stacks pointwise ops (bias → GELU → scale → cast) into the store path. Reference implementation: `cutlass/examples/77_blackwell_dgemm_fusion/dense_gemm_fp8_gelu_persistent.py` fuses **GELU + FP8 GEMM**.
+
+**Our status.** The kernel in this repo is plain (`C = A·B`, no epilogue). Adding fusion is a ~10-line change in the kernel body plus an `activation` constexpr; the host/harness side needs no changes.
+
+---
+
+### 24. Autotuning / Heuristic Dispatch
+
+**Why no single config wins.** The optimal `(BLK_M, BLK_N, BLK_K, NUM_STAGES, SPLIT_K)` is a function:
+
+```
+config* = argmax  throughput(M, N, K, dtype, SM_count, smem_per_SM, regs_per_thread)
+          subject to:  smem_used ≤ 228 KB   (H20)
+                       threads_per_block ≤ 1024
+                       regs_per_thread ≤ 255
+```
+
+Two competing pressures:
+
+| Pressure | Favors |
+|----------|--------|
+| Parallelism (small problems) | Small tiles, split-K → more blocks to fill 78 SMs |
+| TC efficiency (large problems) | Large tiles → fewer loop iterations, better pipelining |
+
+**Wave-count analysis on H20 (78 SMs).** `waves = ceil(M/BLK_M) × ceil(N/BLK_N) / 78`:
+
+| Problem | Tile 128×256 | Blocks | Waves | SM occupancy |
+|---------|--------------|--------|-------|--------------|
+| 512³    | 4 × 2        | 8      | 0.10  | 10 % ✗ |
+| 1024³   | 8 × 4        | 32     | 0.41  | 41 % ✗ |
+| 2048³   | 16 × 8       | 128    | 1.64  | ~100 % (last wave 64 %) |
+| 4096³   | 32 × 16      | 512    | 6.56  | ~100 % ✓ |
+| 16384³  | 128 × 64     | 8192   | 105   | 100 % ✓ |
+
+Small problems leave SMs idle → trade tile size for parallelism via **split-K**: partition the K-reduction into `sk` splits, each producing a partial `C`, then a reduce kernel sums them.
+
+**PERFLOG-derived dispatch (manual autotuning):**
+
+| Problem | Best variant | Tile / stages | Split-K |
+|---------|--------------|----------------|---------|
+| 512³    | v7           | 64×64, S5      | sk8 |
+| 1024³   | —            | —              | sk2 |
+| 2048³   | —            | —              | sk4 |
+| 4096³   | v1           | 128×256, S3    | sk4 |
+| 16384³  | v1           | 128×256, S3    | sk1 (no split) |
+
+**Runtime dispatch rule** (cheap heuristic, no profiling at call time):
+
+```python
+if M * N < 1024 * 1024:
+    launch v7  (BLK_M=64,  BLK_N=64,  NUM_STAGES=5)   # small tiles
+else:
+    launch v1  (BLK_M=128, BLK_N=256, NUM_STAGES=3)   # large tiles
+```
+
+**What cuBLAS does.** Ships hundreds of pre-tuned kernels plus a heuristic dispatch table keyed on `(M, N, K, dtype, transposes, SM_count)`. At runtime it picks the closest-matching kernel from the table. This is why cuBLAS looks "impossible to beat" — it is not one kernel, it is a portfolio.
+
+**CUTLASS 3.x equivalent.** `KernelRuntimeFactory` + `Manifest` enumerate the configuration space (tiles, stages, MMA atoms, epilogues) and emit one compiled kernel per combination, then a dispatch table picks among them. Our `PERFLOG/*.md` tables are the **manual** equivalent: sweep configs offline, record TFLOPS, hand-pick winners.
+
+---
+
+### 25. FP8 / Mixed Precision
+
+**FP8 formats on Hopper.**
+
+| Format | Sign | Exp | Mantissa | Range | Precision |
+|--------|------|-----|----------|-------|-----------|
+| e4m3   | 1    | 4   | 3        | ±448  | ~1 decimal digit (8 values/binade) |
+| e5m2   | 1    | 5   | 2        | ±57344| coarser, wider range |
+| FP16   | 1    | 5   | 10       | ±65504| ~3 decimal digits |
+| BF16   | 1    | 8   | 7        | ±3.4e38 | ~2–3 decimal digits |
+
+WGMMA atom:
+
+```python
+op = cute.nvgpu.warpgroup.MmaF8Op(
+    cutlass.Float8, cutlass.Float8, cutlass.Float32, instruction_shape=(128, N, 32)
+)  # K=32, doubled from FP16's 16
+```
+
+**2× throughput mechanism.** Same 16-byte operand fetch from registers, but each element is 8 bits instead of 16 → **2× the FMA operations per WGMMA instruction**. The K dimension of `instruction_shape` doubles (16 → 32) to consume the same register bytes.
+
+| Dtype | H20 peak | Measured (16384³) | % peak |
+|-------|----------|--------------------|--------|
+| FP16  | 148 TFLOPS | ~139 (cuBLAS)    | 94 % |
+| FP8   | 296 TFLOPS | 280.4 TFLOPS      | **94.7 %** |
+
+`Speedup = 296 / 148 = 2.0×`, achieved by changing two lines: the dtype and the MMA atom. Algorithm identical.
+
+**Precision cost.**
+
+| Dtype | Mantissa bits | RE @ 4096³ |
+|-------|---------------|------------|
+| FP16  | 10            | ~0.01 % |
+| FP8 e4m3 | 3          | ~0.14 % |
+
+RE degrades ~14×. Verdict:
+- ✅ Inference forward pass — fine (weights and activations quantized, output tolerances loose).
+- ❌ Training gradients / optimizer states — FP8 has too little precision for stable gradient accumulation; use FP32 master weights + FP8 activations (mixed precision).
+
+**Shared-memory dividend (that doesn't pay off).** FP8 halves the smem footprint of A/B buffers:
+
+| Dtype | A+B per stage (128×64 + 256×64) | × 3 stages | + C smem (128×256) | Total |
+|-------|----------------------------------|------------|---------------------|-------|
+| FP16  | 48 KB                            | 144 KB     | 64 KB               | **~214 KB** (≤ 228 KB ✓) |
+| FP8   | 24 KB                            | 72 KB      | 32 KB               | **~105 KB** |
+
+FP8 leaves ~123 KB free → could fit 2 blocks/SM (more parallelism) or 6+ pipeline stages. **But:** ncu shows TC utilization already at 90.9 % — the kernel is TC-bound, not smem-bound. Extra smem buys nothing because the bottleneck is the MMA units, not the copy pipeline. The 2× win is purely from the TC doing 2× FMA/cycle on FP8 inputs.
+
+**Algorithmic verdict.** FP8 is a **hardware feature**, not an algorithmic optimization. The 2× comes from the silicon, not from tiling, pipelining, or dispatch work. The user's call: it does not count as a "real breakthrough" — it is free only after NVIDIA built the FP8 tensor cores. Real algorithmic wins (this repo's actual work) are the tiling / pipelining / split-K choices in principles 1–24.
+
+---
+
+### 26. Sparse GEMM (2:4 Structured Sparsity)
+
+Hopper (sm_90) implements **2:4 structured sparsity** in hardware: for every group of 4 contiguous elements along the K-reduction axis, **exactly 2 must be non-zero** and 2 zero (50% sparse). The sparse MMA/WGMMA path skips the zero elements, performing **2× effective FMA/cycle** vs. dense.
+
+**Peak throughput (H20, FP16):**
+- Dense peak: `148 TFLOPS` (given)
+- Sparse (2:4) peak: `2 × 148 = 296 TFLOPS`
+- Theoretical speedup ceiling: `2.0×` (only attainable on fully 2:4-sparse input)
+
+**Metadata cost.** Each group of 4 FP16 elements (8 B) carries a 2-bit selector (which 2 of 4 are non-zero):
+- Metadata bytes per row (K elements): `K/4 × 2 bits = K/2 bits = K/16 bytes`
+- For `K = 4096`: `256 bytes/row` of indices (vs `8192 bytes/row` of data → 3.1% overhead)
+- For a `4096×4096` weight matrix: `4096 × 256 = 1 MiB` metadata, negligible
+
+**When it applies:**
+- Weights are **static** and pruned offline → reuses metadata every call (inference sweet spot)
+- cuSPARSE `cusparseSpMM` (sparse × dense) on Hopper: typically **1.5–1.9×** over dense `cusparseSpMM` at 50% sparsity
+- Training is impractical: gradients have no natural 2:4 structure, pruning-then-retraining (AMPERE/NVIDIA sparse-training recipe) is needed
+
+**Why our kernel cannot benefit (dense random GEMM):**
+1. Inputs are i.i.d. Gaussian → effectively 100% non-zero, **no valid 2:4 pattern** exists
+2. Forcing 2:4 by zeroing 50% of random data changes the problem — output becomes wrong by up to ~50%
+3. Sparse WGMMA uses a **different atom** (`wgmma.sp.mma_async`) + metadata load path; the dense kernel's `cute.nvgpu.warpgroup.MmaF16BF16Op` cannot route through it
+
+**Numbers (hypothetical, 4096³ on H20):**
+- Dense cuBLAS: `132.2 TFLOPS` = `89.3%` of 148 T peak (given)
+- Sparse cuBLAS, 2:4 weights: up to `~250 TFLOPS` ≈ `84%` of 296 T peak
+- Our dense kernel TC util `90.9%` is already near the dense ceiling → sparse is a **different problem class**, not an optimization of this one
+
+**Verdict:** Only applicable with sparse weights (inference). Dense GEMM gains nothing; re-architecting our kernel to sparse WGMMA is out of scope.
+
+---
+
+### 27. Work Stealing (Dynamic Tile Scheduling)
+
+**Static scheduling** assigns each CTA a fixed output tile via `blockIdx`. **Work stealing** replaces this with a global atomic counter `next_tile`; each CTA, after finishing a tile, does `tile_idx = atomicAdd(&next_tile, 1)` and grabs the next available tile. Fast CTAs pick up slack from slow CTAs.
+
+**Imbalance model.** Let `T` = per-tile work, `σ` = std-dev of per-tile time, `S` = SM count, `N` = tile count:
+- Static: `t_static ≈ ⌈N/S⌉ · (T_mean + σ_max)` — tail CTA bounded by the slowest tile
+- Steal: `t_steal ≈ (N · T_mean / S) + O(σ · log S)` — variance amortizes across SMs
+- Gain ≈ `σ / T_mean` fraction; **zero gain when σ = 0**
+
+**Our uniform dense GEMM (σ ≈ 0):**
+- Grid for `M=N=4096`, `BLK_M=128, BLK_N=256`: `(32, 16) = 512` tiles / `78` SMs ≈ `6.6` waves
+- Every tile does identical `K/BLK_K = 4096/64 = 64` MMA rounds → σ = 0 → **stealing gains ~0%**, only adds atomic overhead (slightly negative)
+
+**Where stealing wins (variance sources):**
+| Workload | σ source | Typical gain |
+|---|---|---|
+| FlashAttention, causal mask | upper-triangle tiles skipped (zero MMA) | **1.3–1.8×** |
+| Boundary/residue tiles (M,N not divisible by BLK_M,N) | partial K-reduction on edges | 1.05–1.15× |
+| Variable-K / ragged batches | per-tile K differs | 1.2–1.5× |
+| Uniform dense (ours) | none | ~1.00× |
+
+**Why our bottleneck is not fixable by stealing.** ncu reports `barrier_stall = 74.3%`, `no_eligible = 96.7%`, `occupancy = 13.9%`. The stall is **intra-tile** (a CTA blocked on its own mbarrier between pipeline stages), not inter-tile. Stealing rebalances *between* tiles but cannot hide a stall *inside* a tile — and with only `13.9%` active occupancy there is no resident warp to switch to. The fix path is deeper pipeline / more occupancy (see §28), not work stealing.
+
+**Implementation blocker in CuTe DSL:**
+- `cute.arch.atomic_add` exists, but element-level scalar access on a 0-D gmem tensor is awkward inside the tile abstraction
+- Cross-warp broadcast of runtime `tile_idx` requires a runtime `if`/loop the DSL's staged-`if` (`cutlass.const_expr`) cannot express — `const_expr` is compile-time only, so a runtime per-CTA tile counter cannot drive the tile coordinate
+- Hence **not implemented**; left as a documented optimization for non-uniform workloads (FlashAttention, ragged GEMM)
+
+**Verdict:** Essential for causal/ragged workloads (~1.3–1.8×). Useless for uniform dense GEMM; our `σ = 0` means stealing only costs atomics.
+
+---
+
+### 28. ncu Profiling Methodology
+
+`ncu` (Nsight Compute) exposes hardware counters that wall-clock timing cannot — it tells you **which pipeline** is saturated and **why** warps stall. The discipline is a 4-step loop: **roofline → Speed-of-Light → stall reasons → hypothesis-fix-verify.**
+
+**Step 1 — Roofline (theoretical ceiling).**
+- H20 FP16 peak: `148 TFLOPS`; HBM BW ≈ `4 TB/s`
+- Roofline crossover: `AI* = 148e12 / 4e12 = 37 FLOP/byte`
+- GEMM arithmetic intensity (FP16, square `N³`): `AI = 2MNK / 2(MK + NK + MN) = MNK / (MK + NK + MN)`; for `M=N=K=4096`: `AI ≈ 4096/3 ≈ 1365 FLOP/byte` ≫ 37 → **compute-bound**, HBM should be idle. Predicts DRAM util low.
+
+**Step 2 — Speed of Light (which pipeline).**
+| Metric | Our value | Reading |
+|---|---|---|
+| `sm__pipe_tensor_op_hmma_cycles_active` (TC) | **90.9%** | near peak — good |
+| `dram__throughput` | **7.2%** | HBM idle — matches compute-bound roofline |
+| `sm__warps_active.avg.pct_of_peak_sustained_active` | **13.9%** | severely under-occupied |
+
+TC near saturation yet `No Eligible 96.7%` → the SM is idle because **no warp can issue**, not because compute is light. Bottleneck = scheduling/occupancy, hidden behind high TC%.
+
+**Step 3 — Stall taxonomy (`smsp__pcsamp_warps_issue_stalled_*`):**
+| Stall reason | Meaning | Our value | Fix lever |
+|---|---|---|---|
+| `stalled_barrier` | mbarrier / pipeline-stage sync | **74.3%** | fewer syncs / deeper pipeline |
+| `stalled_imc_miss` | HBM load wait | low | prefetch, more stages |
+| `stalled_long_scoreboard` | smem load wait | — | bank-conflict-free layout |
+| `stalled_not_selected` | scheduler picked another warp (healthy) | ~0 | — (occupancy too low) |
+| `stalled_short_scoreboard` | arithmetic result wait | — | ILP / instr scheduling |
+
+**Occupancy math (why 13.9%).**
+- Threads = `384` → `12 warps/CTA`; Hopper max `64 warps/SM` → resident ceiling `18.75%`
+- **smem is the limiter**: per stage `= (128×64 + 256×64)×2 B = 48 KiB`; ×`NUM_STAGES=3` = `144 KiB`. Hopper budget `228 KiB` → **only 1 CTA/SM** fits (`2×144 = 288 > 228`). So `1 CTA × 12 warps = 18.75%` resident, `13.9%` active. The 144 KiB smem *forces* low occupancy.
+
+**Step 4 — hypothesis → fix → verify (the actual experiments):**
+
+| # | Hypothesis | Change | Result | Lesson |
+|---|---|---|---|---|
+| v4 | fewer barriers → less `stalled_barrier` | `BLK_M=96` (smaller tile, fewer syncs) | **−0.9%** perf | pipeline depth loss > sync savings |
+| v7 | deeper pipeline hides barrier | `NUM_STAGES=5` | barrier `74%→8%` ✅ but TC `90.9%→83%` ❌ | 5×48 = 240 KiB > 228 → must shrink tile → TC starves |
+
+The loop explains **why** `BLK_M=128, BLK_N=256, BLK_K=64, S=3` is a local optimum: it sits at the smem-reg-TC tradeoff knee. Fewer stages → barriers dominate; more stages → tile shrinks and TC underutilizes. The number `90.9%` TC is not arbitrary — it's the equilibrium of that tradeoff.
+
+**Cross-check vs. cuBLAS (peak fraction):**
+- `512³ → 21.1 T` = `14.3%` of 148 T (launch/grid overhead dominates)
+- `4096³ → 132.2 T` = `89.3%` of 148 T ← our kernel competes here (`90.9%` TC)
+- `16384³ → 139.2 T` = `94.1%` of 148 T ← remaining headroom = better occupancy/scheduling
+
+**The core loop:** `ncu metric → diagnosis → hypothesis → code change → ncu re-measure → accept/reject`. Numbers drive every decision; `90.9% / 7.2% / 74.3% / 13.9%` is the signature that says "TC-saturated, barrier-bound, occupancy-starved" and rules out HBM-side fixes.
