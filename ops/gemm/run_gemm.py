@@ -150,9 +150,8 @@ def _compile_and_run(
     N: int,
     K: int,
     split_k: int = 1,
-    num_stages: int = 3,
 ) -> object:
-    print(f"Compiling CuTe DSL gemm({M}x{N}x{K}, split_k={split_k}, num_stages={num_stages}) ...")
+    print(f"Compiling CuTe DSL gemm({M}x{N}x{K}, split_k={split_k}) ...")
     compiled = cute.compile(
         gemm_fn,
         make_cute_tensor(a, leading_dim=1),
@@ -163,7 +162,6 @@ def _compile_and_run(
         N,
         K,
         split_k,
-        num_stages,
         options="--enable-tvm-ffi --generate-line-info",
     )
     compiled(a, b, c)
@@ -216,7 +214,6 @@ def run_case(
     ncu_gui: bool = False,
     split_k: int = 1,
     use_cluster: bool = False,
-    num_stages: int = 3,
 ) -> bool:
     torch.cuda.manual_seed_all(9527)
     a = (torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.5).to(dtype)
@@ -247,10 +244,10 @@ def run_case(
         output_buf = torch.zeros(M_use, N_use, device="cuda", dtype=torch.float16)
 
     if os.environ.get("NCU_PROFILING") == "1":
-        _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k, num_stages)
+        _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k)
         return True
 
-    compiled = _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k, num_stages)
+    compiled = _compile_and_run(gemm_fn, a_use, b_use, output_buf, M_use, N_use, K_use, split_k)
 
     if split_k > 1:
         c = output_buf.view(split_k, M_use, N_use).sum(dim=0)[:M, :N]
@@ -327,7 +324,6 @@ def main() -> None:
 
     use_fp8 = "--fp8" in sys.argv
     use_cluster = "--cluster" in sys.argv
-    use_autotune = "--autotune" in sys.argv
     use_cuda_graphs = "--cuda-graphs" in sys.argv
     use_cupti = "--cupti" in sys.argv
     use_ncu = "--ncu" in sys.argv or "--ncu-raw" in sys.argv or "--ncu-gui" in sys.argv
@@ -346,30 +342,23 @@ def main() -> None:
 
     counters = {"succeed": 0, "failed": 0}
     for M, N, K in shapes:
-        stages_to_try = [1, 2, 3] if use_autotune else [3]
-        for ns in stages_to_try:
-            if use_autotune:
-                print(f"\n{'=' * 40}")
-                print(f"  Autotune: num_stages={ns}")
-                print(f"{'=' * 40}")
-            if run_case(
-                M,
-                N,
-                K,
-                dtype=dtype,
-                bench=True,
-                use_cuda_graphs=use_cuda_graphs,
-                use_cupti=use_cupti,
-                use_ncu=use_ncu,
-                ncu_raw=ncu_raw,
-                ncu_gui=ncu_gui,
-                split_k=split_k,
-                use_cluster=use_cluster,
-                num_stages=ns,
-            ):
-                counters["succeed"] += 1
-            else:
-                counters["failed"] += 1
+        if run_case(
+            M,
+            N,
+            K,
+            dtype=dtype,
+            bench=True,
+            use_cuda_graphs=use_cuda_graphs,
+            use_cupti=use_cupti,
+            use_ncu=use_ncu,
+            ncu_raw=ncu_raw,
+            ncu_gui=ncu_gui,
+            split_k=split_k,
+            use_cluster=use_cluster,
+        ):
+            counters["succeed"] += 1
+        else:
+            counters["failed"] += 1
 
     print(f"\n Summary: {counters['succeed']} succeed, {counters['failed']} failed ".center(PRINT_LENGTH, "="))
     if counters["failed"]:
