@@ -899,3 +899,97 @@ WGMMA accumulator uses ~32 fp32 registers per thread (128×256×4B / 256 threads
 **Tradeoff**: Pipeline overlap (NUM_STAGES) hides TMA latency. Reducing 3→2 loses 33% overlap. Reducing sync count 33% saves ~33% of barrier stall. But barrier stall is only 74.3% of total stall — and the overlap loss affects ALL K-tiles, while sync reduction only affects the sync point count.
 
 **Our result**: -0.9% (4096³: 132.1 vs 132.3 TFLOPS). **Pipeline depth (NUM_STAGES) is more valuable than sync count.** The 3-stage pipeline is the single biggest contributor to 90.9% TC throughput; reducing it undoes the overlap that hides TMA latency. Also, BLK_K=96 uses SW64 swizzle (vs SW128 for K=64) — smaller swizzle granularity.
+
+### Bottleneck 6: Warp Scheduling and Specialization
+
+#### 19. Warp Specialization (Producer/Consumer Split)
+
+**Mechanism**: Without warp specialization, a single warp (warp 0) issues TMA loads and then immediately does WGMMA. TMA issue and WGMMA compute serialize on the same warp: while warp 0 waits for TMA data (mbarrier), it can't issue WGMMA. With warp specialization, one warpgroup (WG0 = 128 threads) is dedicated to TMA issuing, while WG1+WG2 (256 threads) do WGMMA. The producer issues TMA loads continuously; the consumer does WGMMA continuously. They run in parallel on different warpgroups.
+
+**Concrete timeline**: Without warp spec (256 threads, 2 WG): `warp0: [TMA0][wait][MMA0][TMA1][wait][MMA1]...`. With warp spec (384 threads, 3 WG): `WG0: [TMA0][TMA1][TMA2]...` (continuous) parallel with `WG1+WG2: [wait][MMA0][MMA1][MMA2]...` (continuous). The producer never waits for MMA; the consumer never waits for TMA issue (only for data arrival at mbarrier).
+
+**Cost**: 128 extra threads (384 vs 256) that only do TMA issuing (1 thread active, 127 idle). Register budget split: producer gets 24-40 regs, consumer gets 232 regs. Epilogue sync needs NamedBarrier (256 threads, excludes producer) instead of sync_threads (384 threads).
+
+**Our result**: Used from v1 baseline. TC throughput 90.9% at 4096³ — among the best achievable. Without warp spec (cluster kernel): 129.7T vs 130.6T (-0.7%). **Warp spec gives ~1% at large scale** (TMA/MMA overlap is already handled by pipeline; warp spec mainly helps fill/drain). More important for correctness (producer can run ahead without blocking consumer).
+
+#### 20. Swizzle Patterns (Shared Memory Bank Conflict Avoidance)
+
+**Mechanism**: Shared memory on Hopper has 32 banks (4 bytes each, 128B per cycle). Naive row-major layout: consecutive elements map to consecutive banks. WGMMA's `ldmatrix` reads 8 rows × 128B per instruction. If 8 consecutive rows start at the same column offset, they all access the same set of banks → bank conflict (serialized access, 8× slower). Swizzle XORs the row index into the column offset, distributing accesses across banks. SW128 = 1024-bit swizzle unit (8 rows × 128B), SW64 = 512-bit (4 rows × 128B), SW32 = 256-bit.
+
+**Selection**: `get_smem_layout_atom(LayoutEnum.ROW_MAJOR, dtype, major_mode_size)` picks swizzle based on `major_mode_size × dtype_width`. For FP16 K-major with BLK_K=64: 64×16=1024 bits → SW128. For BLK_K=96: 96×16=1536 bits, 1536/512=3 → SW64. Larger swizzle = fewer bank conflicts but requires larger contiguous blocks.
+
+**Our result**: ncu showed 0 bank conflicts with SW128. WGMMA reads smem via descriptor (not LSU), so bank conflicts don't affect WGMMA directly. TMA writes smem via DMA engine (not LSU), also no bank conflicts. The only LSU smem access is epilogue R2S (make_tiled_copy_C from TiledMma), which uses derived layout — no conflicts. **Swizzle is necessary for correctness** (wgmma descriptor expects specific pattern) and **free for performance** (0 conflicts).
+
+### Bottleneck 7: Launch Overhead
+
+#### 21. CUDA Graphs
+
+**Mechanism**: Each kernel launch via `cudaLaunchKernel` has ~5-10µs CPU-side overhead (driver API call, stream submission, context switch). For small kernels (512³ = 0.02ms = 20µs), launch overhead is 25-50% of total time. CUDA Graphs captures the launch sequence into a graph, replaying it with a single `cudaGraphLaunch` call (~1µs overhead).
+
+**Our result**: `--cuda-graphs` flag in run_gemm.py. But CuTe DSL's compiled function uses TVM-FFI DLPack conversion per call, incompatible with CUDA Graphs capture (graph capture needs fixed memory addresses, but DLPack creates new tensors each call). Auto-fallback to cuda_bench. **Launch overhead is 5-10µs, significant only for sub-100µs kernels.**
+
+### Bottleneck 8: Precision and Sparsity
+
+#### 22. FP8 / Mixed Precision
+
+**Mechanism**: Hopper supports FP8 (e4m3, e5m2) WGMMA with `MmaF8Op(a_dtype, b_dtype, acc_dtype, ...)`. FP8 elements are 8-bit (vs 16-bit for FP16), so TC does 2× FMA per cycle. Peak: 296 TFLOPS (2× FP16's 148T). K dimension in instruction_shape doubles (16→32) to maintain the same data volume per instruction.
+
+**Precision tradeoff**: FP8 e4m3 has 3 mantissa bits (~1 decimal digit precision). RE for 4096³ FP8: 0.14% (vs 0.01% for FP16). Acceptable for inference (attention scores, MoE experts) but not for training gradients.
+
+**smem benefit**: FP8 = 1 byte/elem (vs 2 for FP16). smem halves: 105KB vs 214KB → room for more stages or 2 blocks/SM. But TC throughput is already 90%+ with FP16, so the extra smem doesn't translate to performance gain.
+
+**Our result**: 280.4T at 16384³ (95% FP8 peak). 2× speedup with zero algorithm change (just dtype swap). User decided FP8 doesn't count as "real breakthrough" — it's a hardware feature, not an algorithmic optimization.
+
+#### 23. Sparse GEMM (2:4 Structured Sparsity)
+
+**Mechanism**: Hopper supports 2:4 structured sparsity — for every 4 elements, at most 2 are non-zero (50% sparse). The hardware skips zero elements in WGMMA, doing 2× effective FMA per cycle. Peak: 296 TFLOPS FP16 (2× dense 148T). Requires sparse input matrices with 2:4 pattern.
+
+**Limitation**: Input must be pre-sparsified (pruned to 2:4 pattern with metadata). Not applicable to dense GEMM. Only useful when input naturally has 50% sparsity (e.g., pruned weights in inference). Our random dense GEMM can't benefit.
+
+**Our result**: Not tried (input is dense random). Would give 2× peak if input is 2:4 sparse. **Only applicable with sparse weights, not dense GEMM.**
+
+### Bottleneck 9: Scheduling and Tuning
+
+#### 24. Autotuning / Heuristic Dispatch
+
+**Mechanism**: No single tile size / NUM_STAGES / split_k is optimal for all problem sizes. Small problems need small tiles (more occupancy) or split-K (more parallelism). Large problems need large tiles (TC efficiency). cuBLAS internally has hundreds of kernel variants and a heuristic dispatch function that picks the best based on M, N, K.
+
+**Our dispatch**: `run_gemm.py` uses `M*N < 1024*1024` to select v7 (64×64, S5, small tile) vs v1 (128×256, S3, large tile). Split-K best value varies by shape: 512³→sk8, 1024³→sk2, 2048³→sk4, 4096³→sk4. A production library would have a lookup table or cost model.
+
+**Principle**: The optimal configuration is a function of (M, N, K, dtype, SM count, smem size, register budget). Systematic parameter sweep (autotuning) finds the Pareto frontier. CUTLASS 3.x has `KernelRuntimeFactory` for this. Our PERFLOG.md's performance tables are a manual version of autotuning results.
+
+#### 25. Work Stealing (Dynamic Tile Scheduling)
+
+**Mechanism**: Instead of static tile assignment (each CTA gets a fixed set of tiles), CTAs dynamically grab the next available tile from a global atomic counter. Fast CTAs do more tiles; slow CTAs do fewer. Eliminates load imbalance from grid tail and per-tile variance.
+
+**When it helps**: Uniform-workload GEMM (all tiles same compute) → no variance to balance → no gain. FlashAttention with causal mask (upper-triangle tiles are masked, faster) → significant gain. Non-uniform shapes (boundary tiles with residue handling) → moderate gain.
+
+**Our result**: Not implemented — DSL staged-if limitation prevents cross-warp tile_idx broadcast (atomic_add by tid==0, then smem + NamedBarrier to broadcast to 384 threads, but the broadcast barrier call must be outside the if is_producer/else split). `cute.arch.atomic_add` exists but element-level tensor access doesn't work well in DSL. **Only useful for non-uniform tile workloads.**
+
+#### 26. ncu Profiling Methodology
+
+**Mechanism**: ncu (Nsight Compute) provides hardware-level metrics that reveal bottlenecks invisible to timing alone. The profiling workflow: (1) Roofline analysis (theoretical peak), (2) ncu Speed of Light (which pipeline is saturated), (3) stall reasons (why warps wait), (4) hypothesis → fix → verify.
+
+**Key ncu metrics**: `sm__pipe_tensor_op_hmma_cycles_active.pct_of_peak_sustained_active` (TC utilization), `dram__throughput.avg.pct_of_peak_sustained_elapsed` (HBM bandwidth), `smsp__pcsamp_warps_issue_stalled_*` (stall reasons), `sm__warps_active.avg.pct_of_peak_sustained_active` (achieved occupancy).
+
+**Stall reason taxonomy**: `stalled_barrier` (waiting at mbarrier/sync — our 74.3%), `stalled_imc_miss` (waiting for HBM), `stalled_long_scoreboard` (waiting for smem load), `stalled_not_selected` (warp eligible but not selected — resource contention), `stalled_short_scoreboard` (waiting for arithmetic result).
+
+**Our workflow**: ncu → identify CTA barrier stall 74.3% → hypothesis: reduce sync count → try v4-blk96 (fewer syncs) → verify: -0.9% (pipeline depth matters more) → new hypothesis: reduce barrier wait via more stages → try v7 (5-stage) → verify: stall 8% but TC drops 83% → understand tradeoff. This hypothesis-fix-verify loop is the core of kernel optimization.
+
+### Bottleneck 10: Fusion and Epilogue
+
+#### 27. Fused Epilogue (GEMM + Activation)
+
+**Mechanism**: After GEMM computes C = A×B, many applications apply element-wise operations: C = ReLU(A×B + bias), C = GELU(A×B), C = sigmoid(A×B). Doing these in a separate kernel requires: (1) write C to gmem (TMA S2G), (2) read C back from gmem (TMA G2S), (3) apply activation, (4) write result to gmem. Fusing: in the epilogue, after R2S (register → smem), apply activation in registers before writing to smem. Saves one gmem round-trip.
+
+**Epilogue fusion pattern**: `tCrD = make_fragment_like(accumulators, out_dtype)` → `tCrD.store(activation(accumulators.load().to(out_dtype)))` → R2S → TMA S2G. The activation function runs on the TC's output while it's still in registers — no extra gmem access.
+
+**Our result**: Not implemented (our kernel does plain GEMM, no activation). CUTLASS 3.x has `EpiOp` for this. The official `dense_gemm_fp8_gelu_persistent.py` example fuses GELU. **Saves one gmem read + one kernel launch per fused operation.**
+
+#### 28. K-Major Data Layout
+
+**Mechanism**: GEMM computes C = A×B where A is (M,K) and B is (N,K) (transposed). The "major mode" (K-major vs M-major) determines which dimension is contiguous in memory. K-major A means K is the fast-varying dimension — consecutive K elements are adjacent in memory. WGMMA's `OperandMajorMode.K` expects K-major input because the MMA instruction strides along K.
+
+**Impact on TMA**: TMA descriptor captures the gmem tensor's shape and stride. K-major layout means TMA loads consecutive K elements in one memory transaction (coalesced). M-major layout would scatter K elements across memory (uncoalesced, slower). The swizzle pattern also depends on major mode: `get_smem_layout_atom` selects SW128/SW64/SW32 based on `major_mode_size = K dimension`.
+
+**Our result**: We use `LayoutEnum.ROW_MAJOR` for both A and B. For A (M,K) row-major: K is the fast dimension → K-major → `is_k_major_a() = True`. For B (N,K) row-major: K is the fast dimension → K-major → `is_k_major_b() = True`. Both are K-major, matching `OperandMajorMode.K` in our WGMMA atom. **Layout must match major mode — mismatch causes correctness failure (wgmma reads wrong data).**
