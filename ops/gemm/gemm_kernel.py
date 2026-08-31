@@ -56,6 +56,7 @@ def gemm_kernel(
     grid_m: cutlass.Constexpr[int],
     grid_n: cutlass.Constexpr[int],
     num_persistent: cutlass.Constexpr[int],
+    num_stages: cutlass.Constexpr[int],
     acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
     shared_storage_cls: cutlass.Constexpr,
@@ -74,7 +75,7 @@ def gemm_kernel(
 
     mainloop_pipeline = pipeline.PipelineTmaAsync.create(
         barrier_storage=storage.mainloop_mbar_array.data_ptr(),
-        num_stages=NUM_STAGES,
+        num_stages=num_stages,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, NUM_WARPS),
         tx_count=tx_count_ab,
@@ -89,11 +90,11 @@ def gemm_kernel(
 
     mainloop_prod_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Producer,
-        NUM_STAGES,
+        num_stages,
     )
     mainloop_cons_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer,
-        NUM_STAGES,
+        num_stages,
     )
 
     tiler = (BLK_M, BLK_N, BLK_K)
@@ -282,15 +283,15 @@ def gemm(
     N: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     split_k: cutlass.Constexpr[int] = 1,
+    num_stages: cutlass.Constexpr[int] = 3,
 ):
     acc_dtype = cutlass.Float32
     out_dtype = mC.element_type
 
-    op = cute.nvgpu.warpgroup.MmaF8Op(
+    op = cute.nvgpu.warpgroup.MmaF16BF16Op(
         mA.element_type,
-        mB.element_type,
         acc_dtype,
-        (64, BLK_N, 32),
+        (64, BLK_N, 16),
         OperandSource.SMEM,
         OperandMajorMode.K,
         OperandMajorMode.K,
@@ -309,8 +310,8 @@ def gemm(
         sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, out_dtype, BLK_N),
         out_dtype,
     )
-    sA_layout_staged = cute.tile_to_shape(a_atom, (BLK_M, BLK_K, NUM_STAGES), order=(0, 1, 2))
-    sB_layout_staged = cute.tile_to_shape(b_atom, (BLK_N, BLK_K, NUM_STAGES), order=(0, 1, 2))
+    sA_layout_staged = cute.tile_to_shape(a_atom, (BLK_M, BLK_K, num_stages), order=(0, 1, 2))
+    sB_layout_staged = cute.tile_to_shape(b_atom, (BLK_N, BLK_K, num_stages), order=(0, 1, 2))
     sD_layout = cute.tile_to_shape(d_atom, (BLK_M, BLK_N), order=(0, 1))
 
     sA_layout_one = cute.slice_(sA_layout_staged, (None, None, 0))
@@ -345,7 +346,7 @@ def gemm(
 
     @cute.struct
     class SharedStorage:
-        mainloop_mbar_array: cute.struct.MemRange[cutlass.Int64, 2 * NUM_STAGES]
+        mainloop_mbar_array: cute.struct.MemRange[cutlass.Int64, 2 * num_stages]
         sA: cute.struct.Align[
             cute.struct.MemRange[mA.element_type, cute.cosize(sA_layout_staged)],
             1024,
@@ -388,6 +389,7 @@ def gemm(
         grid_m,
         grid_n,
         num_persistent,
+        num_stages,
         acc_dtype,
         out_dtype,
         SharedStorage,
