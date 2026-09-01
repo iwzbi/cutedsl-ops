@@ -2,7 +2,7 @@
 
 Usage::
 
-    python ops/flash_attn/run_prefill.py                       # all default shapes
+    python ops/flash_attn/run_prefill.py                       # all shapes
     python ops/flash_attn/run_prefill.py --shapes 2,5          # only those shapes
     python ops/flash_attn/run_prefill.py --bench               # + TFLOPS report
     python ops/flash_attn/run_prefill.py --ncu                 # + ncu profiling
@@ -11,6 +11,9 @@ Shapes are varlen-form ``(H_q, H_kv, D, [seqlens...])``: the batch dimension
 is implicit (B = len(seqlens)), every sequence is always causal, and the
 harness pads each batch's flattened segment to a BLK_M=64 multiple (kernel
 precondition).  ``pack_varlen`` builds the flattened inputs + ``cu_seqlens``.
+
+The single shape list ``PREFILL_SHAPES`` (reference.py) drives both the
+correctness gate and ``--bench`` — there is no separate bench-only set.
 """
 
 from __future__ import annotations
@@ -39,39 +42,12 @@ from ops.flash_attn.kernels.prefill_bf16_multistage import (
     NUM_THREADS,
     FlashAttnPrefillBf16Multistage,
 )
-from ops.flash_attn.reference import allclose, pack_varlen
+from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen
 
 
 ATOL = 0.016
 NUM_STAGES = 2  # smem pipeline stages (kernel class default)
 
-
-# Default prefill shapes in varlen form: (H_q, H_kv, D, [seqlens...])
-# The batch dimension is implicit: B = len(seqlens). Each batch is a causal
-# self-attention sequence of its own length (varlen: seq_k == seq_q per batch).
-# Cases: single/multi batch, equal/unequal lengths, BLK_M-misaligned lengths
-# (harness pads), MHA (H_q==H_kv) / GQA (H_q>H_kv), single head (H_q==1),
-# large seq.
-DEFAULT_SHAPES = [
-    (4, 4, 128, [512]),  # 1 batch, square-ish MHA
-    (8, 8, 128, [1024]),  # 1 batch, bigger MHA
-    (4, 1, 128, [512]),  # GQA 4:1
-    (1, 1, 128, [512]),  # single head H_q==1
-    (4, 4, 128, [512, 768]),  # 2 batches, unequal lengths
-    (4, 4, 128, [200, 328]),  # misaligned (neither is a 64-multiple)
-    (4, 1, 128, [256, 384, 512]),  # GQA + 3 batches, misaligned
-    (8, 2, 128, [4096]),  # GQA 4:1 large
-]
-
-# Performance benchmarking: large batch (many seqlens) along with modest/large
-# seq. Only run under --bench (the correctness gates above stay fast).
-BENCH_SHAPES = [
-    (4, 4, 128, [512] * 8),  # 8 batches, small seq (serving-like)
-    (4, 4, 128, [512] * 16),  # 16 batches
-    (8, 8, 128, [1024] * 8),  # 8 batches MHA
-    (4, 4, 128, [2048, 2048]),  # 2 batches, longer seq
-    (4, 4, 128, [4096]),  # 1 batch, longest seq
-]
 
 DESC = "bf16 multi-stage varlen (single WG, class-based)"
 
@@ -188,12 +164,12 @@ def main() -> None:
     if "--shapes" in argv:
         idx = argv.index("--shapes") + 1
         shape_indices = [int(x) for x in argv[idx].split(",")]
-    shapes = BENCH_SHAPES if bench else DEFAULT_SHAPES
+    shapes = list(PREFILL_SHAPES)
     if shape_indices is not None:
         shapes = [shapes[i] for i in shape_indices]
 
     if os.environ.get("NCU_PROFILING") == "1":
-        run_case(DEFAULT_SHAPES[0])
+        run_case(PREFILL_SHAPES[0])
         return
 
     counters = {"succeed": 0, "failed": 0}

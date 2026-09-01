@@ -16,6 +16,9 @@ tensors.
 Usage::
     python ops/flash_attn/compare_hpcops.py                 # all shapes
     python ops/flash_attn/compare_hpcops.py --shapes 2      # only shape index 2
+
+Shapes come from the single authority ``PREFILL_SHAPES`` (reference.py),
+shared with run_prefill.py — the same list drives correctness and benchmark.
 """
 
 from __future__ import annotations
@@ -32,20 +35,7 @@ sys.path.insert(0, ".")
 from common.bench import cuda_bench, get_gpu_info
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.flash_attn.kernels.prefill_bf16_multistage import FlashAttnPrefillBf16Multistage
-from ops.flash_attn.reference import allclose, pack_varlen
-
-
-# Shared shapes in varlen form: (H_q, H_kv, D, [seqlens...]), all causal.
-# Mix of equal / unequal / misaligned lengths, MHA and GQA, single + multi batch.
-COMPARE_SHAPES = [
-    (4, 4, 128, [512]),
-    (8, 8, 128, [1024]),
-    (4, 1, 128, [512]),  # GQA 4:1
-    (4, 4, 128, [512, 768]),  # 2 batches, unequal lengths
-    (4, 4, 128, [200, 328]),  # misaligned lengths (kernel pads to 64)
-    (4, 1, 128, [512, 512, 512, 512]),  # 4 batches GQA
-    (8, 2, 128, [4096]),  # GQA 4:1 large
-]
+from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen
 
 
 def _gen_data(H_q, H_kv, seqlens, D, device="cuda"):
@@ -170,7 +160,7 @@ def main():
     if "--shapes" in sys.argv:
         idx = sys.argv.index("--shapes") + 1
         shape_indices = [int(x) for x in sys.argv[idx].split(",")]
-    shapes = COMPARE_SHAPES if shape_indices is None else [COMPARE_SHAPES[i] for i in shape_indices]
+    shapes = PREFILL_SHAPES if shape_indices is None else [PREFILL_SHAPES[i] for i in shape_indices]
 
     print(f"\n{'Shape':<40} {'H':>3} {'Hkv':>4} {'D':>4} {'B':>3} {'max_s':>6}")
     print("-" * 100)

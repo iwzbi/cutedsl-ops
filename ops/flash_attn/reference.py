@@ -25,6 +25,38 @@ import torch
 
 
 # ---------------------------------------------------------------------------
+# Shared varlen prefill shapes
+# ---------------------------------------------------------------------------
+
+# Single authority for every prefill harness (run_prefill.py, compare_hpcops.py):
+# both correctness and benchmarking run the SAME list — no separate "bench-only"
+# shapes.  Each entry is varlen-form ``(H_q, H_kv, D, [seqlens...])``; the batch
+# dimension is implicit (B = len(seqlens)) and every sequence is always causal.
+# Coverage: single / multi batch, equal / unequal / BLK_M-misaligned lengths,
+# MHA (H_q == H_kv) / GQA (H_q > H_kv) / single head (H_q == 1), large seq,
+# and serving-like many-batch shapes.
+PREFILL_SHAPES = [
+    # single batch
+    (4, 4, 128, [512]),  # square-ish MHA
+    (8, 8, 128, [1024]),  # bigger MHA
+    (4, 1, 128, [512]),  # GQA 4:1
+    (1, 1, 128, [512]),  # single head H_q == 1
+    (8, 2, 128, [4096]),  # GQA 4:1, large seq
+    (4, 4, 128, [4096]),  # longest seq
+    # multi batch
+    (4, 4, 128, [512, 768]),  # unequal lengths
+    (4, 4, 128, [200, 328]),  # misaligned (neither is a 64-multiple)
+    (4, 1, 128, [256, 384, 512]),  # GQA + 3 batches, misaligned
+    (4, 1, 128, [512, 512, 512, 512]),  # GQA + 4 equal batches
+    (4, 4, 128, [2048, 2048]),  # longer seq per batch
+    # serving-like (many batches)
+    (4, 4, 128, [512] * 8),  # 8 batches, small seq
+    (8, 8, 128, [1024] * 8),  # 8 batches MHA
+    (4, 4, 128, [512] * 16),  # 16 batches
+]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -343,6 +375,7 @@ def lse_combine(
 
 
 __all__ = [
+    "PREFILL_SHAPES",
     "allclose",
     "gather_paged_kv",
     "lse_combine",

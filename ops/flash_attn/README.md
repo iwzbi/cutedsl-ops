@@ -91,6 +91,6 @@ GQA 自动 `repeat_kv` 广播；FP8 参考**刻意复刻 kernel 数值流程**�
 5. `ncu_reports/` 性能剖析证据
 
 ```bash
-python ops/flash_attn/run_prefill.py --bench    # TFLOPS bench（使用 BENCH_SHAPES）
+python ops/flash_attn/run_prefill.py --bench    # TFLOPS bench（同一份 PREFILL_SHAPES）
 python ops/flash_attn/run_prefill.py --ncu      # ncu 剖析
 ```
