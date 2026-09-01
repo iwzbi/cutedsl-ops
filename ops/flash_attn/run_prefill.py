@@ -1,28 +1,25 @@
-"""Run + validate FlashAttention prefill exercises (1, 2, 4).
+"""Run + validate FlashAttention prefill (exercise 1: bf16 varlen multi-stage).
 
 Usage::
 
-    python ops/flash_attn/run_prefill.py                       # all exercises
-    python ops/flash_attn/run_prefill.py --ex 1                 # only exercise 1
-    python ops/flash_attn/run_prefill.py --ex 1 --bench         # + TFLOPS report
-    python ops/flash_attn/run_prefill.py --ex 4 --ncu           # + ncu profiling
-    python ops/flash_attn/run_prefill.py --ex 2 --causal        # causal mask
+    python ops/flash_attn/run_prefill.py                       # all default shapes
+    python ops/flash_attn/run_prefill.py --shapes 2,5          # only those shapes
+    python ops/flash_attn/run_prefill.py --bench               # + TFLOPS report
+    python ops/flash_attn/run_prefill.py --ncu                 # + ncu profiling
 
-Exercises:
-  1 — ``prefill_bf16_multistage``: bf16, single-WG, kStage=2
-  2 — ``prefill_bf16_warpspec``:   bf16, warp-specialized (1 DMA + 2 MMA WGs)
-  4 — ``prefill_fp8``:              fp8, paged KV, per-tensor KV scales
-
-Until the kernel TODOs are implemented this harness prints ``Failed``.
+Shapes are varlen-form ``(H_q, H_kv, D, [seqlens...])``: the batch dimension
+is implicit (B = len(seqlens)), every sequence is always causal, and the
+harness pads each batch's flattened segment to a BLK_M=64 multiple (kernel
+precondition).  ``pack_varlen`` builds the flattened inputs + ``cu_seqlens``.
 """
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 
 import torch
+import torch.nn.functional as F
 from cutlass import cute
 
 
@@ -38,267 +35,126 @@ from common.bench import (
 )
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.flash_attn.kernels.prefill_bf16_multistage import (
-    BLK_M as EX1_BLK_M,
-)
-from ops.flash_attn.kernels.prefill_bf16_multistage import (
-    NUM_THREADS as EX1_THREADS,
-)
-from ops.flash_attn.kernels.prefill_bf16_multistage import (
+    BLK_M,
+    NUM_THREADS,
     FlashAttnPrefillBf16Multistage,
 )
-from ops.flash_attn.kernels.prefill_bf16_warpspec import (
-    BLK_M as EX2_BLK_M,
-)
-from ops.flash_attn.kernels.prefill_bf16_warpspec import (
-    NUM_STAGES as EX2_STAGES,
-)
-from ops.flash_attn.kernels.prefill_bf16_warpspec import (
-    NUM_THREADS as EX2_THREADS,
-)
-from ops.flash_attn.kernels.prefill_bf16_warpspec import (
-    flash_attn_prefill_bf16_warpspec as ex2_fn,
-)
-from ops.flash_attn.kernels.prefill_fp8 import (
-    BLK_M as EX4_BLK_M,
-)
-from ops.flash_attn.kernels.prefill_fp8 import (
-    NUM_STAGES as EX4_STAGES,
-)
-from ops.flash_attn.kernels.prefill_fp8 import (
-    NUM_THREADS as EX4_THREADS,
-)
-from ops.flash_attn.kernels.prefill_fp8 import (
-    flash_attn_prefill_fp8 as ex4_fn,
-)
-from ops.flash_attn.reference import (
-    allclose,
-    ref_prefill_bf16,
-    ref_prefill_fp8,
-)
+from ops.flash_attn.reference import allclose, pack_varlen
 
 
-# Default prefill shapes: (B, H, H_kv, M, N, D)
+ATOL = 0.016
+NUM_STAGES = 2  # smem pipeline stages (kernel class default)
+
+
+# Default prefill shapes in varlen form: (H_q, H_kv, D, [seqlens...])
+# The batch dimension is implicit: B = len(seqlens). Each batch is a causal
+# self-attention sequence of its own length (varlen: seq_k == seq_q per batch).
+# Cases: single/multi batch, equal/unequal lengths, BLK_M-misaligned lengths
+# (harness pads), MHA (H_q==H_kv) / GQA (H_q>H_kv), single head (H_q==1),
+# large seq.
 DEFAULT_SHAPES = [
-    (1, 1, 1, 64, 64, 64),
-    (1, 1, 1, 512, 512, 64),
+    (4, 4, 128, [512]),  # 1 batch, square-ish MHA
+    (8, 8, 128, [1024]),  # 1 batch, bigger MHA
+    (4, 1, 128, [512]),  # GQA 4:1
+    (1, 1, 128, [512]),  # single head H_q==1
+    (4, 4, 128, [512, 768]),  # 2 batches, unequal lengths
+    (4, 4, 128, [200, 328]),  # misaligned (neither is a 64-multiple)
+    (4, 1, 128, [256, 384, 512]),  # GQA + 3 batches, misaligned
+    (8, 2, 128, [4096]),  # GQA 4:1 large
 ]
 
-EXERCISES = {
-    1: {
-        "cls": FlashAttnPrefillBf16Multistage,
-        "dtype": "bf16",
-        "atol": 0.016,
-        "paged": False,
-        "blk_m": EX1_BLK_M,
-        "stages": 2,
-        "threads": EX1_THREADS,
-        "desc": "bf16 multi-stage (single WG, class-based)",
-        "v_natural": False,
-    },
-    2: {
-        "fn": ex2_fn,
-        "dtype": "bf16",
-        "atol": 0.016,
-        "paged": False,
-        "blk_m": EX2_BLK_M,
-        "stages": EX2_STAGES,
-        "threads": EX2_THREADS,
-        "desc": "bf16 warp-spec (1 DMA + 2 MMA)",
-    },
-    4: {
-        "fn": ex4_fn,
-        "dtype": "fp8",
-        "atol": 0.05,
-        "paged": True,
-        "blk_m": EX4_BLK_M,
-        "stages": EX4_STAGES,
-        "threads": EX4_THREADS,
-        "desc": "fp8 paged (per-tensor KV scale)",
-    },
-}
+# Performance benchmarking: large batch (many seqlens) along with modest/large
+# seq. Only run under --bench (the correctness gates above stay fast).
+BENCH_SHAPES = [
+    (4, 4, 128, [512] * 8),  # 8 batches, small seq (serving-like)
+    (4, 4, 128, [512] * 16),  # 16 batches
+    (8, 8, 128, [1024] * 8),  # 8 batches MHA
+    (4, 4, 128, [2048, 2048]),  # 2 batches, longer seq
+    (4, 4, 128, [4096]),  # 1 batch, longest seq
+]
+
+DESC = "bf16 multi-stage varlen (single WG, class-based)"
 
 
-def _gen_bf16(B, H, H_kv, M, N, D, device="cuda"):
+def _gen_bf16(B, H_q, H_kv, max_s, D, device="cuda"):
     torch.manual_seed(41)
-    scale = 1.0 / math.sqrt(D)
-    q = torch.randn(B, H, M, D, device=device, dtype=torch.bfloat16) * (scale**0.5)
-    k = torch.randn(B, H_kv, N, D, device=device, dtype=torch.bfloat16) * (scale**0.5)
-    v = torch.randn(B, H_kv, N, D, device=device, dtype=torch.bfloat16) * 0.5
-    o = torch.zeros(B, H, M, D, device=device, dtype=torch.bfloat16)
-    return q, k, v, o
+    q = torch.randn(B, H_q, max_s, D, device=device, dtype=torch.bfloat16)
+    k = torch.randn(B, H_kv, max_s, D, device=device, dtype=torch.bfloat16)
+    v = torch.randn(B, H_kv, max_s, D, device=device, dtype=torch.bfloat16) * 0.5
+    return q, k, v
 
 
-def _gen_fp8_paged(B, H, H_kv, M, N, D, page_size=64, device="cuda"):
-    torch.manual_seed(10086)
-    q = torch.randn(B, H, M, D, device=device, dtype=torch.float8_e4m3fn)
-    k = torch.randn(B, H_kv, N, D, device=device, dtype=torch.float8_e4m3fn)
-    v = torch.randn(B, H_kv, N, D, device=device, dtype=torch.float8_e4m3fn)
-    o = torch.zeros(B, H, M, D, device=device, dtype=torch.bfloat16)
-
-    # Per-token-per-head Q scale, per-tensor K/V scales
-    q_scale = torch.rand(B, H, M, 1, device=device, dtype=torch.float32) * 0.5 + 0.5
-    k_scale = float(torch.rand(1, device=device).item() * 0.5 + 0.5)
-    v_scale = float(torch.rand(1, device=device).item() * 0.5 + 0.5)
-
-    # Convert to paged layout: (num_pages, H_kv, page_size, D)
-    num_pages = (N + page_size - 1) // page_size * B
-    k_pages = torch.randn(num_pages, H_kv, page_size, D, device=device, dtype=torch.float8_e4m3fn)
-    v_pages = torch.randn(num_pages, H_kv, page_size, D, device=device, dtype=torch.float8_e4m3fn)
-
-    # Fill pages from the dense tensors
-    for b in range(B):
-        for p in range((N + page_size - 1) // page_size):
-            page_idx = b * ((N + page_size - 1) // page_size) + p
-            start = p * page_size
-            end = min(start + page_size, N)
-            k_pages[page_idx, :, : end - start, :] = k[b, :, start:end, :]
-            v_pages[page_idx, :, : end - start, :] = v[b, :, start:end, :]
-
-    # Block table: (B, max_blocks), -1 for padding
-    max_blocks = (N + page_size - 1) // page_size
-    block_table = torch.arange(max_blocks, device=device, dtype=torch.int32).unsqueeze(0).expand(B, -1).contiguous()
-    for b in range(1, B):
-        block_table[b] = block_table[0] + b * max_blocks
-
-    return q, k_pages, v_pages, block_table, o, q_scale, k_scale, v_scale
-
-
-def run_case(
-    ex_num: int,
-    shape: tuple[int, ...],
-    *,
-    is_causal: bool = False,
-    bench: bool = False,
-    use_ncu: bool = False,
-) -> bool:
-    ex = EXERCISES[ex_num]
-    B, H, H_kv, M, N, D = shape
-    BH = B * H
-    scale = 1.0 / math.sqrt(D)
+def run_case(shape, *, bench=False, use_ncu=False) -> bool:
+    """Run ex.1 varlen prefill on one varlen shape against torch SDPA."""
+    H_q, H_kv, D, seqlens = shape
+    B = len(seqlens)
+    max_s = max(seqlens)
+    q, k, v = _gen_bf16(B, H_q, H_kv, max_s, D)
+    q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens = pack_varlen(q, k, v, seqlens)
+    pad_offsets = cu_seqlens.cpu().numpy()
 
     print(f"\n{'=' * 80}")
-    print(f"  Exercise {ex_num}: {ex['desc']}  | B={B} H={H} H_kv={H_kv} M={M} N={N} D={D} causal={is_causal}")
+    print(f"  Exercise 1: {DESC}  | H_q={H_q} H_kv={H_kv} D={D} seqlens={seqlens}")
     print(f"{'=' * 80}")
 
-    if ex["dtype"] == "bf16":
-        q, k, v, o = _gen_bf16(B, H, H_kv, M, N, D)
-        q3 = q.view(BH, M, D)
-        k3 = k.view(B * H_kv, N, D)
-        o3 = o.view(BH, M, D)
+    print("Compiling CuTe DSL (ex.1, bf16 varlen) ...")
+    instance = FlashAttnPrefillBf16Multistage()
+    compiled = cute.compile(
+        instance,
+        make_cute_tensor(q_cat, leading_dim=2),
+        make_cute_tensor(k_cat, leading_dim=2),
+        make_cute_tensor(v_t, leading_dim=3),
+        make_cute_tensor(o_cat, leading_dim=2),
+        make_cute_tensor(seqlens_t, leading_dim=0),
+        make_cute_tensor(cu_seqlens, leading_dim=0),
+        make_stream(),
+        max_s,
+        H_q,
+        H_kv,
+        D,
+        options="--enable-tvm-ffi --generate-line-info",
+    )
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
+    torch.cuda.synchronize()
 
-        if ex.get("v_natural", False):
-            v3 = v.view(B * H_kv, N, D)
-        else:
-            v3 = v.view(B * H_kv, N, D).transpose(1, 2).contiguous()
-
-        print(f"Compiling CuTe DSL (ex.{ex_num}, bf16) ...")
-        if "cls" in ex:
-            instance = ex["cls"]()
-            compiled = cute.compile(
-                instance,
-                make_cute_tensor(q3, leading_dim=2),
-                make_cute_tensor(k3, leading_dim=2),
-                make_cute_tensor(v3, leading_dim=2),
-                make_cute_tensor(o3, leading_dim=2),
-                make_stream(),
-                BH,
-                M,
-                N,
-                D,
-                options="--enable-tvm-ffi --generate-line-info",
-            )
-        else:
-            compiled = cute.compile(
-                ex["fn"],
-                make_cute_tensor(q3, leading_dim=2),
-                make_cute_tensor(k3, leading_dim=2),
-                make_cute_tensor(v3, leading_dim=2),
-                make_cute_tensor(o3, leading_dim=2),
-                make_stream(),
-                is_causal,
-                BH,
-                M,
-                N,
-                D,
-                options="--enable-tvm-ffi --generate-line-info",
-            )
-        compiled(q3, k3, v3, o3)
-        torch.cuda.synchronize()
-
-        ref = ref_prefill_bf16(q, k, v, is_causal=is_causal, scale=scale)
-        ok = allclose(ref, o, atol=ex["atol"], name=f"ex{ex_num} bf16 {'causal' if is_causal else ''}")
-
-    elif ex["dtype"] == "fp8":
-        page_size = 64
-        q, k_pages, v_pages, block_table, o, q_scale, k_scale, v_scale = _gen_fp8_paged(B, H, H_kv, M, N, D, page_size)
-        q3 = q.view(BH, M, D)
-        o3 = o.view(BH, M, D)
-
-        print(f"Compiling CuTe DSL (ex.{ex_num}, fp8, paged) ...")
-        compiled = cute.compile(
-            ex["fn"],
-            make_cute_tensor(q3, leading_dim=2),
-            make_cute_tensor(k_pages, leading_dim=3),
-            make_cute_tensor(v_pages, leading_dim=3),
-            make_cute_tensor(block_table, leading_dim=1),
-            make_cute_tensor(o3, leading_dim=2),
-            make_cute_tensor(q_scale.view(BH, M, 1), leading_dim=2),
-            make_stream(),
-            k_scale,
-            v_scale,
-            is_causal,
-            BH,
-            M,
-            N,
-            D,
-            page_size,
-            options="--enable-tvm-ffi --generate-line-info",
-        )
-        compiled(q3, k_pages, v_pages, block_table, o3, q_scale.view(BH, M, 1))
-        torch.cuda.synchronize()
-
-        ref = ref_prefill_fp8(
-            q,
-            k,
-            v,
-            is_causal=is_causal,
-            scale=scale,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        ok = allclose(ref, o, atol=ex["atol"], name=f"ex{ex_num} fp8 {'causal' if is_causal else ''}")
-    else:
-        raise ValueError(f"Unknown dtype: {ex['dtype']}")
+    # Per-batch comparison at real lengths (varlen, always causal).
+    kk = k.repeat_interleave(H_q // H_kv, dim=1)
+    vv = v.repeat_interleave(H_q // H_kv, dim=1)
+    ref = F.scaled_dot_product_attention(q, kk, vv, is_causal=True)
+    ok = True
+    for b in range(B):
+        p0 = int(pad_offsets[b])
+        seg = o_cat[p0 : p0 + seqlens[b]]
+        ref_b = ref[b, :, : seqlens[b], :].permute(1, 0, 2).contiguous()
+        name = f"ex1 varlen b{b} seq{seqlens[b]}"
+        ok = allclose(ref_b, seg, atol=ATOL, name=name) and ok
 
     if bench and ok:
-        if ex["dtype"] == "bf16":
-            ms = cuda_bench(compiled, q3, k3, v3, o3)
-        else:
-            ms = cuda_bench(compiled, q3, k_pages, v_pages, block_table, o3, q_scale.view(BH, M, 1))
-
-        flops = int(4 * B * H * M * N * D)  # 2*(QK^T) + 2*(PV)
+        ms = cuda_bench(compiled, q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
+        # FLOPs use max_s x max_s (the padded causal problem; causal skips the
+        # upper triangle so this overcounts — see PERFLOG).
+        flops = int(4 * B * H_q * max_s * max_s * D)
         gmem_bytes = int(
-            B * H * M * D * q.element_size()
-            + B * H_kv * N * D * k.element_size()
-            + B * H_kv * N * D * v.element_size()
-            + B * H * M * D * o.element_size()
+            B * H_q * max_s * D * q.element_size()
+            + B * H_kv * max_s * D * k.element_size()
+            + B * H_kv * max_s * D * v.element_size()
+            + B * H_q * max_s * D * q.element_size()
         )
-        grid_m = (M + ex["blk_m"] - 1) // ex["blk_m"]
-        grid_blocks = BH * grid_m
+        grid_m = (max_s + BLK_M - 1) // BLK_M
+        grid_blocks = B * H_q * grid_m
         num_sms = get_gpu_info()["num_sms"]
         grid_blocks_min = min(grid_blocks, num_sms)
 
         meta = KernelMeta(
-            name=f"FA-Prefill-ex{ex_num}",
-            tile_dims={"BLK_M": ex["blk_m"], "BLK_N": 64, "D": D, "NUM_STAGES": ex["stages"]},
-            block_threads=ex["threads"],
-            block_description=ex["desc"],
-            grid_mode="persistent" if ex_num >= 2 else "standard",
+            name="FA-Prefill-ex1",
+            tile_dims={"BLK_M": BLK_M, "BLK_N": 64, "D": D, "NUM_STAGES": NUM_STAGES},
+            block_threads=NUM_THREADS,
+            block_description=DESC,
+            grid_mode="standard",
         )
         print_bench_report(
             ms=ms,
-            problem_shape=(B, H, M, N, D),
+            problem_shape=(B, H_q, max_s, max_s, D),
             dtype=q.dtype,
             flops=flops,
             gmem_bytes=gmem_bytes,
@@ -308,7 +164,7 @@ def run_case(
         )
 
     if use_ncu and ok:
-        program_cmd = [sys.executable, os.path.abspath(__file__), "--ex", str(ex_num)]
+        program_cmd = [sys.executable, os.path.abspath(__file__), "--ncu"]
         ncu_text = run_ncu_profile("flash_attn", program_cmd)
         ncu_data = parse_ncu_output(ncu_text)
         if ncu_data:
@@ -324,25 +180,28 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("This example requires a CUDA-capable GPU (sm_90 recommended).")
 
-    ex_args = [a for a in sys.argv if a.startswith("--ex=")]
-    exercises = [int(a.split("=")[1]) for a in ex_args] if ex_args else [1, 2, 4]
-    bench = "--bench" in sys.argv
-    use_ncu = "--ncu" in sys.argv
-    is_causal = "--causal" in sys.argv
-    sys.argv = [a for a in sys.argv if not a.startswith("--")]
+    argv = sys.argv[1:]
+    bench = "--bench" in argv
+    use_ncu = "--ncu" in argv
+
+    shape_indices = None
+    if "--shapes" in argv:
+        idx = argv.index("--shapes") + 1
+        shape_indices = [int(x) for x in argv[idx].split(",")]
+    shapes = BENCH_SHAPES if bench else DEFAULT_SHAPES
+    if shape_indices is not None:
+        shapes = [shapes[i] for i in shape_indices]
 
     if os.environ.get("NCU_PROFILING") == "1":
-        for ex_num in exercises:
-            run_case(ex_num, DEFAULT_SHAPES[0])
+        run_case(DEFAULT_SHAPES[0])
         return
 
     counters = {"succeed": 0, "failed": 0}
-    for ex_num in exercises:
-        for shape in DEFAULT_SHAPES:
-            if run_case(ex_num, shape, is_causal=is_causal, bench=bench, use_ncu=use_ncu):
-                counters["succeed"] += 1
-            else:
-                counters["failed"] += 1
+    for shape in shapes:
+        if run_case(shape, bench=bench, use_ncu=use_ncu):
+            counters["succeed"] += 1
+        else:
+            counters["failed"] += 1
 
     print(f"\n Summary: {counters['succeed']} succeed, {counters['failed']} failed ".center(PRINT_LENGTH, "="))
     if counters["failed"]:

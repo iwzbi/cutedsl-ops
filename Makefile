@@ -1,4 +1,4 @@
-.PHONY: help sync style quality bench-gemm bench-gemm-ncu bench-gemm-ncu-raw bench-gemm-ncu-gui bench-flash bench-flash-prefill bench-flash-decode bench-flash-prefill-ncu bench-flash-decode-ncu bench-moe test
+.PHONY: help sync style quality bench-gemm bench-gemm-ncu bench-gemm-ncu-raw bench-gemm-ncu-gui bench-flash-prefill bench-flash-decode bench-flash-prefill-ncu bench-flash-decode-ncu bench-moe test
 
 PYTHON := .venv/bin/python
 
@@ -32,17 +32,14 @@ bench-gemm-ncu-gui: ## Generate ncu .ncu-rep + serve for laptop download
 	@echo "=== Or open in browser ==="
 	@echo "  http://11.167.35.90:8899/gemm_profile.ncu-rep"
 
-bench-flash: ## Benchmark FlashAttention (lesson 0 warm-up)
-	$(PYTHON) ops/flash_attn/run_flash_attn.py
-
-bench-flash-prefill: ## Benchmark FA prefill exercises (ex.1,2,4) — correctness + TFLOPS
+bench-flash-prefill: ## Benchmark FA prefill (ex.1 varlen) — correctness + TFLOPS
 	$(PYTHON) ops/flash_attn/run_prefill.py --bench
 
 bench-flash-decode: ## Benchmark FA decode exercises (ex.3,5) — correctness + latency µs
 	$(PYTHON) ops/flash_attn/run_decode.py --bench
 
 bench-flash-prefill-ncu: ## ncu profiling of FA prefill (ex.1)
-	$(PYTHON) ops/flash_attn/run_prefill.py --ex 1 --ncu
+	$(PYTHON) ops/flash_attn/run_prefill.py --ncu
 
 bench-flash-decode-ncu: ## ncu profiling of FA decode (ex.3)
 	$(PYTHON) ops/flash_attn/run_decode.py --ex 3 --ncu

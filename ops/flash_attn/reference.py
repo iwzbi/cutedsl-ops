@@ -1,4 +1,4 @@
-"""Torch reference implementations for FlashAttention exercises.
+"""Torch reference implementations for FlashAttention.
 
 Two tiers:
 - **BF16**: uses ``torch.nn.functional.scaled_dot_product_attention`` (fp32
@@ -6,14 +6,14 @@ Two tiers:
 - **FP8**: mirrors the kernel's numerics — online softmax in fp32, then
   Px256 -> fp8 quant -> V matmul.  This deliberately reproduces the fp8
   rounding so the tolerance accounts for quantization, not just algorithmic
-  error.  Tolerance: ``atol=0.05`` (prefill), ``0.1`` (decode).
+  error.  Tolerance: ``atol=0.1`` (decode).
 
-Shapes:
-- **Prefill**: ``(B, H, M, D)`` standard attention; ``M`` can be large.
-- **Decode**: ``(B, H, M, D)`` with **paged KV** — ``M`` is small (1-4).
-  KV pages live in ``(num_pages, H_kv, page_size, D)``; ``block_table``
-  ``(B, max_blocks)`` int32 indexes into the pool (``-1`` = unused).
+Decode: ``(B, H, M, D)`` with **paged KV** — ``M`` is small (1-4).  KV pages
+live in ``(num_pages, H_kv, page_size, D)``; ``block_table`` ``(B, max_blocks)``
+int32 indexes into the pool (``-1`` = unused).
 
+``pack_varlen`` is the shared helper for varlen prefill: it flattens natural
+``(B, H, S, D)`` tensors into the kernel's padded layout (see its docstring).
 GQA is handled by repeating ``H_kv`` heads to ``H`` via ``repeat_interleave``.
 """
 
@@ -22,12 +22,74 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def pack_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens, blk_m: int = 64):
+    """Pack natural ``(B, H, S, D)`` prefill tensors into the varlen kernel layout.
+
+    The varlen kernel requires every batch's flattened start index
+    (``cu_seqlens[b]``) to be a multiple of BLK_M (64) — see the kernel
+    docstring.  This helper flattens each batch's Q/K segment with
+    zero-padding to the next 64-multiple, pre-transposes V to
+    ``(B, H_kv, D, S)`` (the PV B-operand's K-major layout), and returns the
+    padded ``cu_seqlens`` offsets.
+
+    Args:
+        q: ``(B, H_q, S, D)`` — only rows ``[0, seqlens[b])`` of each batch
+           are packed; ``S >= max(seqlens)``.
+        k: ``(B, H_kv, S, D)`` — same row convention.
+        v: ``(B, H_kv, S, D)`` — same row convention.
+        seqlens: per-batch sequence lengths (list / tensor / CUDA tensor).
+        blk_m: batch-alignment block size (kernel BLK_M = 64).
+
+    Returns ``(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)``:
+        q_cat: ``(total_padded, H_q, D)`` — flattened Q, zero-padded
+        k_cat: ``(total_padded, H_kv, D)`` — flattened K, zero-padded
+        v_t: ``(B, H_kv, D, S)`` — V transposed (K-major for the PV MMA)
+        o_cat: ``(total_padded, H_q, D)`` — zero-filled output buffer
+        seqlens_t: int32 CUDA tensor ``(B,)`` — real lengths
+        cu_seqlens: int32 CUDA tensor ``(B + 1,)`` — **padded** (64-aligned)
+           offsets, i.e. the values the kernel indexes with
+    """
+    B, H_q, S, D = q.shape
+    H_kv = k.shape[1]
+    device = q.device
+
+    # (B, S, H, D) sequence-major views; only [0:seqlens[b]] rows are packed.
+    q_nat = q.permute(0, 2, 1, 3).contiguous()
+    k_nat = k.permute(0, 2, 1, 3).contiguous()
+
+    segs_q, segs_k = [], []
+    pad_offsets = torch.zeros(B + 1, dtype=torch.int64)
+    for b in range(B):
+        n_valid = int(seqlens[b])
+        segs_q.append(q_nat[b, :n_valid])
+        segs_k.append(k_nat[b, :n_valid])
+        n_pad = (n_valid + blk_m - 1) // blk_m * blk_m - n_valid
+        if n_pad:
+            segs_q.append(torch.zeros(n_pad, H_q, D, device=device, dtype=q.dtype))
+            segs_k.append(torch.zeros(n_pad, H_kv, D, device=device, dtype=k.dtype))
+        pad_offsets[b + 1] = pad_offsets[b] + n_valid + n_pad
+
+    q_cat = torch.cat(segs_q, dim=0).contiguous()
+    k_cat = torch.cat(segs_k, dim=0).contiguous()
+    o_cat = torch.zeros(int(pad_offsets[-1]), H_q, D, device=device, dtype=q.dtype)
+
+    # (B, S, H_kv, D) sequence-major view, transposed to the PV K-major layout.
+    v_nat = v.permute(0, 2, 1, 3).contiguous()
+    v_t = torch.zeros(B, H_kv, D, S, device=device, dtype=v.dtype)
+    for b in range(B):
+        n_valid = int(seqlens[b])
+        v_t[b, :, :, :n_valid] = v_nat[b, :n_valid, :, :].permute(1, 2, 0)
+
+    seqlens_t = torch.tensor([int(s) for s in seqlens], device=device, dtype=torch.int32)
+    cu_seqlens = pad_offsets.to(device).to(torch.int32)
+    return q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens
 
 
 def repeat_kv(x: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -67,26 +129,8 @@ def gather_paged_kv(
 
 
 # ---------------------------------------------------------------------------
-# BF16 references (torch SDPA — the "true" answer)
+# Decode reference (paged KV)
 # ---------------------------------------------------------------------------
-
-
-def ref_prefill_bf16(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    is_causal: bool = False,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """Prefill reference: ``(B, H, M, D) x (B, H_kv, N, D) -> (B, H, M, D)`` fp32.
-
-    Uses torch SDPA (fp32 internally).  Handles GQA via ``repeat_kv``.
-    """
-    H = q.shape[1]
-    k = repeat_kv(k, H)
-    v = repeat_kv(v, H)
-    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=is_causal, scale=scale)
 
 
 def ref_decode_bf16(
@@ -139,7 +183,7 @@ def ref_decode_bf16(
 
 
 # ---------------------------------------------------------------------------
-# FP8 references (mirror kernel numerics)
+# FP8 reference (mirror kernel numerics)
 # ---------------------------------------------------------------------------
 
 
@@ -175,46 +219,6 @@ def _online_softmax_fp8(
 
     # V matmul with quantized P (fp32 accumulate)
     return (P_quant @ v) / l
-
-
-def ref_prefill_fp8(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    is_causal: bool = False,
-    scale: float | None = None,
-    q_scale: torch.Tensor | float = 1.0,
-    k_scale: torch.Tensor | float = 1.0,
-    v_scale: torch.Tensor | float = 1.0,
-) -> torch.Tensor:
-    """FP8 prefill reference (mirrors kernel numerics).
-
-    q: ``(B, H, M, D)`` fp8_e4m3, k/v: ``(B, H_kv, N, D)`` fp8_e4m3.
-    Scales: ``q_scale`` per-token-per-head ``(B,H,M,1)`` or scalar;
-    ``k_scale``, ``v_scale`` per-tensor scalar.
-    Returns ``(B, H, M, D)`` fp32.
-    """
-    H = q.shape[1]
-    if scale is None:
-        scale = 1.0 / math.sqrt(q.shape[-1])
-
-    k = repeat_kv(k, H)
-    v = repeat_kv(v, H)
-
-    qf = q.float() * q_scale
-    kf = k.float() * k_scale
-    vf = v.float() * v_scale
-
-    S = (qf @ kf.transpose(-2, -1)) * scale
-
-    if is_causal:
-        M = qf.shape[-2]
-        N = S.shape[-1]
-        mask = torch.triu(torch.ones(M, N, device=q.device, dtype=torch.bool), diagonal=1)
-        S = S.masked_fill(mask, float("-inf"))
-
-    return _online_softmax_fp8(S, vf)
 
 
 def ref_decode_fp8(
@@ -342,9 +346,8 @@ __all__ = [
     "allclose",
     "gather_paged_kv",
     "lse_combine",
+    "pack_varlen",
     "ref_decode_bf16",
     "ref_decode_fp8",
-    "ref_prefill_bf16",
-    "ref_prefill_fp8",
     "repeat_kv",
 ]
