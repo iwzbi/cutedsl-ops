@@ -92,6 +92,7 @@ lines-after-imports = 2
 # Kernel scaffolds: the device body is a guided TODO, so thread/block index
 # variables are bound to show the pattern but not yet consumed.
 "ops/**/*_kernel.py" = ["F841", "RUF059"]
+"ops/flash_attn/kernels/*.py" = ["F841", "RUF059"]
 # Run harnesses use a sys.path bootstrap before first-party imports.
 "ops/**/run_*.py" = ["E402", "PLC0415"]
 
