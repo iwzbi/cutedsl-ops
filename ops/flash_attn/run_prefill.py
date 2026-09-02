@@ -68,6 +68,10 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
     q, k, v = _gen_bf16(B, H_q, H_kv, max_s, D)
     q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens = pack_varlen(q, k, v, seqlens)
     pad_offsets = cu_seqlens.cpu().numpy()
+    # v_t's S axis is padded to a BLK_M multiple (pack_varlen); TMA V tiles
+    # index it at BLK_N granularity so mirror that padded extent in the
+    # kernel's max_seqlens (matches stride (S,1,D*S) of the V view).
+    s_pad = v_t.shape[3]
 
     print(f"\n{'=' * 80}")
     print(f"  Exercise 1: {DESC}  | H_q={H_q} H_kv={H_kv} D={D} seqlens={seqlens}")
@@ -77,14 +81,20 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
     instance = FlashAttnPrefillBf16Multistage()
     compiled = cute.compile(
         instance,
+        # q_cat: (T, H_q, D) bf16, strides (H_q*D, D, 1) — contiguous; T = Σ_b ceil(seq_b/64)*64
         make_cute_tensor(q_cat, leading_dim=2),
+        # k_cat: (T, H_kv, D) bf16, strides (H_kv*D, D, 1) — contiguous
         make_cute_tensor(k_cat, leading_dim=2),
+        # v_t: (B, H_kv, D, S) bf16, strides (H_kv*D*S, D*S, S, 1) — K-major for PV MMA
         make_cute_tensor(v_t, leading_dim=3),
+        # o_cat: (T, H_q, D) bf16, strides (H_q*D, D, 1) — zero-filled output
         make_cute_tensor(o_cat, leading_dim=2),
+        # seqlens_t: (B,) int32, real per-batch lengths (not padded)
         make_cute_tensor(seqlens_t, leading_dim=0),
+        # cu_seqlens: (B+1,) int32, padded 64-aligned cumulative offsets
         make_cute_tensor(cu_seqlens, leading_dim=0),
         make_stream(),
-        max_s,
+        s_pad,
         H_q,
         H_kv,
         D,

@@ -82,7 +82,9 @@ def pack_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens, blk_
     Returns ``(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)``:
         q_cat: ``(total_padded, H_q, D)`` — flattened Q, zero-padded
         k_cat: ``(total_padded, H_kv, D)`` — flattened K, zero-padded
-        v_t: ``(B, H_kv, D, S)`` — V transposed (K-major for the PV MMA)
+        v_t: ``(B, H_kv, D, S_pad)`` — V transposed (K-major for the PV MMA).
+           ``S_pad`` is ``max(seqlens)`` rounded up to a ``blk_m`` multiple so
+           the last per-batch V tile read by TMA stays in-bounds.
         o_cat: ``(total_padded, H_q, D)`` — zero-filled output buffer
         seqlens_t: int32 CUDA tensor ``(B,)`` — real lengths
         cu_seqlens: int32 CUDA tensor ``(B + 1,)`` — **padded** (64-aligned)
@@ -113,8 +115,12 @@ def pack_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens, blk_
     o_cat = torch.zeros(int(pad_offsets[-1]), H_q, D, device=device, dtype=q.dtype)
 
     # (B, S, H_kv, D) sequence-major view, transposed to the PV K-major layout.
+    # S_pad: TMA reads whole BLK_N-wide V tiles; a non-64-multiple max(seqlens)
+    # would read past the per-batch S extent.  Pad S up to a blk_m multiple
+    # (the extra columns are zero and masked out by the causal mask anyway).
     v_nat = v.permute(0, 2, 1, 3).contiguous()
-    v_t = torch.zeros(B, H_kv, D, S, device=device, dtype=v.dtype)
+    s_pad = (S + blk_m - 1) // blk_m * blk_m
+    v_t = torch.zeros(B, H_kv, D, s_pad, device=device, dtype=v.dtype)
     for b in range(B):
         n_valid = int(seqlens[b])
         v_t[b, :, :, :n_valid] = v_nat[b, :n_valid, :, :].permute(1, 2, 0)

@@ -46,7 +46,7 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
         make_cute_tensor(seqlens, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
         make_stream(),
-        pad_to,
+        v_t.shape[3],
         H_q,
         H_kv,
         D,

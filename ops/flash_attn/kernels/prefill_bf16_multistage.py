@@ -1,50 +1,49 @@
-"""FlashAttention prefill — bf16, multi-stage, non-warpspec, varlen (Exercise 1).
+"""FlashAttention prefill — bf16, multi-stage TMA pipelined, non-warpspec, varlen (Exercise 1).
 
 The kernel implements FlashAttention v2 **varlen** prefill (hpc-ops compatible
-API) with a multi-stage Hopper WGMMA pipeline. The batch dimension is implicit
-in the ``seqlens`` / ``cu_seqlens`` arrays: inputs are flattened to
-``(total_seq, H, D)`` (hpc-ops ``attention_prefill_bf16`` form) and every
-sequence is always causal.
+API) with a **TMA multi-stage** Hopper pipeline — the same structure as
+hpc-ops ``attention_prefill_bf16_multi_stage`` (NOT warp-specialized: one
+128-thread warpgroup both issues TMA loads and runs the WGMMAs, overlapping
+K/V loads with compute via a kStage ring of smem buffers + mbarriers).
 
-Class-based kernel following the Hopper FMHA pattern. Uses ``layout_acc_mn``
-for 2D (M, N) C-fragment views and ``warp_reduction_max/sum`` for intra-warp
-reduction.
+* **Loads**: all three of Q/K/V are TMA bulk-tensor loads issued by warp 0
+  (``elect_one`` leader). Q is loaded once behind a single mbarrier; K and V
+  stream through ``kStage`` ring buffers, each with its own full barrier, and
+  the consumer waits ``bar_k`` before the QK MMA and ``bar_v`` before the PV
+  MMA (hpc-ops ordering).
 
-**Key design point — N embedded in the MMA shape.** The QK instruction is
-``(64, 64, 16)`` with atom layout ``(1, 1, 1)``: all 64 KV columns land in ONE
-warpgroup (128 threads), and each M row's 64 N values are spread over just 4
-threads of a warp (``reduction_target_n == (4,)``). ``warp_reduction`` then
-covers the full softmax row.  Do NOT use ``(64,16,16)+(1,4,1)`` — that tiled
-mma needs 512 threads; launched at 128 it computes only 1/4 of N and the
-softmax row-sum collapses (the ~16x error seen in early iterations).
+* **MMAs**: QK WGMMA ``(64,64,16)`` SS-scope, PV WGMMA ``(64,128,16)``
+  RS-scope (P in registers, V from smem K-major) — identical to the v1
+  kernel; only the loading path changed.
 
-Algorithm (single-pass online softmax, per Hopper FMHA pattern)::
-
-    for j_block in range(num_n_blocks):
-        load K, V → smem
-        S = Q @ K^T * scale                   # WGMMA (SS scope)
-        m_new = max(m, rowmax(S))             # per-element + warp_reduction_max
-        P = exp2(scale * S - scale * m_new)   # per-element
-        O *= exp2(scale * (m - m_new))        # per-element rescale
-        l = l * exp2(scale * (m - m_new)) + rowsum(P)   # a_sum, NO cross-thread
-                                                         # reduction inside loop
-        O += P @ V                            # WGMMA (RS scope: P in regs)
-        m = m_new
-    l = warp_reduction_sum(l)                 # cross-thread sum ONCE here
-    O /= l                                    # normalize
-    store O
-
-The ``a_sum`` cross-thread sum must run only in the epilogue: calling
-``warp_reduction_sum`` inside the KV loop re-sums the already-complete
-running total on every block (after the first reduction, all 4 threads of a
-row hold the full sum), over-counting it 4x per iteration.
+* **Causal**: every batch is always causal; identities and masks are
+  batch-local (see module preconditions below). TMA zero-fills out-of-bounds
+  tiles, so the padded tail (pack_varlen 64-aligns every batch's flattened
+  Q/K/O segment) is safe to read.
 
 Varlen semantics: the causal mask uses **batch-local** coordinates and gmem is
 tiled at BLK_M granularity, so every batch's flattened start index
-(``cu_seqlens[b]``) must be a multiple of BLK_M (64). With misaligned batch
-boundaries tiles would straddle two batches and the mask would mismatch the
-actual gmem rows (silent wrong results). The harness pads each batch's Q/K/O
-segment to 64 rows so arbitrary real seqlens are supported.
+(``cu_seqlens[b]``) must be a multiple of BLK_M (64). The harness pads each
+batch's Q/K/O segment to 64 rows so arbitrary real seqlens are supported.
+
+Pipeline sketch (mirrors hpc-ops multi_stage_dim128)::
+
+    prologue: leader TMA-loads Q (bar_q), then K/V tiles 0..kStage-2
+              (bar_k[0..kStage-2], bar_v[0..kStage-2])
+    for itile in range(num_n_blocks):
+        leader: if itile_write < num_n_blocks: TMA-load K+V tile itile_write
+                into stage itile_write % kStage (bar_k/bar_v)
+        wait bar_k[ismem_read]
+        S = Q @ K^T * scale                    # QK WGMMA (SS scope)
+        m_new = max(m, rowmax(S))
+        P = exp2(scale * S - scale * m_new)
+        O *= exp2(scale * (m - m_new))
+        l = l * exp2(scale * (m - m_new)) + rowsum(P)
+        wait bar_v[ismem_read]
+        O += P @ V                            # PV WGMMA (RS scope)
+        m = m_new
+        ismem_read = (ismem_read + 1) % kStage; flip phase at wrap
+    l = cross-thread sum(l); O /= l; store O
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.utils.hopper_helpers as sm90_utils
 from cuda.bindings.driver import CUstream
-from cutlass import cute
+from cutlass import cute, pipeline
 from cutlass.cute.nvgpu.warpgroup import OperandMajorMode, OperandSource
 from cutlass.utils.layout import LayoutEnum
 
@@ -61,17 +60,19 @@ BLK_M = 64
 BLK_N = 64
 D = 128
 NUM_THREADS = 128
+NUM_STAGES = 2  # K/V ring depth (smem ~= 2*(sK+sV) ≈ 64KB)
 
 
 class FlashAttnPrefillBf16Multistage:
-    """Varlen FlashAttention prefill kernel (bf16, single warpgroup, multi-stage).
+    """TMA multi-stage varlen FlashAttention prefill (bf16, single warpgroup).
 
     hpc-ops compatible: ``(total_seq, H_q/H_kv, D)`` + ``seqlens`` +
     ``cu_seqlens``, always causal, internal 1/sqrt(D) scale.  See module
     docstring for the 64-aligned batch boundary precondition.
     """
 
-    def __init__(self):
+    def __init__(self, num_stages: int = NUM_STAGES):
+        self.num_stages = num_stages
         self.q_dtype = cutlass.BFloat16
         self.kv_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
@@ -149,17 +150,20 @@ class FlashAttnPrefillBf16Multistage:
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
         mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+        mK_tma: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        mV_tma: cute.Tensor,
         mO: cute.Tensor,
         mSeqlens: cute.Tensor,
         mCuSeqlens: cute.Tensor,
         r2s_tiled_copy_o: cute.TiledCopy,
-        sQ_layout: cute.ComposedLayout,
-        sK_layout: cute.ComposedLayout,
-        sV_layout: cute.ComposedLayout,
+        sQ_layout_staged: cute.ComposedLayout,
+        sK_layout_staged: cute.ComposedLayout,
+        sV_layout_staged: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
+        cta_layout_vmnk: cute.Layout,
         scale_log2: cutlass.Float32,
         H_q: cutlass.Constexpr[int],
         H_kv: cutlass.Constexpr[int],
@@ -169,13 +173,16 @@ class FlashAttnPrefillBf16Multistage:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bid_bh, bid_m, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        f32 = self.acc_dtype
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(shared_storage_cls)
 
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sQ_full = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
+        sK_full = storage.sK.get_tensor(sK_layout_staged.outer, swizzle=sK_layout_staged.inner)
+        sV_full = storage.sV.get_tensor(sV_layout_staged.outer, swizzle=sV_layout_staged.inner)
         sP_flat = cute.make_tensor(storage.sP.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
         sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
 
@@ -185,6 +192,7 @@ class FlashAttnPrefillBf16Multistage:
         gqa = H_q // H_kv
         b = bid_bh // H_q
         h_q = bid_bh % H_q
+        h_kv = h_q // gqa
 
         q_start = mCuSeqlens[(b,)]
         q_len = mSeqlens[(b,)]
@@ -195,24 +203,52 @@ class FlashAttnPrefillBf16Multistage:
         # Tiles beyond this batch's actual length must write nothing.  A staged
         # `if` cannot exit early, so the whole CTA body is wrapped below.
         if q_tile_start < q_len:
-            # Varlen gmem layouts are (total_seq, H_q/H_kv, D): mode0 is the
-            # (flattened) sequence dim, mode1 the head dim.  local_tile maps
-            # tiler modes 1:1 onto input modes, so the tiler here is
-            # (tile_rows, 1, Dd) — coord indices are *tile* indices,
-            # i.e. absolute row // tile size.
-            gQ = cute.local_tile(mQ, (BLK_M, 1, Dd), (q_row0 // BLK_M, h_q, 0))
-            cute.autovec_copy(cute.group_modes(gQ, 0, 2), sQ)
+            # ----- TMA pipeline (barriers live in SharedStorage) -----
+            kv_pipeline = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.bar_kv_array.data_ptr(),
+                num_stages=self.num_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, NUM_THREADS // 32),
+                tx_count=BLK_N * Dd * self.q_dtype.width // 8
+                + BLK_N * Dd * self.q_dtype.width // 8,  # K tile + V tile bytes
+                defer_sync=True,
+                cta_layout_vmnk=cta_layout_vmnk,
+            )
+            # Fence the (deferred) mbarrier init once, then sync all threads.
+            cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
 
-            bf16 = self.q_dtype
-            f32 = self.acc_dtype
+            kv_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages)
+            kv_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_stages)
 
+            # ----- TMA partitions (3D gmem views, hpc-ops pattern) -----
+            # K view is (S, D, H_kv): flat_divide by the 2D box tiler
+            # (BLK_N, Dd) splits the leading (S, D) modes into (tile, rest);
+            # group_modes(0, 3) folds the tile dims into one mode, and the
+            # trailing (S-tiles, ...) modes stay indexable per tile.
+            tSgK = cute.flat_divide(mK_tma, (BLK_N, Dd))
+            tKsK, tKgK_tmp = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_k,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sK_full, 0, 2),
+                cute.group_modes(tSgK, 0, 2),
+            )
+            tKgK = tKgK_tmp[(None, None, 0, h_kv)]
+            tSgV = cute.flat_divide(mV_tma, (Dd, BLK_N))
+            tVsV, tVgV_tmp = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_v,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sV_full, 0, 2),
+                cute.group_modes(tSgV, 0, 2),
+            )
+            tVgV = tVgV_tmp[(None, None, None, b * H_kv + h_kv)]
+
+            # ----- MMA fragments & softmax state (unchanged from v1) -----
             qk_thr = qk_tiled_mma.get_slice(tidx)
-            tCsQ = qk_thr.partition_A(sQ)
-            tCrQ = qk_tiled_mma.make_fragment_A(tCsQ)
             tCsS = qk_thr.partition_C(sP_flat)
             tCrS = qk_tiled_mma.make_fragment_C(tCsS)
-
             pv_thr = pv_tiled_mma.get_slice(tidx)
             tCsO = pv_thr.partition_C(sO)
             tCrO = pv_tiled_mma.make_fragment_C(tCsO)
@@ -237,45 +273,99 @@ class FlashAttnPrefillBf16Multistage:
             # scale folded with log2(e) so exp2(x) computes exp(x*scale): one
             # less multiply per element vs. separate scale + exp.
             scale_val = (1.0 / (Dd**0.5)) * 1.4426950408889634
-            num_k_blocks = cute.size(tCrQ, mode=[2])
-            # Causal KV limit for this Q-tile: rows [0, q_tile_start + BLK_M)
-            # within the batch, capped by the batch length.  (Always causal.)
+
+            # Causal KV extent for this Q-tile: rows [0, q_tile_start + BLK_M)
+            # within the batch, capped by the batch length.
             kv_limit = q_tile_start + BLK_M
             kv_limit = min(kv_limit, q_len)
             num_n_blocks = (kv_limit + BLK_N - 1) // BLK_N
+            num_tile_kv = (q_len + BLK_N - 1) // BLK_N  # total padded KV tiles (mask guard)
+            # KV tile rows live in gmem at [q_start + itile*BLK_N ..) — gmem is
+            # zero-padded past q_len so TMA reads of the tail tile are safe.
+            kv_base = q_start // BLK_N  # absolute gmem tile index of this batch's K
 
             # Batch-aware causal mask per tile.  c_idx is a batch-local
             # identity tensor (max_s x max_s) routed through local_tile +
             # partition_C, so each fragment element carries its batch-local
-            # (q_row, k_col) coordinate in [0, max_s).  All comparisons stay
-            # batch-local (gK/gV are indexed from q_start, so the fragment's
-            # columns are this batch's KV rows shifted by q_start).
+            # (q_row, k_col) coordinate in [0, max_s).
             c_idx = cute.make_identity_tensor((max_seqlens, max_seqlens))
 
-            for j_block in cutlass.range(num_n_blocks, unroll=1):
-                # K rows live in gmem at [q_start + ...] — the batch's KV
-                # starts at its own first query row (self-attn, seq_k==seq_q).
-                gK = cute.local_tile(mK, (BLK_N, 1, Dd), ((q_start + j_block * BLK_N) // BLK_N, h_q // gqa, 0))
-                cute.autovec_copy(cute.group_modes(gK, 0, 2), sK)
-                # V is pre-transposed + per-batch padded to (B, H_kv, D, max_s)
-                # by the harness so the PV B-operand (D, BLK_N) is K-major:
-                # WGMMA computes P@V. Tile = (b, kv_h, 0:D, j_block*BLK_N+..).
-                gV = cute.local_tile(mV, (1, 1, Dd, BLK_N), (b, h_q // gqa, 0, j_block))
-                cute.autovec_copy(cute.group_modes(gV, 1, 3), sV)
-                cute.arch.sync_threads()
+            # =================================================================
+            # PROLOGUE — Q autovec copy (loaded once, not a loop hotspot),
+            # then K/V tiles 0..kStage-2 prefetched by the leader warp.
+            # =================================================================
+            gQ = cute.local_tile(mQ, (BLK_M, 1, Dd), (q_row0 // BLK_M, h_q, 0))
+            cute.autovec_copy(cute.group_modes(gQ, 0, 2), sQ_full[None, None, 0])
+            cute.arch.sync_threads()
 
-                # Identity tile coord tracks j_block so k_col covers the
-                # current KV block, not the first one.
-                g_idx = cute.local_tile(c_idx, (BLK_M, BLK_N), (bid_m, j_block))
-                tIdx = qk_thr.partition_C(g_idx)
-                idx_mn = cute.make_tensor(tIdx.iterator, self.layout_acc_mn(qk_tiled_mma, tIdx.layout))
+            # K/V prologue: prefetch tiles 0..kStage-2 (if they exist).
+            if warp_idx == 0:
+                for istage in cutlass.range(self.num_stages - 1, unroll=1):
+                    if istage < num_n_blocks:
+                        kv_pipeline.producer_acquire(kv_prod_state)
+                        cute.copy(
+                            tma_atom_k,
+                            tKgK[None, kv_base + istage],
+                            tKsK[None, kv_prod_state.index],
+                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_prod_state),
+                        )
+                        cute.copy(
+                            tma_atom_v,
+                            tVgV[None, 0, istage],
+                            tVsV[None, kv_prod_state.index],
+                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_prod_state),
+                        )
+                        kv_pipeline.producer_commit(kv_prod_state)
+                    kv_prod_state.advance()
 
+            # Q fragment (smem) for the QK SS-scope MMA — stage-free, built once.
+            tCsQ = qk_thr.partition_A(sQ_full[None, None, 0])
+            tCrQ = qk_tiled_mma.make_fragment_A(tCsQ)
+            num_k_blocks = cute.size(tCrQ, mode=[2])
+
+            # =================================================================
+            # MAINLOOP — K/V ring: producer prefetches, consumer computes.
+            # =================================================================
+            ismem_read = 0
+            for itile in cutlass.range(num_n_blocks, unroll=1):
+                # Producer: prefetch tile itile + (kStage-1) into its ring slot
+                # (warp 0 only; the TMA engine does the DMA in the background).
+                if warp_idx == 0:
+                    itile_write = itile + (self.num_stages - 1)
+                    if itile_write < num_n_blocks:
+                        kv_pipeline.producer_acquire(kv_prod_state)
+                        cute.copy(
+                            tma_atom_k,
+                            tKgK[None, kv_base + itile_write],
+                            tKsK[(None, kv_prod_state.index)],
+                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_prod_state),
+                        )
+                        cute.copy(
+                            tma_atom_v,
+                            tVgV[None, 0, itile_write],
+                            tVsV[(None, kv_prod_state.index)],
+                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_prod_state),
+                        )
+                        kv_pipeline.producer_commit(kv_prod_state)
+                    kv_prod_state.advance()
+
+                # Consumer: wait for the K tile it's about to read.
+                kv_pipeline.consumer_wait(kv_cons_state)
+                ismem_now = kv_cons_state.index
+
+                # K fragment from the current ring slot (SS-scope QK MMA).
+                sK = sK_full[None, None, ismem_now]
                 tCsK = qk_thr.partition_B(sK)
                 tCrK = qk_tiled_mma.make_fragment_B(tCsK)
 
+                # Identity tile coord tracks itile so k_col covers the current
+                # KV block, not the first one.
+                g_idx = cute.local_tile(c_idx, (BLK_M, BLK_N), (bid_m, itile))
+                tIdx = qk_thr.partition_C(g_idx)
+                idx_mn = cute.make_tensor(tIdx.iterator, self.layout_acc_mn(qk_tiled_mma, tIdx.layout))
+
                 # QK WGMMA: S[m, n] = Q[m, :] @ K[n, :]^T. First k-block must
-                # overwrite the accumulator; later blocks accumulate
-                # (D/MMA-K loop).
+                # overwrite the accumulator; later blocks accumulate.
                 cute.nvgpu.warpgroup.fence()
                 qk_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                 for k_idx in cutlass.range(num_k_blocks, unroll_full=True):
@@ -335,9 +425,11 @@ class FlashAttnPrefillBf16Multistage:
 
                 # P (QK C-fragment) becomes the PV A-operand directly in
                 # registers (RS scope) — no smem round-trip for P.
-                # make_acc_into_op converts the C-layout to the A-operand
-                # layout + casts fp32→bf16.
-                acc_qk_fixed = self.make_acc_into_op(tCrS, pv_tiled_mma.tv_layout_A, bf16)
+                acc_qk_fixed = self.make_acc_into_op(tCrS, pv_tiled_mma.tv_layout_A, self.q_dtype)
+
+                # Consumer: V for this tile is ready only now — wait bar_v
+                # (hpc-ops orders the V wait after the QK/softmax work).
+                sV = sV_full[None, None, ismem_now]
                 tCsV = pv_thr.partition_B(sV)
                 tCrV = pv_tiled_mma.make_fragment_B(tCsV)
 
@@ -348,7 +440,9 @@ class FlashAttnPrefillBf16Multistage:
                 cute.gemm(pv_tiled_mma, tCrO, acc_qk_fixed, tCrV, tCrO)
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
-                cute.arch.sync_threads()
+
+                kv_pipeline.consumer_release(kv_cons_state)
+                kv_cons_state.advance()
 
             # a_sum is accumulated per-thread (local N cols) inside the loop;
             # the cross-thread sum happens once here (a row's N cols span 4
@@ -388,7 +482,7 @@ class FlashAttnPrefillBf16Multistage:
         H_kv: cutlass.Constexpr[int],
         Dd: cutlass.Constexpr[int],
     ):
-        """hpc-ops compatible varlen prefill (always causal).
+        """hpc-ops compatible varlen prefill (always causal), TMA multi-stage.
 
         MMA/SMEM setup identical across exercises; grid is
         (B * H_q, ceil(max_seqlens/BLK_M), 1) with per-batch guard.
@@ -418,6 +512,7 @@ class FlashAttnPrefillBf16Multistage:
         # SMEM layouts: swizzled layout atoms created via hopper_helpers, then
         # tile_to_shape fixes the tile extent. q_atom (K-major, D contiguous)
         # is reused for Q/K/O; sV is (D, BLK_N) K-major for the PV B-operand.
+        # K/V get a leading STAGE axis (ring buffers) for the pipeline.
         q_atom = sm90_utils.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, bf16, Dd), bf16
         )
@@ -427,21 +522,59 @@ class FlashAttnPrefillBf16Multistage:
         p_atom = sm90_utils.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, bf16, BLK_N), bf16
         )
-        sQ_layout = cute.tile_to_shape(q_atom, (BLK_M, Dd), order=(0, 1))
-        sK_layout = cute.tile_to_shape(q_atom, (BLK_N, Dd), order=(0, 1))
-        sV_layout = cute.tile_to_shape(v_atom, (Dd, BLK_N), order=(0, 1))
+        sQ_layout_staged = cute.tile_to_shape(q_atom, (BLK_M, Dd, 1), order=(0, 1, 2))
+        sK_layout_staged = cute.tile_to_shape(q_atom, (BLK_N, Dd, self.num_stages), order=(0, 1, 2))
+        sV_layout_staged = cute.tile_to_shape(v_atom, (Dd, BLK_N, self.num_stages), order=(0, 1, 2))
         sP_layout = cute.tile_to_shape(p_atom, (BLK_M, BLK_N), order=(0, 1))
         sO_layout = cute.tile_to_shape(q_atom, (BLK_M, Dd), order=(0, 1))
 
-        # Shared storage struct laid out by the cutlass SMEM allocator; every
-        # buffer 1024-B aligned so TMA/WGMMA 128-bit requirements are met.
+        # TMA atoms over 3D gmem views, mirroring hpc-ops multi_stage_dim128:
+        #   Q/K: (total_seq*H) rows x D cols, H head dim → (S, D, H) view
+        #   V:   K-major (D, S) tiles, H*B head dim → (D, S, BH) view
+        # The tma tile box is 2D; the trailing H (or BH) mode stays outside
+        # the box and is indexed per-CTA (one head per CTA, V folded BH).
+        total_seq = mQ.shape[0]
+        # K view (S, D, H_kv), strides (H_kv*D, 1, D): matches hpc-ops' K =
+        # (max_seq, D, H_kv) construct.  The 2D tma box (BLK_N, Dd) divides the
+        # leading (S, D) modes; the trailing H_kv mode is indexed per-CTA.
+        k_view = cute.make_tensor(
+            mK.iterator,
+            cute.make_layout((total_seq, Dd, H_kv), stride=(H_kv * Dd, 1, Dd)),
+        )
+        tma_atom_k, tma_tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            k_view,
+            cute.slice_(sK_layout_staged, (None, None, 0)),
+            (BLK_N, Dd),
+        )
+        # V: gmem (B, H_kv, D, S) from pack_varlen → view (Dd, S, BH) with
+        # strides (S, 1, Dd*S): the box (Dd, BLK_N) divides leading (D, S),
+        # the trailing BH mode is indexed per-CTA.
+        B_bh = mSeqlens.shape[0] * H_kv
+        v_view = cute.make_tensor(
+            mV.iterator,
+            cute.make_layout((Dd, max_seqlens, B_bh), stride=(max_seqlens, 1, Dd * max_seqlens)),
+        )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            v_view,
+            cute.slice_(sV_layout_staged, (None, None, 0)),
+            (Dd, BLK_N),
+        )
+
+        # Shared storage: K/V ring buffers (staged cosize), P, O, plus Q and
+        # K/V mbarrier arrays (PipelineTmaAsync needs 2 Int64 per stage).
         @cute.struct
         class SharedStorage:
-            sQ: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sQ_layout)], 1024]
-            sK: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sK_layout)], 1024]
-            sV: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sV_layout)], 1024]
+            bar_kv_array: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
+            sQ: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sQ_layout_staged)], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sK_layout_staged)], 1024]
+            sV: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sV_layout_staged)], 1024]
             sP: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sP_layout)], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sO_layout)], 1024]
+
+        # Non-clustered CTA: vmnk = (1, 1, 1, 1).
+        cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
 
         scale_log2 = cutlass.Float32((1.0 / (Dd**0.5)) * 1.4426950408889634)
         B = mSeqlens.shape[0]
@@ -451,17 +584,20 @@ class FlashAttnPrefillBf16Multistage:
             qk_mma,
             pv_mma,
             mQ,
-            mK,
-            mV,
+            tma_atom_k,
+            tma_tensor_k,
+            tma_atom_v,
+            tma_tensor_v,
             mO,
             mSeqlens,
             mCuSeqlens,
             r2s_o,
-            sQ_layout,
-            sK_layout,
-            sV_layout,
+            sQ_layout_staged,
+            sK_layout_staged,
+            sV_layout_staged,
             sP_layout,
             sO_layout,
+            cta_layout_vmnk,
             scale_log2,
             H_q,
             H_kv,

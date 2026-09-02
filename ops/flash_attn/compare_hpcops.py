@@ -124,7 +124,7 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D):
         make_cute_tensor(seqlens_t, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
         make_stream(),
-        max(seqlens),
+        v_t.shape[3],
         H_q,
         H_kv,
         D,
@@ -177,7 +177,7 @@ def main():
         H_q, H_kv, D, seqlens = shape
         # Real attention work: sum of per-batch causal s² (hpc-ops and cutedsl
         # both roughly do this; padded rows of the cutedsl kernel are masked).
-        flops = int(4 * H_q * sum(s * s for s in seqlens))
+        flops = int(4 * H_q * sum(s * s for s in seqlens) * D)
         label = f"({H_q},{H_kv},{D},{seqlens})"
 
         q, k, v = _gen_data(H_q, H_kv, seqlens, D)
