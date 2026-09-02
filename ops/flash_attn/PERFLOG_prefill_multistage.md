@@ -23,28 +23,32 @@ NOTE: both kernels skip the causal upper triangle via `kv_limit`, so this formul
 overcounts their work equally at M≈N (hpc-ops reports >100% peak for exactly this
 reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
 
+`vs hpc` = hpc_ms / cute_ms — **> 1 means OUR kernel is faster**. v5 + hpc rows are
+the same 14-shape re-bench run (FA_SPLIT=1, 3-way vs torch all Success); v1/v2/v3
+rows keep their historical numbers.
+
 | Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5-qasync | vs hpc (v5) |
 |---|---|---|---|---|---|
-| **(4,4,128,[512])** single batch | 0.030 ms / 18.1T (12%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | **0.026 / 20.3T (13.7%)** | **0.89x — faster** |
-| **(8,8,128,[1024])** single batch | 0.053 / 80.6T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | **0.050 / 86.3T (58%)** | **0.94x — faster** |
-| **(4,1,128,[512])** GQA | 0.029 / 18.2T | 0.070 / 7.7T | 0.071 / 7.5T | **0.026 / 20.3T** | **0.90x — faster** |
-| **(1,1,128,[512])** single head | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | **0.029 / 4.6T** | 0.99x |
-| **(4,4,128,[4096])** long seq † | 0.165 / 208.0T (>peak) | 0.350 / 98.1T (66%) | — † | — † | 2.1x (v2) |
-| **(8,2,128,[4096])** GQA long † | 0.288 / 238.6T (>peak) | 0.593 / 115.8T (78%) | — † | — † | 2.1x (v2) |
-| **(4,4,128,[512,768])** unequal | 0.044 / 39.5T | 0.120 / 14.6T | 0.120 / 14.5T | **0.041 / 42.1T** | **0.93x — faster** |
-| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | **0.023 / 13.3T** | **0.87x — faster** |
-| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.0T | 0.110 / 8.8T | 0.110 / 8.9T | **0.032 / 30.5T** | **0.85x — faster** |
-| **(4,1,128,[512]×4)** GQA×4 | 0.036 / 60.3T | 0.109 / 19.7T | 0.110 / 19.5T | **0.033 / 65.5T (44%)** | **0.92x — faster** |
-| **(4,4,128,[2048,2048])** † | 0.090 / 190.2T | 0.263 / 65.4T (44%) | — † | — † | 2.9x (v2) |
-| **(4,4,128,[512]×8)** serving † | 0.040 / 107.8T | 0.196 / 21.9T | — † | — † | 4.9x (v2) |
-| **(8,8,128,[1024]×8)** serving † | 0.164 / 209.8T | 0.775 / 44.3T | — † | — † | 4.7x (v2) |
-| **(4,4,128,[512]×16)** serving † | 0.059 / 145.4T | 0.364 / 23.6T | — † | — † | 6.2x (v2) |
+| **(4,4,128,[512])** single batch | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | **0.027 / 20.1T (13.6%)** | **1.28x faster** |
+| **(8,8,128,[1024])** single batch | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | **0.050 / 85.5T (57.8%)** | **1.06x faster** |
+| **(4,1,128,[512])** GQA | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | **0.027 / 20.2T** | **1.10x faster** |
+| **(1,1,128,[512])** single head | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | **0.026 / 5.1T** | **1.08x faster** |
+| **(4,4,128,[4096])** long seq † | 0.164 / 209.0T (>peak) | 0.350 / 98.1T (66%) | — † | **0.244 / 140.8T (95.1%)** | 0.67x |
+| **(8,2,128,[4096])** GQA long † | 0.286 / 240.3T (>peak) | 0.593 / 115.8T (78%) | — † | **0.356 / 193.0T (130%)** | 0.80x |
+| **(4,4,128,[512,768])** unequal | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | **0.041 / 42.2T** | **1.07x faster** |
+| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | **0.023 / 13.2T** | **1.13x faster** |
+| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | **0.032 / 30.4T** | **1.08x faster** |
+| **(4,1,128,[512]×4)** GQA×4 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | **0.034 / 64.0T** | **1.01x faster** |
+| **(4,4,128,[2048,2048])** † | 0.090 / 190.5T | 0.263 / 65.4T (44%) | — † | **0.119 / 144.6T (97.7%)** | 0.76x |
+| **(4,4,128,[512]×8)** serving † | 0.039 / 108.9T | 0.196 / 21.9T | — † | **0.044 / 98.5T** | 0.90x |
+| **(8,8,128,[1024]×8)** serving † | 0.164 / 209.3T | 0.775 / 44.3T | — † | **0.187 / 184.0T** | 0.88x |
+| **(4,4,128,[512]×16)** serving † | 0.059 / 145.9T | 0.364 / 23.6T | — † | **0.069 / 125.4T (84.7%)** | 0.86x |
 
 † hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
 (`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
 comparing our single-WG kernel against them is structural mismatch — the v3+
-bench target is the 8 multi-stage shapes only. **v5 wins 7 of those 8 outright**
-(with FA_SPLIT=2 the [512] shapes drop to 0.72-0.78x, see Step 5).
+bench target is the 8 multi-stage shapes only. **v5 wins ALL 8 of them (1.01-1.28x)**
+(with FA_SPLIT=2 the [512] shapes reach 1.29-1.39x, see Step 5).
 
 ### Key takeaways
 - **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
@@ -60,9 +64,10 @@ bench target is the 8 multi-stage shapes only. **v5 wins 7 of those 8 outright**
   codegen quality. Fix = split-K over the KV dimension (Step 4).
 - **v4 split-KV: negative result** (Step 4) — cutting the loop cannot pay for
   per-CTA fixed costs (synchronous Q load + TMA wait + drain), which dominate.
-- **v5 Q-async TMA: 2.5-3.4x, 7/8 multi-stage shapes now FASTER than hpc-ops**
-  (0.85-0.94x; single-head ties). The ncu-predicted lever worked exactly as
-  diagnosed; split=2 re-test after v5 turns positive on the smallest grids (0.72-0.83x).
+- **v5 Q-async TMA: 2.5-3.4x — ALL 8 multi-stage shapes now FASTER than hpc-ops**
+  (1.01-1.28x on the re-bench; the 6 † shapes sit at 0.67-0.90x where hpc uses its
+  structurally different warp_spec kernel). The ncu-predicted lever worked exactly as
+  diagnosed; split=2 re-test after v5 turns positive on the smallest grids (1.29-1.39x).
 
 ---
 

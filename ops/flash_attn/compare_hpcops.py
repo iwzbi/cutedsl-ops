@@ -217,7 +217,8 @@ def main():
 
         print(f"{label:<40} {'hpc-ops':<12} {hpc_ms:>10.3f} {hpc_tflops:>10.1f} {hpc_peak_pct:>6.1f}%")
         print(f"{'':<40} {'cutedsl':<12} {cute_ms:>10.3f} {cute_tflops:>10.1f} {cute_peak_pct:>6.1f}%")
-        print(f"{'':<40} {'speedup':<12} {cute_ms / hpc_ms:>10.2f}x")
+        # ratio > 1 means cutedsl is FASTER than hpc-ops (hpc_ms / cute_ms)
+        print(f"{'':<40} {'vs hpc':<12} {hpc_ms / cute_ms:>10.2f}x")
         print()
 
     print(f"{'=' * 100}")
