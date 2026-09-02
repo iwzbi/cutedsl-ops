@@ -155,7 +155,8 @@ class FlashAttnPrefillBf16Multistage:
         self,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
-        mQ: cute.Tensor,
+        tma_atom_q: cute.CopyAtom,
+        mQ_tma: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
         mK_tma: cute.Tensor,
         tma_atom_v: cute.CopyAtom,
@@ -227,12 +228,24 @@ class FlashAttnPrefillBf16Multistage:
                 defer_sync=True,
                 cta_layout_vmnk=cta_layout_vmnk,
             )
+            # Single-stage pipeline for the once-per-CTA Q tile (v5 async Q).
+            q_pipeline = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.q_bar_array.data_ptr(),
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, NUM_THREADS // 32),
+                tx_count=BLK_M * Dd * self.q_dtype.width // 8,
+                defer_sync=True,
+                cta_layout_vmnk=cta_layout_vmnk,
+            )
             # Fence the (deferred) mbarrier init once, then sync all threads.
             cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
 
             kv_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages)
             kv_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_stages)
+            q_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            q_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
 
             # ----- TMA partitions (3D gmem views, hpc-ops pattern) -----
             # K view is (S, D, H_kv): flat_divide by the 2D box tiler
@@ -257,6 +270,15 @@ class FlashAttnPrefillBf16Multistage:
                 cute.group_modes(tSgV, 0, 2),
             )
             tVgV = tVgV_tmp[(None, None, None, b * H_kv + h_kv)]
+            tSgQ = cute.flat_divide(mQ_tma, (BLK_M, Dd))
+            tQsQ, tQgQ_tmp = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_q,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sQ_full, 0, 2),
+                cute.group_modes(tSgQ, 0, 2),
+            )
+            tQgQ = tQgQ_tmp[(None, None, 0, h_q)]
 
             # ----- MMA fragments & softmax state (unchanged from v1) -----
             qk_thr = qk_tiled_mma.get_slice(tidx)
@@ -315,12 +337,18 @@ class FlashAttnPrefillBf16Multistage:
             num_tile_full = bid_m
 
             # =================================================================
-            # PROLOGUE — Q autovec copy (loaded once, not a loop hotspot),
-            # then K/V tiles 0..kStage-2 prefetched by the leader warp.
+            # PROLOGUE — Q via TMA (async; waited before the mainloop), then
+            # K/V tiles 0..kStage-2 prefetched by the leader warp.
             # =================================================================
-            gQ = cute.local_tile(mQ, (BLK_M, 1, Dd), (q_row0 // BLK_M, h_q, 0))
-            cute.autovec_copy(cute.group_modes(gQ, 0, 2), sQ_full[None, None, 0])
-            cute.arch.sync_threads()
+            if warp_idx == 0:
+                q_pipeline.producer_acquire(q_prod_state)
+                cute.copy(
+                    tma_atom_q,
+                    tQgQ[None, q_row0 // BLK_M],
+                    tQsQ[None, 0],
+                    tma_bar_ptr=q_pipeline.producer_get_barrier(q_prod_state),
+                )
+                q_pipeline.producer_commit(q_prod_state)
 
             # K/V prologue: prefetch this CTA's first kStage-1 tiles (if any).
             if warp_idx == 0:
@@ -346,6 +374,11 @@ class FlashAttnPrefillBf16Multistage:
             tCsQ = qk_thr.partition_A(sQ_full[None, None, 0])
             tCrQ = qk_tiled_mma.make_fragment_A(tCsQ)
             num_k_blocks = cute.size(tCrQ, mode=[2])
+
+            # Wait for the Q TMA exactly once — sQ is never overwritten, so no
+            # consumer_release is needed (all warps have arrived on empty after
+            # this wait returns; later reads are pure consumers).
+            q_pipeline.consumer_wait(q_cons_state)
 
             # =================================================================
             # MAINLOOP — K/V ring: producer prefetches, consumer computes.
@@ -630,6 +663,17 @@ class FlashAttnPrefillBf16Multistage:
         # The tma tile box is 2D; the trailing H (or BH) mode stays outside
         # the box and is indexed per-CTA (one head per CTA, V folded BH).
         total_seq = mQ.shape[0]
+        # Q view (S, D, H_q) — same construct as K, box (BLK_M, Dd), v5 async.
+        q_view = cute.make_tensor(
+            mQ.iterator,
+            cute.make_layout((total_seq, Dd, H_q), stride=(H_q * Dd, 1, Dd)),
+        )
+        tma_atom_q, tma_tensor_q = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            q_view,
+            cute.slice_(sQ_layout_staged, (None, None, 0)),
+            (BLK_M, Dd),
+        )
         # K view (S, D, H_kv), strides (H_kv*D, 1, D): matches hpc-ops' K =
         # (max_seq, D, H_kv) construct.  The 2D tma box (BLK_N, Dd) divides the
         # leading (S, D) modes; the trailing H_kv mode is indexed per-CTA.
@@ -663,6 +707,7 @@ class FlashAttnPrefillBf16Multistage:
         @cute.struct
         class SharedStorage:
             bar_kv_array: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
+            q_bar_array: cute.struct.MemRange[cutlass.Int64, 2]
             sQ: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sQ_layout_staged)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sK_layout_staged)], 1024]
             sV: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sV_layout_staged)], 1024]
@@ -679,7 +724,8 @@ class FlashAttnPrefillBf16Multistage:
         self.kernel(
             qk_mma,
             pv_mma,
-            mQ,
+            tma_atom_q,
+            tma_tensor_q,
             tma_atom_k,
             tma_tensor_k,
             tma_atom_v,
