@@ -46,7 +46,7 @@ from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen
 
 
 ATOL = 0.016
-NUM_STAGES = 2  # smem pipeline stages (kernel class default)
+NUM_STAGES = 1  # smem pipeline stages (kernel class default)
 
 
 DESC = "bf16 multi-stage varlen (single WG, class-based)"

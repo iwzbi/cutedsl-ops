@@ -60,7 +60,9 @@ BLK_M = 64
 BLK_N = 64
 D = 128
 NUM_THREADS = 128
-NUM_STAGES = 2  # K/V ring depth (smem ~= 2*(sK+sV) ≈ 64KB)
+NUM_STAGES = 1  # K/V ring depth; 1 keeps smem at ~72KB → 3 CTAs/SM (hpc-ops
+# multi_stage_dim128 runs kStage=1 and hides TMA latency via CTA interleaving).
+# A/B verified: stages=1 vs 2 with grid-swap+mask-skip is within noise (<4%).
 
 
 class FlashAttnPrefillBf16Multistage:
@@ -172,7 +174,10 @@ class FlashAttnPrefillBf16Multistage:
         shared_storage_cls: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bid_bh, bid_m, _ = cute.arch.block_idx()
+        # grid = (q_tile, batch*head): the FAST dim is the Q-tile so a wave of
+        # concurrent CTAs reads nested causal KV prefixes of the SAME head
+        # (L2 reuse), matching hpc-ops' (tile_m, head, batch) launch order.
+        bid_m, bid_bh, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         f32 = self.acc_dtype
@@ -290,6 +295,11 @@ class FlashAttnPrefillBf16Multistage:
             # (q_row, k_col) coordinate in [0, max_s).
             c_idx = cute.make_identity_tensor((max_seqlens, max_seqlens))
 
+            # KV tiles below this one are entirely under the causal diagonal
+            # (their last column (itile+1)*64-1 < q_tile_start = bid_m*64),
+            # so the mask loop only runs from the diagonal tile onward.
+            num_tile_full = bid_m
+
             # =================================================================
             # PROLOGUE — Q autovec copy (loaded once, not a loop hotspot),
             # then K/V tiles 0..kStage-2 prefetched by the leader warp.
@@ -375,17 +385,19 @@ class FlashAttnPrefillBf16Multistage:
                 cute.nvgpu.warpgroup.wait_group(0)
 
                 # Batch-local causal mask: rows past q_len and upper-triangle
-                # k_col > q_row set to -inf.
-                for i in cutlass.range_constexpr(qk_m):
-                    if idx_mn[i, 0][0] >= q_len:
-                        for j in cutlass.range_constexpr(qk_n):
-                            acc_qk_mn[i, j] = float("-inf")
-                    else:
-                        for j in cutlass.range_constexpr(qk_n):
-                            k_col = idx_mn[i, j][1]
-                            q_row = idx_mn[i, j][0]
-                            if k_col >= q_len or k_col > q_row:
+                # k_col > q_row set to -inf.  Skipped entirely for fully
+                # unmasked tiles below the diagonal (see num_tile_full).
+                if itile >= num_tile_full:
+                    for i in cutlass.range_constexpr(qk_m):
+                        if idx_mn[i, 0][0] >= q_len:
+                            for j in cutlass.range_constexpr(qk_n):
                                 acc_qk_mn[i, j] = float("-inf")
+                        else:
+                            for j in cutlass.range_constexpr(qk_n):
+                                k_col = idx_mn[i, j][1]
+                                q_row = idx_mn[i, j][0]
+                                if k_col >= q_len or k_col > q_row:
+                                    acc_qk_mn[i, j] = float("-inf")
 
                 # Online softmax (FlashAttention v2): running max m, running
                 # sum l.  m and l live in the QK C-space (qk_m values per
@@ -578,7 +590,7 @@ class FlashAttnPrefillBf16Multistage:
 
         scale_log2 = cutlass.Float32((1.0 / (Dd**0.5)) * 1.4426950408889634)
         B = mSeqlens.shape[0]
-        grid = (B * H_q, (max_seqlens + BLK_M - 1) // BLK_M, 1)
+        grid = ((max_seqlens + BLK_M - 1) // BLK_M, B * H_q, 1)
 
         self.kernel(
             qk_mma,

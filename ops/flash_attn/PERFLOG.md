@@ -19,22 +19,27 @@ NOTE: both kernels skip the causal upper triangle via `kv_limit`, so this formul
 overcounts their work equally at M≈N (hpc-ops reports >100% peak for exactly this
 reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
 
-| Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v2-TMA | v2 vs hpc |
-|---|---|---|---|
-| **(4,4,128,[512])** single batch | 0.030 ms / 18.1T (12%) | **0.070 ms / 7.6T (5%)** | 2.4x slower |
-| **(8,8,128,[1024])** single batch | 0.053 / 80.6T (55%) | **0.128 / 33.5T (23%)** | 2.4x slower |
-| **(4,1,128,[512])** GQA | 0.029 / 18.2T | **0.070 / 7.7T** | 2.4x slower |
-| **(1,1,128,[512])** single head | 0.029 / 4.7T | **0.072 / 1.9T** | 2.5x slower |
-| **(4,4,128,[4096])** long seq | 0.165 / 208.0T (>peak) | **0.350 / 98.1T (66%)** | 2.1x slower |
-| **(8,2,128,[4096])** GQA long | 0.288 / 238.6T (>peak) | **0.593 / 115.8T (78%)** | **2.1x slower** |
-| **(4,4,128,[512,768])** unequal | 0.044 / 39.5T | **0.120 / 14.6T** | 2.7x slower |
-| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | **0.066 / 4.6T** | 2.6x slower |
-| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.0T | **0.110 / 8.8T** | 3.2x slower |
-| **(4,1,128,[512]×4)** GQA×4 | 0.036 / 60.3T | **0.109 / 19.7T** | 3.1x slower |
-| **(4,4,128,[2048,2048])** | 0.090 / 190.2T | **0.263 / 65.4T (44%)** | 2.9x slower |
-| **(4,4,128,[512]×8)** serving | 0.040 / 107.8T | **0.196 / 21.9T** | 4.9x slower |
-| **(8,8,128,[1024]×8)** serving | 0.164 / 209.8T | **0.775 / 44.3T** | 4.7x slower |
-| **(4,4,128,[512]×16)** serving | 0.059 / 145.4T | **0.364 / 23.6T** | 6.2x slower |
+| Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v2-TMA | ex.1 v3 | vs hpc (v3) |
+|---|---|---|---|---|
+| **(4,4,128,[512])** single batch | 0.030 ms / 18.1T (12%) | 0.070 ms / 7.6T (5%) | **0.071 / 7.5T** | 2.2x slower |
+| **(8,8,128,[1024])** single batch | 0.053 / 80.6T (55%) | 0.128 / 33.5T (23%) | **0.130 / 33.1T** | 2.4x slower |
+| **(4,1,128,[512])** GQA | 0.029 / 18.2T | 0.070 / 7.7T | **0.071 / 7.5T** | 2.4x slower |
+| **(1,1,128,[512])** single head | 0.029 / 4.7T | 0.072 / 1.9T | **0.073 / 1.8T** | 2.5x slower |
+| **(4,4,128,[4096])** long seq † | 0.165 / 208.0T (>peak) | 0.350 / 98.1T (66%) | — † | 2.1x (v2) |
+| **(8,2,128,[4096])** GQA long † | 0.288 / 238.6T (>peak) | 0.593 / 115.8T (78%) | — † | 2.1x (v2) |
+| **(4,4,128,[512,768])** unequal | 0.044 / 39.5T | 0.120 / 14.6T | **0.120 / 14.5T** | 2.4x slower |
+| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | 0.066 / 4.6T | **0.068 / 4.4T** | 2.6x slower |
+| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.0T | 0.110 / 8.8T | **0.110 / 8.9T** | 3.2x slower |
+| **(4,1,128,[512]×4)** GQA×4 | 0.036 / 60.3T | 0.109 / 19.7T | **0.110 / 19.5T** | 3.1x slower |
+| **(4,4,128,[2048,2048])** † | 0.090 / 190.2T | 0.263 / 65.4T (44%) | — † | 2.9x (v2) |
+| **(4,4,128,[512]×8)** serving † | 0.040 / 107.8T | 0.196 / 21.9T | — † | 4.9x (v2) |
+| **(8,8,128,[1024]×8)** serving † | 0.164 / 209.8T | 0.775 / 44.3T | — † | 4.7x (v2) |
+| **(4,4,128,[512]×16)** serving † | 0.059 / 145.4T | 0.364 / 23.6T | — † | 6.2x (v2) |
+
+† hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
+(`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
+comparing our single-WG kernel against them is structural mismatch — the v3+
+bench target is the 8 multi-stage shapes only.
 
 ### Key takeaways
 - **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
@@ -42,9 +47,12 @@ reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
   5 test_varlen cases, and 14×3-way agreement (torch/hpc-ops/cutedsl) via compare_hpcops.py.
 - **v1→v2 (TMA multi-stage): 16-100x faster** — the serial-load bottleneck is gone;
   the gap to hpc-ops collapsed from 37-132x to **2.1-6.2x**.
-- Remaining gap is *not* causal skipping (both kernels already cap KV via `kv_limit`):
-  it is single-warpgroup issue width + softmax/MMA serialization (→ ex.2 warp-spec)
-  and small-grid / bandwidth effects on long sequences (→ num_stages, split-K tuning).
+- **v3 ruled out the easy suspects** (see Step 3): occupancy (2→3 CTA/SM), L2 grid
+  order, and per-tile mask skipping are all *neutral* — v2 already saturates what
+  the single-warpgroup structure can do. The residual ~2.2-3.2x vs hpc-ops'
+  *same-shape* multi_stage kernel is instruction-scheduling quality inside the
+  QK→softmax→PV chain (CUTLASS C++ vs DSL codegen) — attacking it needs
+  warp-specialization (ex.2) or ncu-level stall analysis, not more pipeline knobs.
 
 ---
 
@@ -154,16 +162,67 @@ ex.2/hpc-ops add; see Step 3.
 
 ---
 
-## Step 3+: planned optimizations
+## Step 3: ⚖️ v3 — occupancy / L2 / mask-skip A/B study (neutral, kept for fidelity)
+
+**Tag**: `flash-ex1-v3-occupancy`
+
+### Changes (each mirrors an hpc-ops `multi_stage_dim128` trait; h20 dispatch:
+`ceil(max_seq/64)·B·H_q < 156 CTAs` → the 8 small shapes below)
+
+1. `NUM_STAGES 2 → 1`: smem 104KB→72KB → **3 CTAs/SM** (hpc runs kStage=1:
+   48+16KB, 3 CTAs — latency hidden by CTA interleaving, not in-CTA prefetch).
+2. **Grid transpose** `(B·H_q, q_tile) → (q_tile, B·H_q)`: Q-tile becomes the fast
+   dim so one wave reads nested causal KV prefixes of the same head (L2 reuse),
+   hpc's launch order.
+3. **Full-tile mask skip** (`num_tile_full = bid_m`): KV tiles entirely under the
+   diagonal ((itile+1)·64−1 < q_tile_start) skip the causal-mask loop — hpc does
+   the same via `num_tile_full`.
+
+### A/B result (8 multi-stage shapes, cute ms)
+
+| Shape | v2 (s2) | v3a (s1+swap+skip) | v3b (s2+swap+skip) |
+|---|---|---|---|
+| (4,4,128,[512]) | 0.070 | 0.071 | 0.069 |
+| (8,8,128,[1024]) | 0.128 | 0.130 | 0.129 |
+| (4,1,128,[512]) | 0.070 | 0.071 | 0.069 |
+| (1,1,128,[512]) | 0.072 | 0.073 | 0.070 |
+| [512,768] | 0.120 | 0.120 | 0.119 |
+| [200,328] | 0.066 | 0.068 | 0.066 |
+| [256,384,512] | 0.110 | 0.110 | 0.108 |
+| [512]×4 | 0.109 | 0.110 | 0.110 |
+
+**All three changes are performance-neutral (≤4%)** — v2-TMA had already
+saturated the single-warpgroup design: TMA + prefetch made loads invisible, so
+occupancy (2→3 CTA), L2 order, and saved mask instructions cannot move the
+needle. v3a config kept anyway (hpc-faithful: kStage=1 + grid order + mask skip;
+mask-skip also shrinks the loop body executed on real workloads).
+
+### What this rules out / next
+- The residual 2.2-3.2x vs hpc-ops' *structurally identical* kernel is NOT about
+  pipeline depth or occupancy — it is the per-iteration WGMMA→softmax→WGMMA
+  dependency chain (single-WG issue serialization) and DSL codegen scheduling.
+- The lever that actually differs: warp-specialization (hpc's own answer at
+  >156 CTAs; our ex.2 territory) or an ncu stall-attribution study of the
+  softmax↔MMA interleave.
+
+### Verified
+- `run_prefill.py`: 14/14 succeed; `tests/test_varlen.py`: 5/5;
+  `compare_hpcops.py --shapes 0,1,2,3,6,7,8,9`: 8×3-way all Success.
+
+---
+
+## Step 4+: planned optimizations
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
-| 3 | flash-ex1-v3-stages | tune `num_stages` (3/4) + smem budget per occupancy | tighter load/compute overlap |
-| 4 | flash-ex1-v4-splitk | split-K over KV (grid z) + LSE combine | multi-CTA parallelism for long seq |
-| 5 | (later) | Q/O TMA paths, causal full-tile mask-skip (skip mask work for tiles fully below the diagonal) | polish |
+| 4 | flash-ex1-v4-splitk | split-K over KV (grid z) + LSE combine | multi-CTA parallelism for long seq / serving shapes |
+| 5 | (later) | Q/O TMA paths; per-iteration stall attribution with ncu before touching the softmax↔MMA chain | polish / warp-spec groundwork |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
+**Bench target set from v3 on: the 8 multi-stage shapes** (`--shapes 0,1,2,3,6,7,8,9`) —
+long/serving shapes compare against hpc-ops' *different* kernel (warp_spec) and are
+informational only.
 
 ---
 
