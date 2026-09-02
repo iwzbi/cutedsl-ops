@@ -82,7 +82,9 @@ GQA 自动 `repeat_kv` 广播；FP8 参考**刻意复刻 kernel 数值流程**�
 
 ## 性能工作流
 
-每个 kernel 一个 `PERFLOG.md`（对标 `ops/gemm/PERFLOG.md` 风格），记录：
+每个 kernel 一个 `PERFLOG_<kernel>.md`（对标 `ops/gemm/PERFLOG.md` 风格），记录：
+当前有 [`PERFLOG_prefill_multistage.md`](./PERFLOG_prefill_multistage.md)（ex.1 varlen multi-stage）；
+decode 等 kernel 开工时再各开一份。
 
 1. 硬件基线（H20: sm_90, 78 SM, 148 TFLOPS FP16 峰值）
 2. Master Performance Table（shape × 版本列，TFLOPS + 相对峰值 %）

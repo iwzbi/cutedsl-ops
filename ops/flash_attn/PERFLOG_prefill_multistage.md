@@ -1,4 +1,8 @@
-# FlashAttention Optimization Journey
+# FlashAttention Prefill (multi-stage) — Optimization Journey
+
+> Per-kernel optimization log for `kernels/prefill_bf16_multistage.py` (ex.1).
+> Scope: the single-warpgroup TMA multi-stage kernel only — warp-specialization
+> (ex.2) is a different kernel and intentionally out of scope here.
 
 Hopper H20 (sm_90, 78 SM, 148 TFLOPS FP16 peak), CuTe DSL (nvidia-cutlass-dsl 4.7.0).
 References: torch SDPA (`F.scaled_dot_product_attention`, fp32) and hpc-ops
@@ -49,10 +53,10 @@ bench target is the 8 multi-stage shapes only.
   the gap to hpc-ops collapsed from 37-132x to **2.1-6.2x**.
 - **v3 ruled out the easy suspects** (see Step 3): occupancy (2→3 CTA/SM), L2 grid
   order, and per-tile mask skipping are all *neutral* — v2 already saturates what
-  the single-warpgroup structure can do. The residual ~2.2-3.2x vs hpc-ops'
-  *same-shape* multi_stage kernel is instruction-scheduling quality inside the
-  QK→softmax→PV chain (CUTLASS C++ vs DSL codegen) — attacking it needs
-  warp-specialization (ex.2) or ncu-level stall analysis, not more pipeline knobs.
+  the single-warpgroup design can do *at fixed grid shape*.
+- **v3 ncu attribution (Step 3.5)**: the residual gap on small shapes is
+  *parallelism starvation* (32-CTA grid = 0.14 wave, tensor pipe 0.55%), not
+  codegen quality. Fix = split-K over the KV dimension (Step 4).
 
 ---
 
@@ -149,10 +153,10 @@ overlap across KV blocks.
 | 2048²×2 | 11.49 | 0.263 | **44x** | 2.9x slower |
 | [512]×16 | — | 0.364 | — | 6.2x slower |
 
-Multi-batch shapes drift further behind (up to 6.2x on [512]×16): more CTAs than
-SMs, each CTA's single warpgroup issues both TMA prefetch and WGMMA/softmax
-serially — the warp-specialized overlap (load-WG vs compute-WG) is exactly what
-ex.2/hpc-ops add; see Step 3.
+Multi-batch shapes drift further behind (up to 6.2x on [512]×16) — these have
+enough CTAs to fill the GPU, and the per-warp issue serialization plus the
+larger KV working set expose the remaining single-warpgroup cost (see Step 3.5
+for the ncu attribution).
 
 ### Verified
 - `run_prefill.py`: 14/14 succeed (max diff ≤ 0.00195).
@@ -199,11 +203,8 @@ mask-skip also shrinks the loop body executed on real workloads).
 
 ### What this rules out / next
 - The residual 2.2-3.2x vs hpc-ops' *structurally identical* kernel is NOT about
-  pipeline depth or occupancy — it is the per-iteration WGMMA→softmax→WGMMA
-  dependency chain (single-WG issue serialization) and DSL codegen scheduling.
-- The lever that actually differs: warp-specialization (hpc's own answer at
-  >156 CTAs; our ex.2 territory) or an ncu stall-attribution study of the
-  softmax↔MMA interleave.
+  pipeline depth or occupancy in itself — Step 3.5's ncu run shows the true
+  failure mode is an under-filled grid + exposed single-warp latency chain.
 
 ### Verified
 - `run_prefill.py`: 14/14 succeed; `tests/test_varlen.py`: 5/5;
@@ -211,12 +212,43 @@ mask-skip also shrinks the loop body executed on real workloads).
 
 ---
 
-## Step 4+: planned optimizations
+## Step 3.5: 🔬 ncu stall attribution (v3 config, shape (4,4,128,[512]))
+
+Evidence: [`ncu_reports/ex1-v3-multistage-512.txt`](./ncu_reports/ex1-v3-multistage-512.txt)
+(`ncu --set full`, kernel `kernel_cutlass_kernel_opsflash_attn...`, capture via
+`NCU_PROFILING=1` + `--kernel-name regex:kernel_cutlass`).
+
+| Signal | Value | Reading |
+|---|---|---|
+| Grid Size / Waves Per SM | 32 CTA / **0.14 wave** | 78-SM GPU < half filled; ≥1 CTA per SM never happens |
+| Active Warps Per Scheduler | **1.00** (of 16) | one resident warp → zero warp-level interleave |
+| Compute (SM) / DRAM throughput | 14.9% / **0.45%** | neither ALU nor bandwidth saturated |
+| **Tensor pipe utilization** | **0.55%** | WGMMA idles ~99.5% of elapsed cycles |
+| Stall Long Scoreboard | **1.57 cyc/inst (34%)** | exposed global-load latency (synchronous `autovec_copy` Q load + small-work CTAs) |
+| Stall Wait | 1.09 (24%) | fixed-latency QK→softmax→PV dependency chain |
+| Stall Short Scoreboard / Barrier | 0.33 / 0.22 | LDS + sync minor |
+
+**Verdict: parallelism starvation, not codegen quality.** With 32 CTAs and no
+in-CTA pipelining slack, every warp serializes Q-load → TMA-wait → WGMMA →
+softmax with no co-resident work to cover latency; the tensor pipe never spins up.
+hpc-ops' multi_stage kernel fights this with 64KB smem (3 CTA/SM) — still capped
+by grid=32 on these shapes, which is why even *it* only reaches 12% peak at 512².
+
+**Implication → Step 4 (split-K)**: splitting the KV range across `split ∈ {2,4}`
+CTAs (grid z) + LSE combine multiplies the CTA count exactly where shapes are
+small (32→64/128 CTAs fills the GPU; 512², [512]×4, [512,768], GQA×3 all gain),
+and shrinks each CTA's serial KV-tile chain. Secondary lever from the long-scoreboard
+finding: make the Q load TMA/async so tile-0's QK can overlap Q-in-flight.
+
+---
+
+## Step 4+: planned optimizations (multi-stage scope only)
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
-| 4 | flash-ex1-v4-splitk | split-K over KV (grid z) + LSE combine | multi-CTA parallelism for long seq / serving shapes |
-| 5 | (later) | Q/O TMA paths; per-iteration stall attribution with ncu before touching the softmax↔MMA chain | polish / warp-spec groundwork |
+| 4 | flash-ex1-v4-splitk | split-KV across grid z (2/4) + LSE combine; grid fills the 78-SM machine on small shapes | big win on the 8 multi-stage shapes (tensor pipe 0.55% → utilization by breadth) |
+| 5 | flash-ex1-v5-qasync | Q load via TMA (or cp.async pipeline) so QK tile-0 doesn't pay the synchronous LDG chain | kills the 34% long-scoreboard head-on for short CTAs |
+| 6 | (later) | smem aliasing (sO over sQ like hpc's 64KB budget) to lift occupancy at long seqs | polish |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
@@ -224,17 +256,3 @@ Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 long/serving shapes compare against hpc-ops' *different* kernel (warp_spec) and are
 informational only.
 
----
-
-## Other exercises (scaffolds, not yet verified)
-
-> Note: the dense-form prefill scaffolds (ex.2 warpspec, ex.4 fp8) were deleted
-> when the project went varlen-only — prefill keeps just ex.1 varlen.
-
-| Exercise | File | Status | Notes |
-|---|---|---|---|
-| 3 | decode_bf16_splitk.py | 🚧 | decode + paged KV + split-K + LSE combine. Class-based, identity-tensor causal, RS PV (64,128,16). Not compile-tested after rewrite. |
-| 5 | decode_fp8.py | 🚧 | FP8 decode, QK=SS/SV=RS. Not yet wired. |
-
-Once ex.1 hits a stable optimized tag (v4+), the TMA/double-buffer pattern is ported to
-each scaffold before profiling it. Per-exercise tables land here as each becomes verified.
