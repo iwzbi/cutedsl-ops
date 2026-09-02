@@ -19,21 +19,29 @@ NOTE: both kernels skip the causal upper triangle via `kv_limit`, so this formul
 overcounts their work equally at M≈N (hpc-ops reports >100% peak for exactly this
 reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
 
-| Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v1-varlen | ex.1 v2-TMA | v2 vs hpc |
-|---|---|---|---|---|
-| (4,4,128,[512]) | 0.030 ms / 17.9T | 1.108 ms / 0.5T | **0.070 / 7.7T** | 2.4x slower |
-| (8,8,128,[1024]) | 0.055 / 80.0T | 2.844 / 1.5T | **0.128 / 34.3T** | 2.3x slower |
-| (4,1,128,[512]) GQA | 0.030 / 17.9T | 1.107 / 0.5T | **0.070 / 7.7T** | 2.4x slower |
-| (4,4,128,[2048,2048]) | 0.090 / 191T | 11.49 / 1.5T | **0.262 / 65.6T** | 2.9x slower |
-| (8,2,128,[4096]) GQA | 0.286 / 240T | 37.6 / 1.8T | **0.594 / 115.7T** | 2.1x slower |
-| (4,4,128,[512]*16) | 0.059 / 146T | — | **0.362 / 23.7T** | 6.1x slower |
+| Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v2-TMA | v2 vs hpc |
+|---|---|---|---|
+| **(4,4,128,[512])** single batch | 0.030 ms / 18.1T (12%) | **0.070 ms / 7.6T (5%)** | 2.4x slower |
+| **(8,8,128,[1024])** single batch | 0.053 / 80.6T (55%) | **0.128 / 33.5T (23%)** | 2.4x slower |
+| **(4,1,128,[512])** GQA | 0.029 / 18.2T | **0.070 / 7.7T** | 2.4x slower |
+| **(1,1,128,[512])** single head | 0.029 / 4.7T | **0.072 / 1.9T** | 2.5x slower |
+| **(4,4,128,[4096])** long seq | 0.165 / 208.0T (>peak) | **0.350 / 98.1T (66%)** | 2.1x slower |
+| **(8,2,128,[4096])** GQA long | 0.288 / 238.6T (>peak) | **0.593 / 115.8T (78%)** | **2.1x slower** |
+| **(4,4,128,[512,768])** unequal | 0.044 / 39.5T | **0.120 / 14.6T** | 2.7x slower |
+| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | **0.066 / 4.6T** | 2.6x slower |
+| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.0T | **0.110 / 8.8T** | 3.2x slower |
+| **(4,1,128,[512]×4)** GQA×4 | 0.036 / 60.3T | **0.109 / 19.7T** | 3.1x slower |
+| **(4,4,128,[2048,2048])** | 0.090 / 190.2T | **0.263 / 65.4T (44%)** | 2.9x slower |
+| **(4,4,128,[512]×8)** serving | 0.040 / 107.8T | **0.196 / 21.9T** | 4.9x slower |
+| **(8,8,128,[1024]×8)** serving | 0.164 / 209.8T | **0.775 / 44.3T** | 4.7x slower |
+| **(4,4,128,[512]×16)** serving | 0.059 / 145.4T | **0.364 / 23.6T** | 6.2x slower |
 
 ### Key takeaways
 - **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
   equal/unequal/misaligned, GQA 1..16 groups, 64→4096 seqs) via `run_prefill.py`,
   5 test_varlen cases, and 14×3-way agreement (torch/hpc-ops/cutedsl) via compare_hpcops.py.
 - **v1→v2 (TMA multi-stage): 16-100x faster** — the serial-load bottleneck is gone;
-  the gap to hpc-ops collapsed from 37-132x to **2.1-6.1x**.
+  the gap to hpc-ops collapsed from 37-132x to **2.1-6.2x**.
 - Remaining gap is *not* causal skipping (both kernels already cap KV via `kv_limit`):
   it is single-warpgroup issue width + softmax/MMA serialization (→ ex.2 warp-spec)
   and small-grid / bandwidth effects on long sequences (→ num_stages, split-K tuning).
@@ -128,11 +136,12 @@ overlap across KV blocks.
 | Shape | v1 ms | v2 ms | v2 speedup vs v1 | vs hpc-ops |
 |---|---|---|---|---|
 | 512² | 1.108 | 0.070 | **15.8x** | 2.4x slower |
-| 1024² | 2.844 | 0.128 | **22.2x** | 2.3x slower |
-| 4096² GQA | 37.6 | 0.594 | **63x** | 2.1x slower |
-| 2048²×2 | 11.49 | 0.262 | **44x** | 2.9x slower |
+| 1024² | 2.844 | 0.128 | **22.2x** | 2.4x slower |
+| 4096² GQA | 37.6 | 0.593 | **63x** | 2.1x slower |
+| 2048²×2 | 11.49 | 0.263 | **44x** | 2.9x slower |
+| [512]×16 | — | 0.364 | — | 6.2x slower |
 
-Multi-batch shapes drift further behind (up to 6.1x on [512]×16): more CTAs than
+Multi-batch shapes drift further behind (up to 6.2x on [512]×16): more CTAs than
 SMs, each CTA's single warpgroup issues both TMA prefetch and WGMMA/softmax
 serially — the warp-specialized overlap (load-WG vs compute-WG) is exactly what
 ex.2/hpc-ops add; see Step 3.
