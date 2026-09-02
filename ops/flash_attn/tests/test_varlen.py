@@ -6,6 +6,7 @@ segment to a BLK_M=64 multiple — required by the kernel; see kernel docstring)
 """
 
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from cutlass import cute
 from common.cute_runtime import make_cute_tensor, make_stream
 from ops.flash_attn.kernels.prefill_bf16_multistage import FlashAttnPrefillBf16Multistage
 from ops.flash_attn.reference import allclose, pack_varlen
+
+
+SPLIT = int(os.environ.get("FA_SPLIT", "1"))
 
 
 def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
@@ -35,8 +39,13 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
     # Padded offsets for slicing the (real-length) result segments back out.
     padded_offsets = cu_seqlens.cpu().to(torch.int64).numpy()
 
-    inst = FlashAttnPrefillBf16Multistage()
-    print(f"Compiling varlen(B={B},H_q={H_q},H_kv={H_kv},seq={seqlens_list},max={pad_to},D={D}) ...")
+    t_pad = o_cat.shape[0]
+    po = torch.empty(t_pad, H_q, SPLIT, D, device="cuda", dtype=torch.float32)
+    pm = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
+    pl = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
+
+    inst = FlashAttnPrefillBf16Multistage(split_k=SPLIT)
+    print(f"Compiling varlen(B={B},H_q={H_q},H_kv={H_kv},seq={seqlens_list},max={pad_to},D={D},split={SPLIT}) ...")
     compiled = cute.compile(
         inst,
         make_cute_tensor(q_cat, leading_dim=2),
@@ -45,6 +54,9 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
         make_cute_tensor(o_cat, leading_dim=2),  # (padded_total, H_q, D)
         make_cute_tensor(seqlens, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
+        make_cute_tensor(po, leading_dim=3),
+        make_cute_tensor(pm, leading_dim=2),
+        make_cute_tensor(pl, leading_dim=2),
         make_stream(),
         v_t.shape[3],
         H_q,
@@ -52,7 +64,7 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
         D,
         options="--enable-tvm-ffi --generate-line-info",
     )
-    compiled(q_cat, k_cat, v_t, o_cat, seqlens, cu_seqlens)
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens, cu_seqlens, po, pm, pl)
     torch.cuda.synchronize()
 
     kk = k.repeat_interleave(H_q // H_kv, dim=1)

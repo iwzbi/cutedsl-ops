@@ -23,6 +23,7 @@ shared with run_prefill.py — the same list drives correctness and benchmark.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import hpc
@@ -104,17 +105,23 @@ def _run_hpcops(q, k, v, seqlens, H_q, D):
     return flat, ms
 
 
-def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D):
+def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split=1):
     """Run cutedsl ex.1 varlen prefill on the SAME logical inputs as hpc-ops.
 
     Inputs are the BLK_M=64-padded flatten + padded cu_seqlens (kernel
     precondition); output is sliced back to real lengths and concatenated in
-    the same (total_real, H, D) segment order.
+    the same (total_real, H, D) segment order.  `split` is the split-KV factor
+    (grid z); split=1 keeps the fused epilogue and the workspace is unused.
     """
     q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens = pack_varlen(q, k, v, seqlens)
     pad_offsets = cu_seqlens.cpu().numpy()
 
-    instance = FlashAttnPrefillBf16Multistage()
+    t_pad = o_cat.shape[0]
+    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
+    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
+    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
+
+    instance = FlashAttnPrefillBf16Multistage(split_k=split)
     compiled = cute.compile(
         instance,
         make_cute_tensor(q_cat, leading_dim=2),
@@ -123,6 +130,9 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D):
         make_cute_tensor(o_cat, leading_dim=2),
         make_cute_tensor(seqlens_t, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
+        make_cute_tensor(po, leading_dim=3),
+        make_cute_tensor(pm, leading_dim=2),
+        make_cute_tensor(pl, leading_dim=2),
         make_stream(),
         v_t.shape[3],
         H_q,
@@ -130,14 +140,14 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D):
         D,
         options="--enable-tvm-ffi --generate-line-info",
     )
-    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
     torch.cuda.synchronize()
 
     segs = [o_cat[int(pad_offsets[b]) : int(pad_offsets[b]) + seqlens[b]] for b in range(len(seqlens))]
     flat = torch.cat(segs, dim=0).contiguous()  # (total_real, H, D)
 
     def _call():
-        compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
+        compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
 
     ms = cuda_bench(_call)
     return flat, ms
@@ -161,6 +171,11 @@ def main():
         idx = sys.argv.index("--shapes") + 1
         shape_indices = [int(x) for x in sys.argv[idx].split(",")]
     shapes = PREFILL_SHAPES if shape_indices is None else [PREFILL_SHAPES[i] for i in shape_indices]
+
+    split = int(os.environ.get("FA_SPLIT", "1"))
+    if "--split" in sys.argv:
+        split = int(sys.argv[sys.argv.index("--split") + 1])
+    print(f"  cutedsl split_k = {split}")
 
     print(f"\n{'Shape':<40} {'H':>3} {'Hkv':>4} {'D':>4} {'B':>3} {'max_s':>6}")
     print("-" * 100)
@@ -191,7 +206,7 @@ def main():
         hpc_peak_pct = hpc_tflops / gpu["peak_fp16_tflops"] * 100
 
         # cutedsl ex.1 (varlen, padded inputs — precision compared on real segs)
-        cute_out, cute_ms = _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D)
+        cute_out, cute_ms = _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split)
         cute_tflops = flops / cute_ms / 1e9
         cute_peak_pct = cute_tflops / gpu["peak_fp16_tflops"] * 100
 

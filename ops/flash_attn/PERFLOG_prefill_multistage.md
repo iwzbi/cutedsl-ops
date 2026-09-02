@@ -237,8 +237,65 @@ by grid=32 on these shapes, which is why even *it* only reaches 12% peak at 512�
 **Implication → Step 4 (split-K)**: splitting the KV range across `split ∈ {2,4}`
 CTAs (grid z) + LSE combine multiplies the CTA count exactly where shapes are
 small (32→64/128 CTAs fills the GPU; 512², [512]×4, [512,768], GQA×3 all gain),
-and shrinks each CTA's serial KV-tile chain. Secondary lever from the long-scoreboard
-finding: make the Q load TMA/async so tile-0's QK can overlap Q-in-flight.
+and shrinks each CTA's serial KV-tile chain. *(Step 4 tested this — the split-K
+prediction was wrong for all but one shape; see Step 4. The long-scoreboard
+secondary lever stands and becomes Step 5.)*
+
+---
+
+## Step 4: ❌ split-KV — full implementation, negative result (kept off by default)
+
+**Tag**: `flash-ex1-v4-splitk` (infra retained; `split_k=1` default = v3 behavior)
+
+### What was built (verified correct, fully wired)
+- Main kernel gains `split_k` (grid z): each CTA owns KV tile range
+  `[s·⌈nb/S⌉ … ]` via `kv_lo/kv_hi = s_idx*num_n_blocks//split_k` — disjoint spans,
+  zero duplicated math. `kv_limit`/causal mask/c_idx semantics unchanged.
+- split_k>1 epilogue writes **fp32 partials** (unnormalized `tCrO` → `PO (T,H_q,S,D)`,
+  row max `Pm`, row sum `Pl`) via a second `make_tiled_copy_C`; empty spans store
+  (0, −inf, 0) naturally. A separate `combine_kernel` (grid (T,H_q)×128) does the
+  LSE merge: `M=max_s Pm`, `w_s=exp2(scale·(Pm_s−M))`, `O=Σ w·PO / Σ w·Pl`.
+- Harness: `FA_SPLIT` env / `--split` CLI across run_prefill / compare_hpcops /
+  test_varlen; `pick_split()` helper available. Correctness: split∈{1,2,4} →
+  run_prefill 14/14 + test_varlen 5/5 + compare 3-way all Success.
+
+### A/B bench (8 multi-stage shapes, cute ms; v3 = split 1)
+
+| Shape | v3 | s2 | s4 | s8 |
+|---|---|---|---|---|
+| (4,4,128,[512]) | 0.071 | 0.072 | 0.106 | 0.188 |
+| (8,8,128,[1024]) | 0.130 | 0.209 | 0.327 | 0.612 |
+| (4,1,128,[512]) GQA | 0.071 | 0.073 | 0.106 | 0.188 |
+| **(1,1,128,[512])** single head | 0.073 | 0.070 | 0.067 | **0.066** ✓ |
+| [512,768] | 0.120 | 0.156 | 0.234 | 0.397 |
+| [200,328] | 0.068 | 0.107 | 0.146 | 0.227 |
+| [256,384,512] | 0.110 | 0.152 | 0.193 | 0.353 |
+| [512]×4 | 0.110 | 0.199 | 0.319 | 0.603 |
+| (4,4,128,[4096]) † | 0.350 | 0.456 | — | — |
+| (4,4,128,[2048,2048]) † | 0.262 | 0.381 | — | — |
+
+† long-loop control shapes: also *slower* at s2 — the negative result is not a
+short-kernel artifact. Only the genuinely under-occupied single-head shape improves.
+
+### ncu attribution (split=2, (4,4,128,[512]))
+- `combine_kernel` Duration = **4.2 us** — the combine is cheap, *not* the problem.
+- Main kernel Duration: 71 us (v3, 32 CTA) → **83 us** (s2, 64 CTA) — splitting
+  *doubled* the CTAs yet the main kernel got **17% slower** even though each CTA
+  runs half the loop.
+
+### Why the hypothesis died
+Per-CTA **fixed cost dominates the critical path**: synchronous `autovec_copy` Q
+load (34% long-scoreboard in Step 3.5), first-tile TMA wait, and prologue/epilogue
+drain. Halving the loop body saves the *minority* of the time; meanwhile each
+split CTA re-pays the full Q load (×S gmem traffic) and the partials write
+(PO fp32 = 2 MB per split × S). CTA-count breadth cannot help when every CTA is
+latency-serial inside itself. This is fully consistent with v3's three knobs
+being neutral and with the split=2 main kernel slowing down.
+
+**Take-away**: the binding constraint is the per-CTA latency chain, not grid size.
+Step 3.5's secondary lever is promoted: **Step 5 = async Q load (v5-qasync)** —
+and only after the CTA critical path is short does split-KV deserve a re-test
+(it's kept as ready infrastructure behind `split_k`).
 
 ---
 
@@ -246,9 +303,9 @@ finding: make the Q load TMA/async so tile-0's QK can overlap Q-in-flight.
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
-| 4 | flash-ex1-v4-splitk | split-KV across grid z (2/4) + LSE combine; grid fills the 78-SM machine on small shapes | big win on the 8 multi-stage shapes (tensor pipe 0.55% → utilization by breadth) |
-| 5 | flash-ex1-v5-qasync | Q load via TMA (or cp.async pipeline) so QK tile-0 doesn't pay the synchronous LDG chain | kills the 34% long-scoreboard head-on for short CTAs |
-| 6 | (later) | smem aliasing (sO over sQ like hpc's 64KB budget) to lift occupancy at long seqs | polish |
+| ~~4~~ | ~~flash-ex1-v4-splitk~~ | ~~split-KV across grid z + LSE combine~~ | ❌ DONE — negative result, see Step 4; infra kept behind `split_k` |
+| 5 | flash-ex1-v5-qasync | Q load via TMA (or cp.async pipeline) so QK tile-0 doesn't pay the synchronous LDG chain | kills the 34% long-scoreboard head-on — now the primary lever per Step 4 |
+| 6 | (later) | smem aliasing (sO over sQ like hpc's 64KB budget) to lift occupancy at long seqs; re-test split-KV *after* v5 shortens the CTA critical path | polish |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
