@@ -53,6 +53,25 @@ PREFILL_SHAPES = [
     (4, 4, 128, [512] * 8),  # 8 batches, small seq
     (8, 8, 128, [1024] * 8),  # 8 batches MHA
     (4, 4, 128, [512] * 16),  # 16 batches
+    # --- Llama-3-8B-class (32 Q / 8 KV heads, GQA 4:1, d=128) -------------
+    # Industry-standard bench axis (FA / FlashInfer / NVIDIA blogs): keep the
+    # TOTAL token budget ~16k and sweep (batch, seqlen).  These grids are big
+    # (>=8k CTAs) — hpc-ops dispatches them to its warp_spec kernel, so the
+    # †-region caveat applies; included for honest representativeness.
+    (32, 8, 128, [512] * 32),  # 16k tokens, 512 seqs
+    (32, 8, 128, [1024] * 16),  # 16k tokens, 1k seqs
+    (32, 8, 128, [2048] * 8),  # 16k tokens, 2k seqs
+    (32, 8, 128, [4096] * 4),  # 16k tokens, 4k seqs
+    (32, 8, 128, [8192] * 2),  # 16k tokens, 8k seqs
+    (32, 8, 128, [16384]),  # single 16k seq (long-context edge)
+    # --- realistic varlen distributions (FlashInfer-style) -----------------
+    (
+        32,
+        8,
+        128,
+        [736, 1920, 512, 3392, 1152, 2688, 640, 4096, 1536, 2944, 832, 2176, 1024, 3712, 1280, 2560],
+    ),  # ~U(512,4k)
+    (32, 8, 128, [128, 256, 384, 512, 640, 768, 1024, 1536, 2048, 3072, 4096, 6144]),  # zipf-like skew
 ]
 
 

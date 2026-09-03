@@ -71,7 +71,7 @@ kernel 以 64 行为粒度切分 gmem 且 mask 用 batch-local 坐标；若 batc
 
 ```bash
 make quality                              # ruff 检查/格式（无需 GPU，唯一 CI 门）
-python ops/flash_attn/run_prefill.py                    # ex.1 varlen 正确性(8 shape)
+python ops/flash_attn/run_prefill.py                    # ex.1 varlen 正确性(全部 PREFILL_SHAPES)
 python ops/flash_attn/tests/test_varlen.py               # varlen 正确性(5 case, 含非对齐 seq)
 python ops/flash_attn/compare_hpcops.py [--shapes 0,1]   # 3-way: torch SDPA / hpc-ops / 本仓库
 ```

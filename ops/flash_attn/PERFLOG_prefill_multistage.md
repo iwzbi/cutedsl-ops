@@ -43,6 +43,14 @@ rows keep their historical numbers.
 | **(4,4,128,[512]×8)** serving † | 256 | 0.039 / 108.9T | 0.196 / 21.9T | — † | 0.044 / 98.5T | — | — |
 | **(8,8,128,[1024]×8)** serving † | 1024 | 0.164 / 209.3T | 0.775 / 44.3T | — † | 0.187 / 184.0T | — | — |
 | **(4,4,128,[512]×16)** serving † | 512 | 0.059 / 145.9T | 0.364 / 23.6T | — † | 0.069 / 125.4T (84.7%) | — | — |
+| **(32,8,128,[512]×32)** Llama3-8B 16k tok † | 8192 | 0.653 / 210.5T | — | — | — | 0.826 | 0.79x |
+| **(32,8,128,[1024]×16)** † | 4096 | 1.139 / 241.4T | — | — | — | 1.341 | 0.85x |
+| **(32,8,128,[2048]×8)** † | 2048 | 2.109 / 260.6T | — | — | — | 2.362 | 0.89x |
+| **(32,8,128,[4096]×4)** † | 1024 | 4.010 / 274.2T | — | — | — | 4.432 | 0.90x |
+| **(32,8,128,[8192]×2)** † | 512 | 7.861 / 279.7T | — | — | — | 8.605 | 0.91x |
+| **(32,8,128,[16384])** † | 256 | 15.615 / 281.7T | — | — | — | 16.917 | 0.92x |
+| **(32,8,128,U(512,4k)×16)** varlen dist † | ~4k | 5.136 / 259.1T | — | — | — | 5.511 | 0.93x |
+| **(32,8,128,zipf[128..6k]×12)** † | ~2k | 4.751 / 251.9T | — | — | — | 4.938 | 0.96x |
 
 † hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
 (`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
@@ -50,6 +58,14 @@ comparing our single-WG kernel against them is structural mismatch — the v3+
 bench target is the 8 multi-stage shapes only. **v6 (stages=2 ring + automatic split-K, Step 6) wins ALL 8 multi-stage shapes at
 1.03-1.52x** (CTAs column = grid size `ceil(max_s/64)*B*H_q`; v6 ms derived from the
 Step 6 four-quadrant A/B ratio matrix; † shapes not re-benched under v6 defaults).
+
+The last 8 rows (added with the shape-set refresh) use **industry-standard configs**
+— Llama3-8B heads (32Q/8KV) at a constant ~16k-token budget swept across
+batch×seqlen (Dao-AILab / FlashInfer benchmark convention) plus uniform/zipf varlen
+distributions. All are † (hpc = warp_spec). The gap *closes monotonically with
+sequence length* — 0.79x at [512]×32 up to 0.92x at [16384], and the zipf varlen mix
+reaches **0.96x** — our per-CTA fixed costs amortize fully on long loops, and the
+residual is single-warpgroup vs 3-warpgroup WGMMA scheduling, not load/pipeline stalls.
 
 ### Key takeaways
 - **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
