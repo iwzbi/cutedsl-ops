@@ -53,6 +53,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cuda.bindings.driver import CUstream
 from cutlass import cute, pipeline
 from cutlass.cute.nvgpu.warpgroup import OperandMajorMode, OperandSource
+from cutlass.experimental import primitives as prims
 from cutlass.utils.layout import LayoutEnum
 
 
@@ -77,8 +78,8 @@ class FlashAttnPrefillBf16Multistage:
     def __init__(self, num_stages: int = NUM_STAGES, split_k: int = 1):
         self.num_stages = num_stages
         # split-KV: the KV range of each Q-tile is cut into `split_k` disjoint
-        # spans handled by independent CTAs (grid z), merged by an LSE-combine
-        # kernel.  1 = classic single-CTA-per-tile fused path (no partials).
+        # spans handled by the CTAs of a `split_k`-CTA cluster (grid z); v12
+        # merges them in-kernel over DSMEM (no combine kernel when split_k=2).  1 = classic single-CTA-per-tile fused path (no partials).
         self.split_k = split_k
         self.q_dtype = cutlass.BFloat16
         self.kv_dtype = cutlass.BFloat16
@@ -166,11 +167,7 @@ class FlashAttnPrefillBf16Multistage:
         mO_tma: cute.Tensor,
         mSeqlens: cute.Tensor,
         mCuSeqlens: cute.Tensor,
-        mPO: cute.Tensor,
-        mPm: cute.Tensor,
-        mPl: cute.Tensor,
         r2s_tiled_copy_o: cute.TiledCopy,
-        r2s_tiled_copy_po: cute.TiledCopy,
         sQ_layout_staged: cute.ComposedLayout,
         sK_layout_staged: cute.ComposedLayout,
         sV_layout_staged: cute.ComposedLayout,
@@ -338,8 +335,8 @@ class FlashAttnPrefillBf16Multistage:
             num_n_blocks = (kv_limit + BLK_N - 1) // BLK_N
             num_tile_kv = (q_len + BLK_N - 1) // BLK_N  # total padded KV tiles (mask guard)
             # split-KV: this CTA (grid z = s_idx) owns tile span [kv_lo, kv_hi).
-            # The split is disjoint (zero redundant compute); an LSE combine
-            # kernel merges the partials afterwards.  split_k == 1 gives the
+            # The split is disjoint (zero redundant compute); the cluster
+            # peer merges partials in-kernel over DSMEM (v12).  split_k == 1 gives the
             # fused whole-range path.
             kv_lo = (s_idx * num_n_blocks) // self.split_k
             kv_hi = ((s_idx + 1) * num_n_blocks) // self.split_k
@@ -563,83 +560,81 @@ class FlashAttnPrefillBf16Multistage:
                         # before kernel exit — waiting only delayed retire
                         # (~3-4% on dense long-seq grids).
             else:
-                # split-KV partial epilogue: write the UN-normalized fp32 O
-                # tile to PO, plus per-row running max (Pm) and running sum
-                # (Pl).  An LSE-combine kernel merges the split_k partials.
-                # Empty-span CTAs (kv_lo==kv_hi) naturally write O=0, m=-inf,
-                # l=0, which the combine weights to zero.
-                thr_r2s_po = r2s_tiled_copy_po.get_slice(tidx)
-                mPO_s = mPO[(None, None, s_idx, None)]
-                gPO = cute.local_tile(mPO_s, (BLK_M, 1, Dd), (q_row0 // BLK_M, h_q, 0))
-                tDrPO = thr_r2s_po.retile(tCrO)
-                tDgPO = thr_r2s_po.partition_D(cute.group_modes(gPO, 0, 2))
-                cute.copy(r2s_tiled_copy_po, tDrPO, tDgPO)
+                # ---- v12: in-kernel cluster merge (replaces gmem partials +
+                # LSE-combine kernel). grid z = this CTA's cluster rank; the
+                # peer CTA (rank 1-rank) owns the other KV span of the SAME
+                # Q-tile. Partial O/m/l stay on-chip: each CTA writes its own
+                # smem, a non-relaxed cluster barrier publishes them, both
+                # CTAs redundantly LSE-merge the full 64xD tile over DSMEM,
+                # and rank 0 alone TMA-stores the result. A second barrier
+                # pair at the tail keeps peer smem alive until the reads are
+                # done (probe r4 lesson: peers may otherwise retire first).
+                rank = cute.arch.block_idx_in_cluster()
+                peer_rk = cutlass.Int32(self.split_k - 1) - rank
+                sPart = cutlass.Array(
+                    cutlass.Float32,
+                    (BLK_M, Dd),
+                    space=cutlass.AddressSpace.smem,
+                    alignment=16,
+                )
+                sPm = cutlass.Array(cutlass.Float32, BLK_M, space=cutlass.AddressSpace.smem)
+                sPl = cutlass.Array(cutlass.Float32, BLK_M, space=cutlass.AddressSpace.smem)
+                # local batch-row of fragment row i (identity coords, v4 style)
                 g_idx0 = cute.local_tile(c_idx, (BLK_M, BLK_N), (bid_m, 0))
                 tIdx0 = qk_thr.partition_C(g_idx0)
                 idx0 = cute.make_tensor(tIdx0.iterator, self.layout_acc_mn(qk_tiled_mma, tIdx0.layout))
+                # (m, d) coords of every PV accumulator element
+                c_out = cute.make_identity_tensor((BLK_M, Dd))
+                tIdxO = pv_thr.partition_C(c_out)
+                idxO = cute.make_tensor(tIdxO.iterator, self.layout_acc_mn(pv_tiled_mma, tIdxO.layout))
                 for i in cutlass.range_constexpr(qk_m):
-                    row = q_start + idx0[i, 0][0]
-                    mPm[(row, h_q, s_idx)] = s_max[i]
-                    mPl[(row, h_q, s_idx)] = a_sum[i]
-
-    @cute.kernel
-    def combine_kernel(
-        self,
-        mPO: cute.Tensor,  # (T_pad, H_q, S, D) fp32 partial O (un-normalized)
-        mPm: cute.Tensor,  # (T_pad, H_q, S) fp32 partial row max
-        mPl: cute.Tensor,  # (T_pad, H_q, S) fp32 partial row sum
-        mO: cute.Tensor,  # (T_pad, H_q, D) bf16 final output
-        scale_log2: cutlass.Float32,
-        SplitK: cutlass.Constexpr[int],
-        H_q: cutlass.Constexpr[int],
-        Dd: cutlass.Constexpr[int],
-    ):
-        """LSE merge across split-KV partials. One CTA per (row, head);
-        thread d owns output column d.  O = sum_s w_s*PO_s / sum_s w_s*Pl_s
-        with w_s = exp2(scale_log2*(m_s - M)), M = max_s m_s (w_s=0 when
-        m_s=-inf, all-inf rows emit 0)."""
-        # v7: thread (tx, ty) merges row = bx*ROWS + ty across cols
-        # [tx*VEC, (tx+1)*VEC) so PO loads / O stores are VEC-wide vectors.
-        # T_pad is 64-aligned, so ROWS divides the row grid exactly.
-        VEC: cutlass.Constexpr[int] = 4
-        ROWS: cutlass.Constexpr[int] = 4
-        # PDL pair of the combine launch's use_pdl=True (see __call__): block
-        # until every main-kernel write to PO/Pm/Pl is visible.
-        cute.arch.griddepcontrol_wait()
-        tx, ty, _ = cute.arch.thread_idx()
-        bx, h, _ = cute.arch.block_idx()
-        row = bx * ROWS + ty
-        d0 = tx * VEC
-
-        m_max = mPm[(row, h, 0)]
-        for s in cutlass.range_constexpr(1, SplitK):
-            m_max = cutlass.max(m_max, mPm[(row, h, s)])
-
-        acc = cute.make_rmem_tensor((VEC,), cutlass.Float32)
-        for j in cutlass.range_constexpr(VEC):
-            acc[j] = cutlass.Float32(0.0)
-        if m_max != float("-inf"):
-            l_sum = cutlass.Float32(0.0)
-            frag = cute.make_rmem_tensor((VEC,), cutlass.Float32)
-            for s in cutlass.range_constexpr(SplitK):
-                m_s = mPm[(row, h, s)]
-                w = cute.math.exp2(scale_log2 * (m_s - m_max), fastmath=True)
-                if m_s == float("-inf"):
-                    w = cutlass.Float32(0.0)
-                l_sum = l_sum + w * mPl[(row, h, s)]
-                tile = cute.local_tile(mPO, (1, 1, 1, VEC), (row, h, s, tx))
-                cute.autovec_copy(tile, frag)
-                for j in cutlass.range_constexpr(VEC):
-                    acc[j] = acc[j] + w * frag[j]
-            inv = cute.arch.rcp_approx(l_sum)
-            if l_sum == 0.0 or l_sum != l_sum:  # noqa: PLR0124
-                inv = 1.0
-            for j in cutlass.range_constexpr(VEC):
-                acc[j] = acc[j] * inv
-        out = cute.make_rmem_tensor((VEC,), self.o_dtype)
-        out.store(acc.load().to(self.o_dtype))
-        o_tile = cute.local_tile(mO, (1, 1, VEC), (row, h, tx))
-        cute.autovec_copy(out, o_tile)
+                    rl = idx0[i, 0][0]
+                    sPm[rl] = s_max[i]
+                    sPl[rl] = a_sum[i]
+                    for j in cutlass.range_constexpr(pv_n):
+                        sPart[idxO[i, j][0], idxO[i, j][1]] = acc_pv_mn[i, j]
+                prims.barrier_cta_sync(0)
+                prims.barrier_cluster_arrive()
+                prims.barrier_cluster_wait()
+                pPart = prims.mapa(sPart.data_ptr(), peer_rk)
+                pPm = prims.mapa(sPm.data_ptr(), peer_rk)
+                pPl = prims.mapa(sPl.data_ptr(), peer_rk)
+                for i in cutlass.range_constexpr(qk_m):
+                    rl = idx0[i, 0][0]
+                    m0 = sPm[rl]
+                    m1 = (pPm + rl).load()
+                    mmax = cutlass.max(m0, m1)
+                    if mmax == float("-inf"):
+                        for j in cutlass.range_constexpr(pv_n):
+                            acc_pv_mn[i, j] = cutlass.Float32(0.0)
+                    else:
+                        w0 = cute.math.exp2(scale_val * (m0 - mmax), fastmath=True)
+                        w1 = cute.math.exp2(scale_val * (m1 - mmax), fastmath=True)
+                        if m0 == float("-inf"):
+                            w0 = cutlass.Float32(0.0)
+                        if m1 == float("-inf"):
+                            w1 = cutlass.Float32(0.0)
+                        l_sum = w0 * sPl[rl] + w1 * (pPl + rl).load()
+                        inv = cute.arch.rcp_approx(l_sum)
+                        if l_sum == 0.0 or l_sum != l_sum:  # noqa: PLR0124
+                            inv = cutlass.Float32(1.0)
+                        for j in cutlass.range_constexpr(pv_n):
+                            pv = (pPart + idxO[i, j][0] * Dd + idxO[i, j][1]).load()
+                            acc_pv_mn[i, j] = (w0 * acc_pv_mn[i, j] + w1 * pv) * inv
+                if rank == 0:
+                    acc_o_bf16 = cute.make_fragment_like(tCrO, self.o_dtype)
+                    acc_o_bf16.store(tCrO.load().to(self.o_dtype))
+                    tDrO = thr_r2s_o.retile(acc_o_bf16)
+                    tDsO = thr_r2s_o.partition_D(sO)
+                    cute.copy(r2s_tiled_copy_o, tDrO, tDsO)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_threads()
+                    if warp_idx == 0:
+                        with cute.arch.elect_one():
+                            cute.copy(tma_atom_o, tOsO[None], tOgO[None, q_row0 // BLK_M])
+                # keep this cluster (and peer smem) alive past all DSMEM reads
+                prims.barrier_cluster_arrive_relaxed()
+                prims.barrier_cluster_wait()
 
     @cute.jit
     def __call__(
@@ -650,9 +645,6 @@ class FlashAttnPrefillBf16Multistage:
         mO: cute.Tensor,
         mSeqlens: cute.Tensor,
         mCuSeqlens: cute.Tensor,
-        mPO: cute.Tensor,
-        mPm: cute.Tensor,
-        mPl: cute.Tensor,
         stream: CUstream,
         max_seqlens: cutlass.Constexpr[int],
         H_q: cutlass.Constexpr[int],
@@ -663,7 +655,8 @@ class FlashAttnPrefillBf16Multistage:
 
         MMA/SMEM setup identical across exercises; grid is
         (ceil(max_seqlens/BLK_M), B * H_q, split_k) with per-batch guard;
-        split_k > 1 additionally launches the LSE combine kernel.
+        split_k > 1 runs the z-CTAs as one cluster and merges partials
+        in-kernel over DSMEM (v12).
         """
         bf16 = self.q_dtype
         f32 = self.acc_dtype
@@ -688,8 +681,6 @@ class FlashAttnPrefillBf16Multistage:
         universal = cute.nvgpu.CopyUniversalOp()
         copy_atom = cute.make_copy_atom(universal, bf16)
         r2s_o = cute.make_tiled_copy_C(copy_atom, pv_mma)
-        copy_atom_po = cute.make_copy_atom(universal, f32)
-        r2s_po = cute.make_tiled_copy_C(copy_atom_po, pv_mma)
 
         # SMEM layouts: swizzled layout atoms created via hopper_helpers, then
         # tile_to_shape fixes the tile extent. q_atom (K-major, D contiguous)
@@ -802,11 +793,7 @@ class FlashAttnPrefillBf16Multistage:
             tma_tensor_o,
             mSeqlens,
             mCuSeqlens,
-            mPO,
-            mPm,
-            mPl,
             r2s_o,
-            r2s_po,
             sQ_layout_staged,
             sK_layout_staged,
             sV_layout_staged,
@@ -819,32 +806,12 @@ class FlashAttnPrefillBf16Multistage:
             max_seqlens,
             Dd,
             SharedStorage,
-        ).launch(grid=grid, block=(NUM_THREADS, 1, 1), stream=stream)
-
-        # One CTA per padded (row, head): merge the split-KV partials with an
-        # LSE combine (exp2-rescaled weighted sum of PO / weights of Pl).
-        if cutlass.const_expr(self.split_k > 1):
-            # v11: PDL (programmatic dependent launch). The combine grid is
-            # launched with stream-serialization so the hardware can schedule
-            # its blocks while the main kernel is still finishing; every
-            # combine thread then hits griddepcontrol_wait() before touching
-            # the partials, which is the correctness boundary (all main-block
-            # writes to PO/Pm/Pl are visible after the wait).
-            self.combine_kernel(
-                mPO,
-                mPm,
-                mPl,
-                mO,
-                scale_log2,
-                self.split_k,
-                H_q,
-                Dd,
-            ).launch(
-                grid=((mO.shape[0] + 3) // 4, H_q, 1),
-                block=(Dd // 4, 4, 1),  # tx: column-vec group, ty: row group
-                stream=stream,
-                use_pdl=True,
-            )
+        ).launch(
+            grid=grid,
+            block=(NUM_THREADS, 1, 1),
+            cluster=(1, 1, self.split_k),  # split_k=1 -> trivial (1,1,1) cluster
+            stream=stream,
+        )
 
 
 __all__ = ["BLK_M", "BLK_N", "NUM_THREADS", "D", "FlashAttnPrefillBf16Multistage"]

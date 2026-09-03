@@ -119,11 +119,6 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split=1):
     q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens = pack_varlen(q, k, v, seqlens)
     pad_offsets = cu_seqlens.cpu().numpy()
 
-    t_pad = o_cat.shape[0]
-    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
-    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
-    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
-
     instance = FlashAttnPrefillBf16Multistage(num_stages=int(os.environ.get("FA_STAGES", "2")), split_k=split)
     compiled = cute.compile(
         instance,
@@ -133,9 +128,6 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split=1):
         make_cute_tensor(o_cat, leading_dim=2),
         make_cute_tensor(seqlens_t, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
-        make_cute_tensor(po, leading_dim=3),
-        make_cute_tensor(pm, leading_dim=2),
-        make_cute_tensor(pl, leading_dim=2),
         make_stream(),
         v_t.shape[3],
         H_q,
@@ -143,14 +135,14 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split=1):
         D,
         options="--enable-tvm-ffi --generate-line-info",
     )
-    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
     torch.cuda.synchronize()
 
     segs = [o_cat[int(pad_offsets[b]) : int(pad_offsets[b]) + seqlens[b]] for b in range(len(seqlens))]
     flat = torch.cat(segs, dim=0).contiguous()  # (total_real, H, D)
 
     def _call():
-        compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
+        compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
 
     ms = cuda_bench(_call)
     return flat, ms

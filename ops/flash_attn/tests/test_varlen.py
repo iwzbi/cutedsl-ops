@@ -45,11 +45,6 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
     # Padded offsets for slicing the (real-length) result segments back out.
     padded_offsets = cu_seqlens.cpu().to(torch.int64).numpy()
 
-    t_pad = o_cat.shape[0]
-    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
-    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
-    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
-
     inst = FlashAttnPrefillBf16Multistage(num_stages=STAGES, split_k=split)
     print(f"Compiling varlen(B={B},H_q={H_q},H_kv={H_kv},seq={seqlens_list},max={pad_to},D={D},split={split}) ...")
     compiled = cute.compile(
@@ -60,9 +55,6 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
         make_cute_tensor(o_cat, leading_dim=2),  # (padded_total, H_q, D)
         make_cute_tensor(seqlens, leading_dim=0),
         make_cute_tensor(cu_seqlens, leading_dim=0),
-        make_cute_tensor(po, leading_dim=3),
-        make_cute_tensor(pm, leading_dim=2),
-        make_cute_tensor(pl, leading_dim=2),
         make_stream(),
         v_t.shape[3],
         H_q,
@@ -70,7 +62,7 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
         D,
         options="--enable-tvm-ffi --generate-line-info",
     )
-    compiled(q_cat, k_cat, v_t, o_cat, seqlens, cu_seqlens, po, pm, pl)
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens, cu_seqlens)
     torch.cuda.synchronize()
 
     kk = k.repeat_interleave(H_q // H_kv, dim=1)

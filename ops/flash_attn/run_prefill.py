@@ -89,10 +89,6 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
 
     print("Compiling CuTe DSL (ex.1, bf16 varlen) ...")
     instance = FlashAttnPrefillBf16Multistage(num_stages=STAGES, split_k=split)
-    t_pad = o_cat.shape[0]
-    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
-    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
-    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
     compiled = cute.compile(
         instance,
         # q_cat: (T, H_q, D) bf16, strides (H_q*D, D, 1) — contiguous; T = Σ_b ceil(seq_b/64)*64
@@ -109,9 +105,6 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
         make_cute_tensor(cu_seqlens, leading_dim=0),
         # split-KV workspace (fp32): partial O (T,H_q,S,D) + per-split max/sum
         # (T,H_q,S).  Unused when split==1 but still required by the signature.
-        make_cute_tensor(po, leading_dim=3),
-        make_cute_tensor(pm, leading_dim=2),
-        make_cute_tensor(pl, leading_dim=2),
         make_stream(),
         s_pad,
         H_q,
@@ -119,7 +112,7 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
         D,
         options="--enable-tvm-ffi --generate-line-info",
     )
-    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
+    compiled(q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
     torch.cuda.synchronize()
 
     # Per-batch comparison at real lengths (varlen, always causal).
@@ -135,7 +128,7 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
         ok = allclose(ref_b, seg, atol=ATOL, name=name) and ok
 
     if bench and ok:
-        ms = cuda_bench(compiled, q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens, po, pm, pl)
+        ms = cuda_bench(compiled, q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens)
         # FLOPs use max_s x max_s (the padded causal problem; causal skips the
         # upper triangle so this overcounts — see PERFLOG).
         flops = int(4 * B * H_q * max_s * max_s * D)
