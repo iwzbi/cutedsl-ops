@@ -72,6 +72,9 @@ def gemm_kernel(
     cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
     a_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=1)
     b_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=0)
+    # Static (layout-derived) masks; gated to 0 for non-multicast dims so the
+    # plain-atom copies stay legal. Lesson-12 shape — runtime-conditional
+    # masks hang MLIR (old PERFLOG #17), do not introduce them.
     a_mcast_mask = a_mcast_mask if CLUSTER_N > 1 else cutlass.Int16(0)
     b_mcast_mask = b_mcast_mask if CLUSTER_M > 1 else cutlass.Int16(0)
 
@@ -116,13 +119,29 @@ def gemm_kernel(
     )
     sB_for_tma = cute.group_modes(sB_full, 0, 2)
     gB_for_tma = cute.group_modes(gB, 0, 2)
-    tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
-        tma_atom_b,
-        0,
-        cute.make_layout(1),
-        sB_for_tma,
-        gB_for_tma,
-    )
+    if cutlass.const_expr(CLUSTER_M > 1):
+        # B tiles are shared across cluster-mode-0 (M): partition with the
+        # per-axis cta coord/layout so each CTA issues only its 1/CLUSTER_M
+        # slice; the multicast mask fans every slice into ALL members' sB.
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cta_layout_mnk, (None, 0, 0)).shape,
+        )
+        b_cta_crd = cluster_coord_mnk[0]
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b,
+            b_cta_crd,
+            b_cta_layout,
+            sB_for_tma,
+            gB_for_tma,
+        )
+    else:
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            cute.make_layout(1),
+            sB_for_tma,
+            gB_for_tma,
+        )
     sD_for_tma = cute.group_modes(
         cute.make_tensor(sD.iterator, cute.append(sD.layout, cute.make_layout(1))),
         0,
@@ -181,6 +200,7 @@ def gemm_kernel(
                 tBgB[None, mainloop_prod_state.count],
                 tBsB[None, mainloop_prod_state.index],
                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_prod_state),
+                mcast_mask=b_mcast_mask,
             )
             mainloop_pipeline.producer_commit(mainloop_prod_state)
             mainloop_prod_state.advance()
@@ -236,6 +256,7 @@ def gemm_kernel(
                 tBgB[None, mainloop_prod_state.count],
                 tBsB[None, mainloop_prod_state.index],
                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_prod_state),
+                mcast_mask=b_mcast_mask,
             )
             mainloop_pipeline.producer_commit(mainloop_prod_state)
             mainloop_prod_state.advance()
@@ -300,9 +321,15 @@ def gemm(
     sA_layout_one = cute.slice_(sA_layout_staged, (None, None, 0))
     sB_layout_one = cute.slice_(sB_layout_staged, (None, None, 0))
 
-    # TMA atoms: B uses multicast (cluster M > 1)
+    # TMA atoms: B is multicast along cluster M (both members read the same B
+    # tile; each CTA issues half of it and the DMA broadcasts to both smem
+    # domains — lesson-12 recipe). A is plain G2S (CLUSTER_N == 1).
     a_g2s_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-    b_g2s_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    b_g2s_op = (
+        cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
+        if cutlass.const_expr(CLUSTER_M > 1)
+        else cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    )
     tma_atom_a, tma_tensor_a = cute.nvgpu.cpasync.make_tiled_tma_atom(
         a_g2s_op,
         mA,
@@ -314,6 +341,7 @@ def gemm(
         mB,
         sB_layout_one,
         (BLK_N, BLK_K),
+        num_multicast=max(1, CLUSTER_M),
     )
     tma_atom_d, tma_tensor_d = cute.nvgpu.cpasync.make_tiled_tma_atom(
         cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),

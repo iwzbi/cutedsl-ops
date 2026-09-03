@@ -693,6 +693,15 @@ operations on partitioned tensors.
 
 ### #17: TMA Multicast + Cluster — DSL 4.7.0 two limitations, cancelled
 
+> **[RETRADED 2026-09-03 — see #18 below.]** Multicast IS implementable in DSL
+> 4.7.0: the missing piece was the lesson-12 recipe (`CopyBulkTensorTileG2SMulti
+> castOp` + `tma_partition` on the shared axis + static `make_layout_image_mask`
+> + cluster-aware pipeline arrive counts). The historical RE=70.56% failure
+> reproduces exactly from one wrong `slice_` axis (double full-tile issue), which
+> is what likely killed the original attempt. Measured outcome on H20: mechanism
+> verified in SASS (`UTMALDG.2D.MULTICAST`), performance neutral — GEMM here is
+> compute-bound, so the halved L2 reads have nothing to relieve.
+
 **Goal**: Use `CopyBulkTensorTileG2SMulticastOp` with a 2-CTA cluster. Leader CTA
 issues multicast TMA load for A, broadcasting to both CTAs' smem. Halves gmem
 reads for A tiles. Each CTA computes a different output tile (different bid_n).
@@ -726,6 +735,57 @@ cluster phase management).
 **Learning value**: This experiment taught the Hopper cluster programming model
 (cluster launch, `block_in_cluster_idx`, `cta_layout_vmnk`, multicast TMA masks,
 pipeline arrive-count recalculation) even though the DSL can't compile it yet.
+
+---
+
+### #18: TMA Multicast RESOLVED — real hardware multicast lands; neutral on H20
+
+**Verdict: works, shipped (`gemm-v9-multicast`), gains nothing measurable on
+this GPU — and the 'why nothing' is itself the finding.**
+
+**Method recovered from cutlass-notes lesson 12** (patched 2 `fence_proxy
+(ProxyKind…)` call sites to the string-literal API — the lesson's only staleness;
+it then passes its full 640-case sweep incl K=8192). Recipe ported onto the
+existing cluster kernel (CLUSTER_M=2 shares B across 2 CTAs stacked along grid-y):
+1. host: `make_tiled_tma_atom(CopyBulkTensorTileG2SMulticastOp(), mB, …,
+   num_multicast=CLUSTER_M)` — note `G2SOp + num_multicast=2` is rejected at
+   compile time, so a successful build already proves the multicast op.
+2. device: `tma_partition(b_atom, cta_coord=cluster_coord_mnk[0],
+   cta_layout=make_layout(slice_(cta_layout_mnk,(None,0,0)).shape), …)` — each
+   CTA issues its 1/2 slice of the shared B tile; `b_mcast_mask =
+   make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=0)` (static);
+   copy carries `mcast_mask=b_mcast_mask`.
+3. pipeline: consumer arrive count × `(CLUSTER_M+CLUSTER_N-1)` with the true
+   `cta_layout_vmnk=(1,2,1,1)`; non-multicast side stays (1,1,1,1)-style plain.
+4. lifetime: `pipeline_init_arrive(cluster_shape_mn=(2,1), relaxed)` + wait.
+
+**The bug that had killed it (#17's RE=70.56% reproduced exactly)**: copying
+lesson-12's *B*-branch `slice_(cta_layout_mnk,(0,None,0))` when our shared axis
+is **M** — both CTAs then request the full tile and the pair double-issues,
+whose signature is numerically-correct-but-slower OR ~70% error variants.
+Correct branch shape: `(None,0,0)` + `cluster_coord_mnk[0]` (lesson-12's A-case).
+
+**Evidence chain (idle H20, same-session A/B against the no-mcast cluster
+kernel of the same tree):**
+| shape | no-mcast | mcast |
+|---|---|---|
+| 1024³  | 94.1 T | 93.6 T |
+| 4096³  | 129.7 T | 129.4-129.6 T |
+| 8192²×256 | 102.8 T | 102.5-102.6 T |
+| ncu @4096³ | dram rd 254.7 MB, lts 1.53 GB | 249.9 MB, 1.51 GB |
+SASS: `UTMALDG.2D` (A) + `UTMALDG.2D.MULTICAST` (B) — hardware multicast
+genuinely executes. Correctness: 4/4 shapes (incl 8192²×256 deep-K wraparound),
+RE ≤ 0.01%.
+
+**Why no gain (the actual Hopper-on-H20 lesson)**: every compute-bound shape here
+runs at 2-3% DRAM utilization; the L2 read redundancy multicast removes was never
+the limiter. Multicast pays off on bandwidth-hungry parts (H100/B200 SXM, real
+LLM GEMM N≫M, or *multi-tenant* GPUs where L2/DRAM contention is external —
+H20-with-co-tenant is a poor man's version of that). Also lts__t_bytes barely
+moved: with each CTA issuing its own 1/2 slice, L2 still answers the same total
+sector count; multicast's win is DRAM-side fetch dedup + xbar traffic, which a
+60 MB-L2-resident B never exercises. Kept for (a) mechanism availability,
+(b) robustness under co-tenancy, (c) future bandwidth-bound shapes.
 
 ---
 
