@@ -603,6 +603,9 @@ class FlashAttnPrefillBf16Multistage:
         # T_pad is 64-aligned, so ROWS divides the row grid exactly.
         VEC: cutlass.Constexpr[int] = 4
         ROWS: cutlass.Constexpr[int] = 4
+        # PDL pair of the combine launch's use_pdl=True (see __call__): block
+        # until every main-kernel write to PO/Pm/Pl is visible.
+        cute.arch.griddepcontrol_wait()
         tx, ty, _ = cute.arch.thread_idx()
         bx, h, _ = cute.arch.block_idx()
         row = bx * ROWS + ty
@@ -821,6 +824,12 @@ class FlashAttnPrefillBf16Multistage:
         # One CTA per padded (row, head): merge the split-KV partials with an
         # LSE combine (exp2-rescaled weighted sum of PO / weights of Pl).
         if cutlass.const_expr(self.split_k > 1):
+            # v11: PDL (programmatic dependent launch). The combine grid is
+            # launched with stream-serialization so the hardware can schedule
+            # its blocks while the main kernel is still finishing; every
+            # combine thread then hits griddepcontrol_wait() before touching
+            # the partials, which is the correctness boundary (all main-block
+            # writes to PO/Pm/Pl are visible after the wait).
             self.combine_kernel(
                 mPO,
                 mPm,
@@ -834,6 +843,7 @@ class FlashAttnPrefillBf16Multistage:
                 grid=((mO.shape[0] + 3) // 4, H_q, 1),
                 block=(Dd // 4, 4, 1),  # tx: column-vec group, ty: row group
                 stream=stream,
+                use_pdl=True,
             )
 
 

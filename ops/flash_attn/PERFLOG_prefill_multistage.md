@@ -46,36 +46,43 @@ figures). Raw data: `.omo/closure/{tag}_unified.tsv` + `matrix.json`; ncu:
 | v7 `…-v7-combine` | vectorized LSE combine + sO smem removed | 0.023 | 1.48x | split-zone −4-7% | 19.2 µs | barrier 119 (top) | 2.63% |
 | v8 `…-v8-tma-store` | O epilogue = bulk TMA store from sQ-aliased pad | 0.022 | 1.40x | fused mid-band −14% | 17.6 µs | barrier 118 (top), long_sb 54 ↓ | 2.88% |
 | v10 `…-v10-store-retire` | drop redundant bulk commit/wait | 0.022 | 1.39x | neutral (simplification) | 17.8 µs | barrier 114 (top) | 2.90% |
+| v11 `…-v11-pdl` | PDL on the split-path combine launch (`use_pdl` + `griddepcontrol_wait`) | 0.020 | 1.45-1.79x | split-band −4~14% | — (fused path untouched) | — | — |
 
 ### Full 22-shape × 9-version matrix (vs hpc, >1 = ours faster; unified re-bench)
 
 † = hpc dispatches to its 3-warpgroup persistent **warp_spec** kernel (CTAs>156);
 the 8 non-† rows are its multi-stage zone (same structure as ours).
 
-| # | Shape (H_q,H_kv,D,seqlens) | hpc ms | v1 | v2 | v3 | v4 | v5 | v6 | v7 | v8 | **v10** |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | (4,4,[512]) | 0.031 | 0.03 | 0.44 | 0.44 | 0.42 | 1.17 | 1.28 | 1.48 | 1.40 | **1.39** |
-| 1 | (8,8,[1024]) | 0.053 | 0.02 | 0.42 | 0.42 | 0.43 | 1.07 | 1.05 | 1.07 | 1.10 | **1.12** |
-| 2 | (4,1,[512]) GQA | 0.030 | 0.03 | 0.43 | 0.43 | 0.43 | 1.14 | 1.26 | 1.25 | 1.35 | **1.36** |
-| 3 | (1,1,[512]) 1-head | 0.030 | 0.03 | 0.43 | 0.43 | 0.41 | 1.15 | 1.23 | 1.23 | 1.34 | **1.35** |
-| 4† | (8,2,[4096]) | 0.285 | 0.01 | 0.49 | 0.53 | 0.52 | 0.82 | 0.78 | 0.79 | 0.80 | **0.80** |
-| 5† | (4,4,[4096]) | 0.164 | 0.01 | 0.47 | 0.44 | 0.44 | 0.71 | 0.70 | 0.70 | 0.69 | **0.70** |
-| 6 | (4,4,[512,768]) | 0.045 | 0.02 | 0.38 | 0.43 | 0.38 | 1.10 | 1.10 | 1.10 | 1.19 | **1.17** |
-| 7 | (4,4,[200,328]) | 0.027 | 0.04 | 0.41 | 0.47 | 0.40 | 1.21 | 1.28 | 1.26 | 1.40 | **1.39** |
-| 8 | (4,1,[256,384,512]) | 0.036 | 0.03 | 0.33 | 0.39 | 0.32 | 1.13 | 1.14 | 1.12 | 1.26 | **1.26** |
-| 9 | (4,1,[512]×4) | 0.036 | 0.03 | 0.33 | 0.34 | 0.32 | 1.12 | 1.07 | 1.15 | 1.21 | **1.29** |
-| 10† | (4,4,[2048,2048]) | 0.091 | 0.02 | 0.35 | 0.32 | 0.32 | 0.78 | 0.74 | 0.72 | 0.74 | **0.79** |
-| 11† | (4,4,[512]×8) | 0.041 | 0.02 | 0.21 | 0.24 | 0.22 | 0.95 | 0.91 | 0.89 | 0.99 | **0.99** |
-| 12† | (8,8,[1024]×8) | 0.164 | 0.02 | 0.21 | 0.24 | 0.23 | 0.90 | 0.85 | 0.84 | 0.90 | **0.91** |
-| 13† | (4,4,[512]×16) | 0.059 | 0.02 | 0.17 | 0.18 | 0.18 | 0.85 | 0.84 | 0.95 | 0.96 | **0.98** |
-| 14† | (32,8,[512]×32) Llama3 | 0.652 | 0.02 | 0.12 | 0.13 | 0.13 | 0.88 | 0.79 | 0.79 | 0.92 | **0.93** |
-| 15† | (32,8,[1024]×16) | 1.133 | 0.02 | 0.20 | 0.22 | 0.22 | 0.94 | 0.85 | 0.85 | 0.91 | **0.92** |
-| 16† | (32,8,[2048]×8) | 2.087 | 0.02 | 0.32 | 0.38 | 0.38 | 0.95 | 0.89 | 0.89 | 0.90 | **0.91** |
-| 17† | (32,8,[4096]×4) | 4.020 | 0.02 | 0.46 | 0.58 | 0.58 | 0.96 | 0.91 | 0.90 | 0.89 | **0.90** |
-| 18† | (32,8,[8192]×2) | 7.884 | 0.01 | 0.61 | 0.78 | 0.79 | **0.97** | 0.92 | 0.92 | 0.89 | **0.89** |
-| 19† | (32,8,[16384]) | 15.615 | 0.01 | 0.74 | 0.91 | 0.91 | **0.97** | 0.92 | 0.93 | 0.89 | **0.89** |
-| 20† | (32,8,U(512,4k)×16) | 5.138 | 0.02 | 0.39 | 0.46 | 0.46 | **1.00** | 0.94 | 0.93 | 0.94 | **0.95** |
-| 21† | (32,8,zipf×12) | 4.761 | 0.02 | 0.47 | 0.57 | 0.57 | **1.03** | 0.96 | 0.97 | 0.96 | **0.97** |
+v11 column: dual-run mean of the 8 multi-stage shapes only (PDL touches just the
+split=2 combine launch; big-grid † rows not re-run, expected neutral). v10-vs-v11
+cute_ms: 512² 0.022→0.020, GQA512 0.022→0.019, H1 0.020→0.018, [512,768]
+0.033→0.031, GQA×3 0.026→0.025, [200,328] 0.020→0.021 (sole regression);
+split=1 controls 1024²/[512]×4 within noise.
+
+| # | Shape (H_q,H_kv,D,seqlens) | hpc ms | v1 | v2 | v3 | v4 | v5 | v6 | v7 | v8 | v10 | **v11** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0  | (4,4,[512]) | 0.031 | 0.03 | 0.44 | 0.44 | 0.42 | 1.17 | 1.28 | 1.48 | 1.40 | 1.39 | **1.57** |
+| 1  | (8,8,[1024]) | 0.053 | 0.02 | 0.42 | 0.42 | 0.42 | 1.07 | 1.05 | 1.07 | 1.10 | 1.12 | **1.09** |
+| 2  | (4,1,[512]) GQA | 0.030 | 0.03 | 0.43 | 0.43 | 0.43 | 1.14 | 1.26 | 1.25 | 1.35 | 1.35 | **1.53** |
+| 3  | (1,1,[512]) 1-head | 0.030 | 0.03 | 0.43 | 0.43 | 0.41 | 1.15 | 1.23 | 1.23 | 1.34 | 1.35 | **1.61** |
+| 4† | (8,2,[4096]) | 0.286 | 0.01 | 0.49 | 0.53 | 0.52 | 0.82 | 0.78 | 0.79 | 0.80 | 0.80 | — |
+| 5† | (4,4,[4096]) | 0.164 | 0.01 | 0.47 | 0.44 | 0.44 | 0.71 | 0.70 | 0.70 | 0.69 | 0.70 | — |
+| 6  | (4,4,[512,768]) | 0.045 | 0.02 | 0.38 | 0.42 | 0.38 | 1.10 | 1.10 | 1.10 | 1.19 | 1.17 | **1.45** |
+| 7  | (4,4,[200,328]) | 0.026 | 0.04 | 0.41 | 0.47 | 0.40 | 1.21 | 1.28 | 1.26 | 1.40 | 1.39 | **1.19** |
+| 8  | (4,1,[256,384,512]) | 0.036 | 0.03 | 0.33 | 0.39 | 0.32 | 1.13 | 1.14 | 1.12 | 1.26 | 1.26 | **1.36** |
+| 9  | (4,1,[512]×4) | 0.036 | 0.03 | 0.33 | 0.34 | 0.32 | 1.11 | 1.07 | 1.15 | 1.21 | 1.29 | **1.19** |
+| 10† | (4,4,[2048,2048]) | 0.090 | 0.01 | 0.35 | 0.32 | 0.32 | 0.78 | 0.74 | 0.72 | 0.74 | 0.79 | — |
+| 11† | (4,4,[512]×8) | 0.040 | 0.02 | 0.21 | 0.24 | 0.22 | 0.95 | 0.91 | 0.89 | 0.99 | 0.99 | — |
+| 12† | (8,8,[1024]×8) | 0.163 | 0.01 | 0.21 | 0.23 | 0.23 | 0.90 | 0.85 | 0.84 | 0.90 | 0.91 | — |
+| 13† | (4,4,[512]×16) | 0.059 | 0.02 | 0.17 | 0.18 | 0.18 | 0.85 | 0.84 | 0.95 | 0.96 | 0.97 | — |
+| 14† | (32,8,[512]×32) Llama3 | 0.648 | 0.02 | 0.12 | 0.13 | 0.13 | 0.88 | 0.79 | 0.79 | 0.92 | 0.93 | — |
+| 15† | (32,8,[1024]×16) | 1.132 | 0.01 | 0.20 | 0.22 | 0.22 | 0.94 | 0.85 | 0.85 | 0.91 | 0.92 | — |
+| 16† | (32,8,[2048]×8) | 2.094 | 0.01 | 0.32 | 0.38 | 0.38 | 0.95 | 0.89 | 0.89 | 0.90 | 0.91 | — |
+| 17† | (32,8,[4096]×4) | 4.034 | 0.01 | 0.46 | 0.58 | 0.58 | 0.96 | 0.91 | 0.90 | 0.89 | 0.90 | — |
+| 18† | (32,8,[8192]×2) | 7.864 | 0.01 | 0.61 | 0.78 | 0.79 | 0.97 | 0.92 | 0.92 | 0.89 | 0.89 | — |
+| 19† | (32,8,[16384]) | 15.568 | 0.01 | 0.74 | 0.91 | 0.91 | 0.97 | 0.92 | 0.93 | 0.89 | 0.89 | — |
+| 20† | (32,8,U(512,4k)×16) | 5.137 | 0.01 | 0.39 | 0.46 | 0.46 | 1.00 | 0.94 | 0.93 | 0.94 | 0.95 | — |
+| 21† | (32,8,zipf×12) | 4.758 | 0.02 | 0.47 | 0.57 | 0.57 | 1.03 | 0.96 | 0.97 | 0.96 | 0.97 | — |
 
 ### Final standing vs hpc-ops (v10)
 - **multi-stage zone (8 shapes, same-structure opponent): 8/8 ours, 1.12-1.48x.**
@@ -640,6 +647,47 @@ with zero downside.
   kernel exit, and the fused CTA never rewrites the sO pad after issuing. Kept
   as a one-barrier-fewer simplification.
 
+## Step 11: ✅ v11 — programmatic dependent launch on the split combine
+
+**tag: `flash-ex1-v11-pdl`** — first post-freeze gain patch (v10 remains the
+`flash-ex1-v10-frozen` anchor).
+
+### Change (10 lines, split path only)
+- combine `.launch(..., use_pdl=True)` → CUDA attribute
+  `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`: the combine grid
+  launches (blocks scheduled, prologue runs) *while the main kernel is still
+  finishing*, instead of queueing serially on the stream.
+- `cute.arch.griddepcontrol_wait()` at combine entry: blocks there until the
+  previous grid is complete AND its writes flushed — the PO/Pm/Pl reads that
+  follow are guaranteed visible. Pairing is load-bearing: `use_pdl` without the
+  wait races; the wait without `use_pdl` is a no-op (both sides commented).
+- The main kernel is untouched: its ordinary completion is the implicit
+  release. (The producer-side `launch_dependents()` early-release is the
+  documented optional extension — skipped: it releases while PO-writing CTAs
+  are still resident, and the SM-resource trade was not worth testing blind.)
+
+### Δ analysis vs v10 (unified harness, dual-run, split=2 band)
+- **Effect**: −4-14% wall on every split=2 shape — 512² 0.022→0.020 (−9~14%),
+  GQA512 →0.019 (−14%), H1 →0.018 (−10%, new best 1.61x vs hpc), [512,768]
+  →0.031 (−6~9%), GQA×3 →0.025 (−4%); [200,328] +5% is the sole regression
+  (its main kernel is so short there's little tail left to overlap).
+  **split=1 controls 1024²/[512]×4 moved 0~+3% = noise, confirming the gain is
+  PDL-attributed, not run drift.** vs hpc on the band: 1.19-1.61x.
+- **Metric moved**: inter-kernel gap in the stream — the combine's ~4 µs launch
+  latency sinks under the main kernel's CTA-drain tail (this was exactly the
+  'combine launch floor' identified in Step 7's Δ analysis).
+- **Mechanism**: PDL overlaps grid launch/setup with predecessor execution;
+  `griddepcontrol.wait` keeps the memory-order contract. DSL support:
+  `LaunchConfig.use_pdl` (base_dsl/dsl.py) + `cute.arch.griddepcontrol_wait`
+  (arch/nvvm_wrappers.py) — Closure lever 3's 'not wrapped' note was wrong and
+  is struck.
+
+### Verified
+- `run_prefill.py` **22/22**, `test_varlen.py` **5/5**, compare 8 shapes × 2
+  runs 3-way **0 Failed**.
+
+---
+
 ## Closure: frozen state & unused levers (v10 = final)
 
 **This kernel line is frozen at v10.** Final per-version evidence lives in the
@@ -654,9 +702,10 @@ each Step's `Δ analysis` block ties its lever to the metric it moved.
    FMHA): the v10 stall profile (barrier+wait top, 1.00 active warp/sched) names
    it as the *only* remaining big lever — declared out of scope (red line; it is
    a different kernel, ex.2).
-3. **PDL (programmatic dependent launch)** between main + combine on split=2:
-   combine's 4.2 µs launch gap is ~10-20% of the smallest split shapes; needs
-   griddepcontrol plumbing the DSL doesn't wrap.
+3. ~~PDL between main + combine~~ **IMPLEMENTED as v11** (−4-14% on the split
+   band; `use_pdl` + `griddepcontrol_wait` are both wrapped by the DSL — the
+   original 'not wrapped' note was wrong). Producer-side `launch_dependents()`
+   early-release remains unexplored.
 4. **TMA multicast / clusters / DSMEM**: KV is re-read across Q-tiles of the same
    (b,h); a 2-CTA cluster sharing one K/V load halves ring traffic at long seqs —
    untested, plausible for rows 16-21, but v3's grid-order A/B hints L2 already
