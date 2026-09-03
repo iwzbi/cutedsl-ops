@@ -1,5 +1,10 @@
 # FlashAttention Prefill (multi-stage) — Optimization Journey
 
+> **STATUS: FROZEN at v10** (`flash-ex1-v10-frozen`). All 9 versions were
+> re-measured on one idle H20 under a unified protocol (same harness, same 22
+> shapes, same-session hpc-ops baseline) + per-version ncu; the quantified
+> effect/metric/mechanism of every lever is in the Master Table and each Step's
+> `Δ analysis` block.
 > Per-kernel optimization log for `kernels/prefill_bf16_multistage.py` (ex.1).
 > Scope: the single-warpgroup TMA multi-stage kernel only — warp-specialization
 > (ex.2) is a different kernel and intentionally out of scope here.
@@ -15,91 +20,90 @@ Use `git diff <prev-tag>..<tag> -- ops/flash_attn/kernels/<kernel>.py` to see co
 
 ---
 
-## Master Performance Table
+## Master Performance Table (frozen — all 9 versions re-measured on one idle H20)
 
-All numbers BF16 input / FP32 accumulator / BF16 output, **causal varlen**, L2-flushed CUDA Events
-(our kernel + hpc-ops via `compare_hpcops.py`). TFLOPS = 4·H_q·Σs²·D / t.
-NOTE: both kernels skip the causal upper triangle via `kv_limit`, so this formula
-overcounts their work equally at M≈N (hpc-ops reports >100% peak for exactly this
-reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
+Unified protocol: every tagged kernel runs the CURRENT harness — same 22
+PREFILL_SHAPES, same `pack_varlen`, same `cuda_bench` (L2-flushed CUDA events),
+hpc-ops measured in the same session, GPU idle, each version at its shipped
+defaults (v1-v5 stages=1; v6+ stages=2 + auto `pick_split`; v7+ vectorized
+combine; v8+ TMA-store epilogue). BF16 in / FP32 acc / BF16 out, causal varlen.
+`vs hpc` = hpc_ms/cute_ms — **> 1 means our kernel is faster** (old `speedup`
+label inverted accordingly). TFLOPS = 4·H_q·Σs²·D/t is a shared-convention
+upper bound (both kernels skip the causal upper triangle, hence hpc >100% peak
+figures). Raw data: `.omo/closure/{tag}_unified.tsv` + `matrix.json`; ncu:
+`ncu_reports/` + `.omo/closure/{tag}_ncu.txt`.
 
-`vs hpc` = hpc_ms / cute_ms — **> 1 means OUR kernel is faster**. v5 + hpc rows are
-the same 14-shape re-bench run (FA_SPLIT=1, 3-way vs torch all Success); v1/v2/v3
-rows keep their historical numbers.
+### Version journey (reference shape `(4,4,128,[512])`, ncu = fused shape0 replay, ~1.5x inflated, use for cross-version trend only)
 
-| Shape (H_q,H_kv,D,seqlens) | CTAs | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5 | **ex.1 v8 (+TMA-store epilogue)** | vs hpc (v8) |
+| Ver (tag) | One-line change | cute ms | vs hpc | step Δ | ncu Duration | top stall (samples) | tensor% |
 |---|---|---|---|---|---|---|---|
-| **(4,4,128,[512])** single batch | 32 | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | 0.027 / 20.1T | **0.021** | **1.40x faster** |
-| **(8,8,128,[1024])** single batch | 128 | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | 0.050 / 85.5T | **0.048** | **1.09x faster** |
-| **(4,1,128,[512])** GQA | 32 | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | 0.027 / 20.2T | **0.021** | **1.37x faster** |
-| **(1,1,128,[512])** single head | 8 | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | 0.026 / 5.1T | **0.020** | **1.47x faster** |
-| **(4,4,128,[4096])** long seq † | 512 | 0.164 / 209.0T (>peak) | 0.350 / 98.1T (66%) | — † | 0.244 / 140.8T (95.1%) | **0.358** | 0.79x |
-| **(8,2,128,[4096])** GQA long † | 512 | 0.286 / 240.3T (>peak) | 0.593 / 115.8T (78%) | — † | 0.356 / 193.0T (130%) | **0.236** | 0.69x |
-| **(4,4,128,[512,768])** unequal | 96 | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | 0.041 / 42.2T | **0.032** | **1.35x faster** |
-| **(4,4,128,[200,328])** misaligned | 48 | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | 0.023 / 13.2T | **0.023** | **1.13x faster** |
-| **(4,1,128,[256,384,512])** GQA×3 | 96 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | 0.032 / 30.4T | **0.026** | **1.30x faster** |
-| **(4,1,128,[512]×4)** GQA×4 | 128 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | 0.034 / 64.0T | **0.030** | **1.13x faster** |
-| **(4,4,128,[2048,2048])** † | 128 | 0.090 / 190.5T | 0.263 / 65.4T (44%) | — † | 0.119 / 144.6T (97.7%) | **0.125** | 0.71x |
-| **(4,4,128,[512]×8)** serving † | 256 | 0.039 / 108.9T | 0.196 / 21.9T | — † | 0.044 / 98.5T | **0.041** | 0.96x |
-| **(8,8,128,[1024]×8)** serving † | 1024 | 0.164 / 209.3T | 0.775 / 44.3T | — † | 0.187 / 184.0T | **0.181** | 0.89x |
-| **(4,4,128,[512]×16)** serving † | 512 | 0.059 / 145.9T | 0.364 / 23.6T | — † | 0.069 / 125.4T (84.7%) | **0.062** | 0.94x |
-| **(32,8,128,[512]×32)** Llama3-8B 16k tok † | 8192 | 0.653 / 210.5T | — | — | — | **0.709** | 0.92x |
-| **(32,8,128,[1024]×16)** † | 4096 | 1.139 / 241.4T | — | — | — | **1.244** | 0.91x |
-| **(32,8,128,[2048]×8)** † | 2048 | 2.109 / 260.6T | — | — | — | **2.318** | 0.90x |
-| **(32,8,128,[4096]×4)** † | 1024 | 4.010 / 274.2T | — | — | — | **4.500** | 0.89x |
-| **(32,8,128,[8192]×2)** † | 512 | 7.861 / 279.7T | — | — | — | **8.874** | 0.89x |
-| **(32,8,128,[16384])** † | 256 | 15.615 / 281.7T | — | — | — | **17.542** | 0.89x |
-| **(32,8,128,U(512,4k)×16)** varlen dist † | ~4k | 5.136 / 259.1T | — | — | — | **5.463** | 0.94x |
-| **(32,8,128,zipf[128..6k]×12)** † | ~2k | 4.751 / 251.9T | — | — | — | **4.964** | 0.96x |
+| v1 `flash-ex1-v1-varlen` | baseline: autovec gmem→reg loads, serial | 1.008 | 0.031x | — | 1490 µs | long_scoreboard 12131 + wait 5670 | 0.03% |
+| v2 `…-v2-tma` | K/V via TMA + mbarrier multi-stage ring | 0.070 | 0.44x | **16x** | 86.3 µs | long_scoreboard 710 (was 12131) | 0.57% |
+| v3 `…-v3-occupancy` | stages 2→1, grid swap, mask-skip | 0.071 | 0.44x | neutral | 89.5 µs | long_scoreboard 842 | 0.55% |
+| v4 `…-v4-splitk` | split-KV infra (default OFF after A/B) | 0.071 | 0.42x | neutral-off | 87.4 µs | long_scoreboard 727 | 0.56% |
+| v5 `…-v5-qasync` | **Q via async TMA pipeline** | 0.027 | 1.17x | **2.6x** | 24.4 µs | long_scoreboard 174, barrier 112 ↑ | 2.15% |
+| v6 `…-v6-picksplit` | stages=2 default + auto split≤96CTA + sP smem removed | 0.023 | 1.28x | 1.3x | 19.1 µs | **barrier 113 (top)** | 2.67% |
+| v7 `…-v7-combine` | vectorized LSE combine + sO smem removed | 0.023 | 1.48x | split-zone −4-7% | 19.2 µs | barrier 119 (top) | 2.63% |
+| v8 `…-v8-tma-store` | O epilogue = bulk TMA store from sQ-aliased pad | 0.022 | 1.40x | fused mid-band −14% | 17.6 µs | barrier 118 (top), long_sb 54 ↓ | 2.88% |
+| v10 `…-v10-store-retire` | drop redundant bulk commit/wait | 0.022 | 1.39x | neutral (simplification) | 17.8 µs | barrier 114 (top) | 2.90% |
 
-† hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
-(`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
-comparing our single-WG kernel against them is structural mismatch — the v3+
-bench target is the 8 multi-stage shapes only. **v6/v7 (stages=2 ring + automatic
-split-K + vectorized combine, Steps 6-7) win ALL 8 multi-stage shapes at 1.03-1.46x**
-(CTAs column = grid size `ceil(max_s/64)*B*H_q`; the v7 column is a fresh 22-shape
-re-bench under the current defaults — 3-way 0 Failed; the 6 legacy † rows were not
-re-run since v5).
+### Full 22-shape × 9-version matrix (vs hpc, >1 = ours faster; unified re-bench)
 
-The last 8 rows (added with the shape-set refresh) use **industry-standard configs**
-— Llama3-8B heads (32Q/8KV) at a constant ~16k-token budget swept across
-batch×seqlen (Dao-AILab / FlashInfer benchmark convention) plus uniform/zipf varlen
-distributions. All are † (hpc = warp_spec). The gap *closes monotonically with
-sequence length* — 0.79x at [512]×32 up to 0.92x at [16384], and the zipf varlen mix
-reaches **0.96x** — our per-CTA fixed costs amortize fully on long loops, and the
-residual is single-warpgroup vs 3-warpgroup WGMMA scheduling, not load/pipeline stalls.
+† = hpc dispatches to its 3-warpgroup persistent **warp_spec** kernel (CTAs>156);
+the 8 non-† rows are its multi-stage zone (same structure as ours).
+
+| # | Shape (H_q,H_kv,D,seqlens) | hpc ms | v1 | v2 | v3 | v4 | v5 | v6 | v7 | v8 | **v10** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | (4,4,[512]) | 0.031 | 0.03 | 0.44 | 0.44 | 0.42 | 1.17 | 1.28 | 1.48 | 1.40 | **1.39** |
+| 1 | (8,8,[1024]) | 0.053 | 0.02 | 0.42 | 0.42 | 0.43 | 1.07 | 1.05 | 1.07 | 1.10 | **1.12** |
+| 2 | (4,1,[512]) GQA | 0.030 | 0.03 | 0.43 | 0.43 | 0.43 | 1.14 | 1.26 | 1.25 | 1.35 | **1.36** |
+| 3 | (1,1,[512]) 1-head | 0.030 | 0.03 | 0.43 | 0.43 | 0.41 | 1.15 | 1.23 | 1.23 | 1.34 | **1.35** |
+| 4† | (8,2,[4096]) | 0.285 | 0.01 | 0.49 | 0.53 | 0.52 | 0.82 | 0.78 | 0.79 | 0.80 | **0.80** |
+| 5† | (4,4,[4096]) | 0.164 | 0.01 | 0.47 | 0.44 | 0.44 | 0.71 | 0.70 | 0.70 | 0.69 | **0.70** |
+| 6 | (4,4,[512,768]) | 0.045 | 0.02 | 0.38 | 0.43 | 0.38 | 1.10 | 1.10 | 1.10 | 1.19 | **1.17** |
+| 7 | (4,4,[200,328]) | 0.027 | 0.04 | 0.41 | 0.47 | 0.40 | 1.21 | 1.28 | 1.26 | 1.40 | **1.39** |
+| 8 | (4,1,[256,384,512]) | 0.036 | 0.03 | 0.33 | 0.39 | 0.32 | 1.13 | 1.14 | 1.12 | 1.26 | **1.26** |
+| 9 | (4,1,[512]×4) | 0.036 | 0.03 | 0.33 | 0.34 | 0.32 | 1.12 | 1.07 | 1.15 | 1.21 | **1.29** |
+| 10† | (4,4,[2048,2048]) | 0.091 | 0.02 | 0.35 | 0.32 | 0.32 | 0.78 | 0.74 | 0.72 | 0.74 | **0.79** |
+| 11† | (4,4,[512]×8) | 0.041 | 0.02 | 0.21 | 0.24 | 0.22 | 0.95 | 0.91 | 0.89 | 0.99 | **0.99** |
+| 12† | (8,8,[1024]×8) | 0.164 | 0.02 | 0.21 | 0.24 | 0.23 | 0.90 | 0.85 | 0.84 | 0.90 | **0.91** |
+| 13† | (4,4,[512]×16) | 0.059 | 0.02 | 0.17 | 0.18 | 0.18 | 0.85 | 0.84 | 0.95 | 0.96 | **0.98** |
+| 14† | (32,8,[512]×32) Llama3 | 0.652 | 0.02 | 0.12 | 0.13 | 0.13 | 0.88 | 0.79 | 0.79 | 0.92 | **0.93** |
+| 15† | (32,8,[1024]×16) | 1.133 | 0.02 | 0.20 | 0.22 | 0.22 | 0.94 | 0.85 | 0.85 | 0.91 | **0.92** |
+| 16† | (32,8,[2048]×8) | 2.087 | 0.02 | 0.32 | 0.38 | 0.38 | 0.95 | 0.89 | 0.89 | 0.90 | **0.91** |
+| 17† | (32,8,[4096]×4) | 4.020 | 0.02 | 0.46 | 0.58 | 0.58 | 0.96 | 0.91 | 0.90 | 0.89 | **0.90** |
+| 18† | (32,8,[8192]×2) | 7.884 | 0.01 | 0.61 | 0.78 | 0.79 | **0.97** | 0.92 | 0.92 | 0.89 | **0.89** |
+| 19† | (32,8,[16384]) | 15.615 | 0.01 | 0.74 | 0.91 | 0.91 | **0.97** | 0.92 | 0.93 | 0.89 | **0.89** |
+| 20† | (32,8,U(512,4k)×16) | 5.138 | 0.02 | 0.39 | 0.46 | 0.46 | **1.00** | 0.94 | 0.93 | 0.94 | **0.95** |
+| 21† | (32,8,zipf×12) | 4.761 | 0.02 | 0.47 | 0.57 | 0.57 | **1.03** | 0.96 | 0.97 | 0.96 | **0.97** |
+
+### Final standing vs hpc-ops (v10)
+- **multi-stage zone (8 shapes, same-structure opponent): 8/8 ours, 1.12-1.48x.**
+- warp_spec zone (14 shapes, hpc's 3-WG persistent kernel): 0.69-0.99x; best at
+  long-seq varlen ([512]×8 0.99, [512]×16 0.98, zipf 0.97).
+- **Honest unified-run discovery**: v5 (stages=1) was the *best* version on the
+  big-grid † band (rows 16-21: 0.95-1.03x) — v6's stages=2 default costs ~4-7%
+  there (96 KB smem → 2 CTA/SM vs 3) while winning the small grids. A
+  `pick_stages` rule (stages=1 for grids ≥ ~512 CTAs) is the identified
+  follow-up, recorded in Closure.
 
 ### Key takeaways
-- **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
-  equal/unequal/misaligned, GQA 1..16 groups, 64→4096 seqs) via `run_prefill.py`,
-  5 test_varlen cases, and 14×3-way agreement (torch/hpc-ops/cutedsl) via compare_hpcops.py.
-- **v1→v2 (TMA multi-stage): 16-100x faster** — the serial-load bottleneck is gone;
-  the gap to hpc-ops collapsed from 37-132x to **2.1-6.2x**.
-- **v3 ruled out the easy suspects** (see Step 3): occupancy (2→3 CTA/SM), L2 grid
-  order, and per-tile mask skipping are all *neutral* — v2 already saturates what
-  the single-warpgroup design can do *at fixed grid shape*.
-- **v3 ncu attribution (Step 3.5)**: the residual gap on small shapes is
-  *parallelism starvation* (32-CTA grid = 0.14 wave, tensor pipe 0.55%), not
-  codegen quality. Fix = split-K over the KV dimension (Step 4).
-- **v4 split-KV: negative result** (Step 4) — cutting the loop cannot pay for
-  per-CTA fixed costs (synchronous Q load + TMA wait + drain), which dominate.
-- **v5 Q-async TMA: 2.5-3.4x — ALL 8 multi-stage shapes now FASTER than hpc-ops**
-  (1.01-1.28x on the re-bench; the 6 † shapes sit at 0.67-0.90x where hpc uses its
-  structurally different warp_spec kernel). The ncu-predicted lever worked exactly as
-  diagnosed; split=2 re-test after v5 turns positive on the smallest grids (1.29-1.39x).
-- **v6 stages=2 + auto split-K + sP smem removal: 8/8 multi-stage shapes at 1.03-1.52x**
-  (single-head 1.52x, 512² 1.48x). Double-buffering turned positive once v5/v6b removed
-  the fixed per-CTA latency it must hide; split=2 is auto-selected iff grid ≤ 96 CTAs.
-- **v7 vectorized combine + sO dead-smem removal: 8/8 at 1.03-1.46x** (Step 7) — the
-  LSE merge now loads/stores 16 B vectors (−4-7% where combine is on the critical
-  path); sO turned out to be a second never-dereferenced partition_C template
-  (−16 KB/CTA, headroom not occupancy); pick_split threshold 96 re-confirmed with
-  the [512,768]-vs-GQA×3 disagreement documented.
-- **v8 O epilogue TMA store (Step 8)**: fused path exits via one bulk S2G store from
-  the sQ-aliased smem pad. The †/Llama3 fused-heavy band got its first real wins vs
-  hpc's warp_spec ([512]×32 0.79→0.92x, −14% ms); multi-stage zone unchanged;
-  [8192]/[16384] appear ~3% below v7 — later attributed to measurement drift, not
-  the store tail (Step 10 removed the bulk-wait with zero change).
+- **Correctness frozen**: 22 shapes × 3-way (torch SDPA / hpc-ops / cutedsl) 0
+  Failed at every version's re-bench; `run_prefill` 22/22 + `test_varlen` 5/5 at HEAD.
+- **The journey is two phase transitions, not ten equal steps**: v1→v2 killed the
+  load-latency chain (16x), v4→v5 killed the Q-serial critical path (2.6x) and
+  flipped the stall regime; everything after v5 is shaving the *barrier-bound*
+  single-WG regime (v6-v10: 1.28x→1.39-1.48x total).
+- **Same knob, different verdict, depending on the critical path**: stages=2 was
+  neutral at v3 (Q-load dominated), +42% at v6c (after Q-async), and −5% at v6 on
+  big grids (occupancy > prefetch there). A/B every knob after changing the chain.
+- **Negative results kept as infrastructure**: v4 split-KV ships OFF until v5 made
+  it win on small grids (now automatic via pick_split ≤96 CTAs); v10's wait-removal
+  was neutral but provably-safe simplification.
+- ncu attribution chain (shape0): long_scoreboard 12131 → 710 → (plateau 3
+  versions) → 174 → barrier-top 113/119/118/114 — each lever deleted exactly the
+  stall ncu named; the terminal barrier+wait profile IS the single-warpgroup
+  serialization = the declared warp-spec red line.
 
 ---
 
@@ -147,6 +151,15 @@ overlap across KV blocks.
 - No double buffering: K/V for block j+1 cannot load while block j computes.
 
 ---
+
+### Δ analysis (unified re-bench — baseline)
+- **Effect**: 512² 1.008 ms, vs hpc 0.031x; the journey's worst row (1077 ms on
+  [16384] — 69x behind hpc there).
+- **Metric owned**: long_scoreboard **12131 samples** + wait 5670; tensor pipe
+  0.03%. Every warp's life is waiting on global load returns.
+- **Mechanism**: `autovec_copy` issues per-thread LDGs into register fragments;
+  in-order register consumers (WGMMA operands, softmax) can't start until whole
+  tiles land, and nothing overlaps load with compute, within or across tiles.
 
 ## Step 2: ✅ v2-TMA — TMA async loads + multi-stage ring (16-100x faster)
 
@@ -209,6 +222,18 @@ for the ncu attribution).
 
 ---
 
+### Δ analysis vs v1 (unified)
+- **Effect**: 1.008 → 0.070 ms = **16x**; vs hpc 0.031x → 0.44x. Biggest single
+  jump until v5.
+- **Metric moved**: long_scoreboard 12131 → 710 samples (−94%); Duration
+  1490 → 86.3 µs; tensor 0.03 → 0.57%. What remains is `wait` (566): warps now
+  mostly wait on each other, not on DRAM.
+- **Mechanism**: TMA = one-thread descriptor-based bulk copy; the DMA engine
+  moves 16 KB tiles asynchronously, mbarrier + tx-count exposes completion
+  without register pressure. Load left the critical path — but the *loop* is
+  still issue→wait→consume serial (stages=1 shipped), and **Q's autovec_copy
+  stayed synchronous**: exactly the next two plateaus.
+
 ## Step 3: ⚖️ v3 — occupancy / L2 / mask-skip A/B study (neutral, kept for fidelity)
 
 **Tag**: `flash-ex1-v3-occupancy`
@@ -254,6 +279,16 @@ mask-skip also shrinks the loop body executed on real workloads).
   `compare_hpcops.py --shapes 0,1,2,3,6,7,8,9`: 8×3-way all Success.
 
 ---
+
+### Δ analysis vs v2 (unified)
+- **Effect**: none — 0.070 → 0.071 ms, all three knobs ≤4%.
+- **Metric moved**: nothing outside noise (long_sb 710↔842, tensor 0.57↔0.55%).
+- **Mechanism of the neutrality**: occupancy, L2 order and mask-skip target
+  *second-order* costs while the critical path is the serial per-iteration chain
+  (sync Q load + wait-then-consume). Amdahl: you cannot tune what the bottleneck
+  doesn't route through. This step's real product is the Step 3.5 prescription —
+  'parallelism starvation + long_scoreboard 34%' — which named v5's lever two
+  versions early.
 
 ## Step 3.5: 🔬 ncu stall attribution (v3 config, shape (4,4,128,[512]))
 
@@ -342,6 +377,18 @@ and only after the CTA critical path is short does split-KV deserve a re-test
 
 ---
 
+### Δ analysis vs v3 (unified)
+- **Effect**: fused default unchanged (0.071 ms, split-K OFF after the A/B); the
+  experiment itself is the deliverable.
+- **Metric moved (under split=2)**: main kernel 71→83 µs (+17%) with combine only
+  4.2 µs — grid doubled, per-CTA work halved, wall time still *grew*.
+- **Mechanism of the negative**: splitting the KV loop cuts the minority cost
+  (iterations) but multiplies the majority cost (per-CTA fixed: sync Q load,
+  first TMA wait, drain ×S) plus new partial traffic. Parallelism knobs cannot
+  beat a fixed-latency-dominated chain — only shortening the chain can (v5).
+  Infrastructure kept: the partial epilogue + combine became v6a's pick_split
+  substrate.
+
 ## Step 5: ✅ v5-qasync — asynchronous Q via TMA (2.5-3.4x, 7/8 shapes beat hpc-ops)
 
 **Tag**: `flash-ex1-v5-qasync`
@@ -391,6 +438,19 @@ With the Q cost gone, splitting finally pays on the smallest grids:
 
 ---
 
+### Δ analysis vs v4 (unified)
+- **Effect**: 0.071 → 0.027 ms = **2.6x**; vs hpc crosses 1.0 for the first time
+  (1.17x at 512²); all 22 shapes jump ≥2.3x.
+- **Metric moved**: long_scoreboard 727 → 174; Duration 87.4 → 24.4 µs; tensor
+  0.56 → 2.15%; **barrier appears at top-2 (112)** — the regime flip v6 attacks.
+  cyc/inst 4.55 → 10.11 (fewer, longer stalls: the load herd is gone, pipeline
+  waits remain).
+- **Mechanism**: Q rides its own single-stage `PipelineTmaAsync` issued in the
+  prologue — the 16 KB LDG chain that *every* iteration's first WGMMA waited on
+  becomes one async copy overlapping barrier init + first KV prefetch, with
+  consumer_wait placed right before the first MMA. Direct execution of the
+  Step 3.5 prescription.
+
 ## Step 6: ✅ v6 — stages=2 ring + auto split-K + sP smem removal (multi-stage 8/8, up to 1.52x)
 
 **tag: `flash-ex1-v6-picksplit`** — three bundled changes, one four-quadrant A/B to decide defaults.
@@ -438,6 +498,19 @@ Two conclusions:
 
 ---
 
+### Δ analysis vs v5 (unified)
+- **Effect**: 512² fused 0.027 → 0.023 ms (1.28x); s2-eligible small grids reach
+  1.4x+ (four-quadrant matrix above).
+- **Metric moved**: barrier 113 becomes the **top** stall for the first time;
+  tensor 2.15 → 2.67%; Duration 24.4 → 19.1 µs.
+- **Mechanism**: (b) sP's 8 KB smem deleted (compile-time template only); (c)
+  stages=2 ring *turned positive only because v5/v6b removed the latency it must
+  hide* — the same knob was neutral at v3 (A/B after every chain change);
+  (a) pick_split ≤96 CTAs encodes 'split iff the GPU is under-filled'.
+- **Unified-run addendum (honest)**: the four-quadrant matrix only covered the 8
+  small shapes; on big grids stages=2 costs 4-7% vs v5 (96 KB → 2 CTA/SM instead
+  of 3; matrix rows 16-21 peak at v5). `pick_stages` recorded in Closure.
+
 ## Step 7: ✅ v7 — vectorized LSE combine + sO dead-smem removal (small grids to 1.03-1.46x)
 
 **tag: `flash-ex1-v7-combine`** — three follow-ups from the v7 option list:
@@ -470,6 +543,17 @@ standard zone unchanged 0.79-0.96x (zipf varlen 0.96x).
   `compare_hpcops.py` small-8 + Llama3/varlen-8 **3-way 0 Failed** each.
 
 ---
+
+### Δ analysis vs v6 (unified)
+- **Effect**: fused shape0 19.1 → 19.2 µs (unchanged — this step doesn't touch
+  the fused path); the wins are on split=2 shapes where combine is on the
+  critical path (−4-7%, e.g. GQA×3 0.028→0.026 ms).
+- **Metric moved**: inside combine — scalar 4B → 16B vector loads, 4 rows/CTA;
+  the main kernel's ncu signature is identical by construction (tensor 2.67→2.63%).
+- **Mechanism**: sO is a second never-dereferenced partition_C template (the
+  epilogue is reg→gmem despite the r2s name) → −16 KB pure headroom. 512² sitting
+  *at* the combine launch floor (4.2 µs partly hidden by CTA-tail overlap) is
+  itself the evidence that combine isn't the wall there.
 
 ## Step 8: ✅ v8 — O epilogue TMA store (fused shapes to 0.89-0.96x in the Llama3 zone)
 
@@ -512,6 +596,17 @@ Two debugging lessons now baked into comments:
 
 ---
 
+### Δ analysis vs v7 (unified)
+- **Effect**: 17.6 µs (−8% on shape0); the fused-heavy big-grid band recovers
+  most of the v6 stages=2 tax ([512]×32 0.79→0.92, [512]×16→0.96, zipf→0.96).
+- **Metric moved**: long_scoreboard 54 (scatter stores gone); LSU pipe down,
+  TMA pipe carries the 16 KB O tile out; DRAM 2.25%.
+- **Mechanism**: register→smem into the **sQ-aliased** pad (zero new smem: Q is
+  fully consumed by the last QK WGMMA before the epilogue sync) → one bulk S2G
+  store. DSL lessons preserved in code comments: a full-tile TMA box leaves no
+  smem rest-mode (`tOsO[None]`), and r2s vs TMA must agree on swizzle (plain
+  row-major both sides after d≥64 scrambling).
+
 ## Step 10: ➖ v10 — drop the epilogue bulk commit/wait (neutral, kept as simplification)
 
 **hypothesis**: the v8 fused path's ~3-4% regression on [8192]/[16384] came from
@@ -534,17 +629,45 @@ with zero downside.
 
 ---
 
-## Step 11+: planned optimizations (multi-stage scope only)
+### Δ analysis vs v8 (unified)
+- **Effect**: neutral (17.6→17.8 µs; matrix v8→v10 within ±2% everywhere, 12/22
+  shapes slightly up). The v8-era '[8192]/[16384] −3%' narrative retires — the
+  unified re-bench attributes those rows to the v6 stages=2 occupancy tax (v5
+  still leads them; Step 6 addendum).
+- **Metric moved**: none by design.
+- **Mechanism**: the removed `commit_group`/`wait_group(0, read=False)` was
+  provably redundant — PTX guarantees outstanding bulk groups complete before
+  kernel exit, and the fused CTA never rewrites the sO pad after issuing. Kept
+  as a one-barrier-fewer simplification.
 
-| Step | Tag | Change | Expected |
-|---|---|---|---|
-| ~~8~~ | ~~flash-ex1-v8-tma-store~~ | ✅ DONE — fused mid-band 0.89-0.96x vs warp_spec | — |
-| ~~9~~ | — | ❌ SKIPPED (analysis): BLK_N=128 cannot shorten the critical path — QK stays two serial N=64 WGMMA instrs and softmax volume is unchanged; it would force pad-128 contract + 144 KB smem (1 CTA/SM) for at most loop-overhead savings already hidden by stages=2 | — |
-| ~~10~~ | flash-ex1-v10-store-retire | ➖ DONE — neutral, kept as simplification | — |
-| 11 | (candidate) | ncu on [4096]-class fused shapes to attribute the 0.70-0.80x vs warp_spec (suspect: single-WG WGMMA serialization, i.e. the red line — may be terminal for multi-stage scope) | knowledge |
+## Closure: frozen state & unused levers (v10 = final)
 
-Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
-+ `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
-**Bench target set from v3 on: the 8 multi-stage shapes** (`--shapes 0,1,2,3,6,7,8,9`) —
-long/serving shapes compare against hpc-ops' *different* kernel (warp_spec) and are
-informational only.
+**This kernel line is frozen at v10.** Final per-version evidence lives in the
+Master Performance Table (unified 9-version × 22-shape matrix + ncu chain), and
+each Step's `Δ analysis` block ties its lever to the metric it moved.
+
+### Identified-but-unimplemented (ranked by measured evidence)
+1. **`pick_stages`** — the unified matrix's clearest open win: stages=1 beats
+   stages=2 by 4-7% on big grids (rows 16-21 peak at v5) while stages=2 wins
+   small grids; a grid-size rule would take both. Cost: one constant + re-verify.
+2. **Warp specialization** (load WG + compute WGs, hpc's warp_spec / CUTLASS
+   FMHA): the v10 stall profile (barrier+wait top, 1.00 active warp/sched) names
+   it as the *only* remaining big lever — declared out of scope (red line; it is
+   a different kernel, ex.2).
+3. **PDL (programmatic dependent launch)** between main + combine on split=2:
+   combine's 4.2 µs launch gap is ~10-20% of the smallest split shapes; needs
+   griddepcontrol plumbing the DSL doesn't wrap.
+4. **TMA multicast / clusters / DSMEM**: KV is re-read across Q-tiles of the same
+   (b,h); a 2-CTA cluster sharing one K/V load halves ring traffic at long seqs —
+   untested, plausible for rows 16-21, but v3's grid-order A/B hints L2 already
+   catches much of it at these sizes.
+5. **L2 persistence window** (`cudaAccessPolicyWindow`) for K/V prefixes on
+   serving rows ([512]×8..×32).
+6. **FP8 P·V / reduced softmax precision**: hpc's own D-series direction; breaks
+   this exercise's bf16+fp32 correctness envelope, out of scope.
+7. **PV-side deeper pipelining** (double-buffered accumulators, QK(it+1) ∥
+   PV(it)): needs two WGs under Hopper WGMMA semantics — folds into lever 2.
+8. **exp2/MUFU tuning**: XU 1.57% active at v10 — measured irrelevant.
+9. **Hand-scheduled PTX / C++ CuTe**: DSL codegen quality is a known-unknown
+   (hpc's >100%-peak figures are the same flops convention, so ratios are the
+   honest metric); outside this exercise's toolkit.
