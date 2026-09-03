@@ -152,11 +152,13 @@ def pack_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens, blk_
 def pick_split(ctas: int) -> int:
     """Split-K factor for the varlen prefill kernel, by grid shape.
 
-    v4/v5/v6 A/B: split_k=2 wins on small grids (fewer than ~2 waves of 78
-    SMs: up to 96 CTAs here) where per-CTA fixed cost dominates and extra CTAs
-    fill the GPU; it loses on >=128-CTA grids where the GPU is already busy
-    and the extra Q loads / partial traffic are pure cost.  See PERFLOG
-    Step 4/5/6.
+    v4/v5/v6 A/B: split_k=2 wins on small grids (<= ~96 CTAs, i.e. under two
+    waves of 78 SMs) where per-CTA fixed cost dominates and extra CTAs fill
+    the GPU; it loses on >=128-CTA grids where the GPU is already busy and
+    the extra Q loads / partial traffic are pure cost.  At exactly 96 CTAs
+    the data splits: unequal [512,768] gains +0.16x from split=2 while
+    balanced GQA x3 [256,384,512] loses -0.04x, so the threshold stays 96.
+    See PERFLOG Step 4/5/6.
     """
     return 2 if ctas <= 96 else 1
 

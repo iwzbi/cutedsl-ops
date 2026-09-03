@@ -27,37 +27,39 @@ reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
 the same 14-shape re-bench run (FA_SPLIT=1, 3-way vs torch all Success); v1/v2/v3
 rows keep their historical numbers.
 
-| Shape (H_q,H_kv,D,seqlens) | CTAs | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5 | **ex.1 v6 (stages=2+auto split)** | vs hpc (v6) |
+| Shape (H_q,H_kv,D,seqlens) | CTAs | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5 | **ex.1 v7 (stages=2+auto split+vec combine)** | vs hpc (v7) |
 |---|---|---|---|---|---|---|---|
-| **(4,4,128,[512])** single batch | 32 | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | 0.027 / 20.1T | **0.023** | **1.48x faster** |
-| **(8,8,128,[1024])** single batch | 128 | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | 0.050 / 85.5T | **0.050** | **1.07x faster** |
-| **(4,1,128,[512])** GQA | 32 | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | 0.027 / 20.2T | **0.021** | **1.39x faster** |
-| **(1,1,128,[512])** single head | 8 | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | 0.026 / 5.1T | **0.019** | **1.52x faster** |
+| **(4,4,128,[512])** single batch | 32 | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | 0.027 / 20.1T | **0.021** | **1.42x faster** |
+| **(8,8,128,[1024])** single batch | 128 | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | 0.050 / 85.5T | **0.052** | **1.03x faster** |
+| **(4,1,128,[512])** GQA | 32 | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | 0.027 / 20.2T | **0.021** | **1.40x faster** |
+| **(1,1,128,[512])** single head | 8 | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | 0.026 / 5.1T | **0.020** | **1.46x faster** |
 | **(4,4,128,[4096])** long seq † | 512 | 0.164 / 209.0T (>peak) | 0.350 / 98.1T (66%) | — † | 0.244 / 140.8T (95.1%) | — | — |
 | **(8,2,128,[4096])** GQA long † | 512 | 0.286 / 240.3T (>peak) | 0.593 / 115.8T (78%) | — † | 0.356 / 193.0T (130%) | — | — |
-| **(4,4,128,[512,768])** unequal | 96 | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | 0.041 / 42.2T | **0.035** | **1.25x faster** |
-| **(4,4,128,[200,328])** misaligned | 48 | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | 0.023 / 13.2T | **0.021** | **1.21x faster** |
-| **(4,1,128,[256,384,512])** GQA×3 | 96 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | 0.032 / 30.4T | **0.032** | **1.08x faster** |
-| **(4,1,128,[512]×4)** GQA×4 | 128 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | 0.034 / 64.0T | **0.033** | **1.03x faster** |
+| **(4,4,128,[512,768])** unequal | 96 | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | 0.041 / 42.2T | **0.032** | **1.37x faster** |
+| **(4,4,128,[200,328])** misaligned | 48 | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | 0.023 / 13.2T | **0.023** | **1.12x faster** |
+| **(4,1,128,[256,384,512])** GQA×3 | 96 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | 0.032 / 30.4T | **0.026** | **1.33x faster** |
+| **(4,1,128,[512]×4)** GQA×4 | 128 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | 0.034 / 64.0T | **0.033** | **1.08x faster** |
 | **(4,4,128,[2048,2048])** † | 128 | 0.090 / 190.5T | 0.263 / 65.4T (44%) | — † | 0.119 / 144.6T (97.7%) | — | — |
 | **(4,4,128,[512]×8)** serving † | 256 | 0.039 / 108.9T | 0.196 / 21.9T | — † | 0.044 / 98.5T | — | — |
 | **(8,8,128,[1024]×8)** serving † | 1024 | 0.164 / 209.3T | 0.775 / 44.3T | — † | 0.187 / 184.0T | — | — |
 | **(4,4,128,[512]×16)** serving † | 512 | 0.059 / 145.9T | 0.364 / 23.6T | — † | 0.069 / 125.4T (84.7%) | — | — |
-| **(32,8,128,[512]×32)** Llama3-8B 16k tok † | 8192 | 0.653 / 210.5T | — | — | — | 0.826 | 0.79x |
-| **(32,8,128,[1024]×16)** † | 4096 | 1.139 / 241.4T | — | — | — | 1.341 | 0.85x |
-| **(32,8,128,[2048]×8)** † | 2048 | 2.109 / 260.6T | — | — | — | 2.362 | 0.89x |
-| **(32,8,128,[4096]×4)** † | 1024 | 4.010 / 274.2T | — | — | — | 4.432 | 0.90x |
-| **(32,8,128,[8192]×2)** † | 512 | 7.861 / 279.7T | — | — | — | 8.605 | 0.91x |
-| **(32,8,128,[16384])** † | 256 | 15.615 / 281.7T | — | — | — | 16.917 | 0.92x |
-| **(32,8,128,U(512,4k)×16)** varlen dist † | ~4k | 5.136 / 259.1T | — | — | — | 5.511 | 0.93x |
-| **(32,8,128,zipf[128..6k]×12)** † | ~2k | 4.751 / 251.9T | — | — | — | 4.938 | 0.96x |
+| **(32,8,128,[512]×32)** Llama3-8B 16k tok † | 8192 | 0.653 / 210.5T | — | — | — | **0.826** | 0.79x |
+| **(32,8,128,[1024]×16)** † | 4096 | 1.139 / 241.4T | — | — | — | **1.340** | 0.85x |
+| **(32,8,128,[2048]×8)** † | 2048 | 2.109 / 260.6T | — | — | — | **2.359** | 0.90x |
+| **(32,8,128,[4096]×4)** † | 1024 | 4.010 / 274.2T | — | — | — | **4.443** | 0.91x |
+| **(32,8,128,[8192]×2)** † | 512 | 7.861 / 279.7T | — | — | — | **8.610** | 0.92x |
+| **(32,8,128,[16384])** † | 256 | 15.615 / 281.7T | — | — | — | **16.890** | 0.92x |
+| **(32,8,128,U(512,4k)×16)** varlen dist † | ~4k | 5.136 / 259.1T | — | — | — | **5.521** | 0.93x |
+| **(32,8,128,zipf[128..6k]×12)** † | ~2k | 4.751 / 251.9T | — | — | — | **4.932** | 0.96x |
 
 † hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
 (`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
 comparing our single-WG kernel against them is structural mismatch — the v3+
-bench target is the 8 multi-stage shapes only. **v6 (stages=2 ring + automatic split-K, Step 6) wins ALL 8 multi-stage shapes at
-1.03-1.52x** (CTAs column = grid size `ceil(max_s/64)*B*H_q`; v6 ms derived from the
-Step 6 four-quadrant A/B ratio matrix; † shapes not re-benched under v6 defaults).
+bench target is the 8 multi-stage shapes only. **v6/v7 (stages=2 ring + automatic
+split-K + vectorized combine, Steps 6-7) win ALL 8 multi-stage shapes at 1.03-1.46x**
+(CTAs column = grid size `ceil(max_s/64)*B*H_q`; the v7 column is a fresh 22-shape
+re-bench under the current defaults — 3-way 0 Failed; the 6 legacy † rows were not
+re-run since v5).
 
 The last 8 rows (added with the shape-set refresh) use **industry-standard configs**
 — Llama3-8B heads (32Q/8KV) at a constant ~16k-token budget swept across
@@ -88,6 +90,11 @@ residual is single-warpgroup vs 3-warpgroup WGMMA scheduling, not load/pipeline 
 - **v6 stages=2 + auto split-K + sP smem removal: 8/8 multi-stage shapes at 1.03-1.52x**
   (single-head 1.52x, 512² 1.48x). Double-buffering turned positive once v5/v6b removed
   the fixed per-CTA latency it must hide; split=2 is auto-selected iff grid ≤ 96 CTAs.
+- **v7 vectorized combine + sO dead-smem removal: 8/8 at 1.03-1.46x** (Step 7) — the
+  LSE merge now loads/stores 16 B vectors (−4-7% where combine is on the critical
+  path); sO turned out to be a second never-dereferenced partition_C template
+  (−16 KB/CTA, headroom not occupancy); pick_split threshold 96 re-confirmed with
+  the [512,768]-vs-GQA×3 disagreement documented.
 
 ---
 
@@ -297,7 +304,7 @@ secondary lever stands and becomes Step 5.)*
 | (4,4,128,[512]) | 0.071 | 0.072 | 0.106 | 0.188 |
 | (8,8,128,[1024]) | 0.130 | 0.209 | 0.327 | 0.612 |
 | (4,1,128,[512]) GQA | 0.071 | 0.073 | 0.106 | 0.188 |
-| **(1,1,128,[512])** single head | 8 | 0.073 | 0.070 | 0.067 | **0.019** | **1.52x faster** 
+| **(1,1,128,[512])** single head | 8 | 0.073 | 0.070 | 0.067 | **1.46x faster** |
 | [512,768] | 0.120 | 0.156 | 0.234 | 0.397 |
 | [200,328] | 0.068 | 0.107 | 0.146 | 0.227 |
 | [256,384,512] | 0.110 | 0.152 | 0.193 | 0.353 |
@@ -426,16 +433,49 @@ Two conclusions:
 
 ---
 
-## Step 7+: planned optimizations (multi-stage scope only)
+## Step 7: ✅ v7 — vectorized LSE combine + sO dead-smem removal (small grids to 1.03-1.46x)
+
+**tag: `flash-ex1-v7-combine`** — three follow-ups from the v7 option list:
+
+1. **combine_kernel vectorized**: was 1 thread = 1 column with scalar 4B loads
+   (grid T×H, block 128). Now `VEC=4` columns/thread (16 B `autovec_copy` loads of
+   PO + vectorized bf16 store) and `ROWS=4` rows/CTA (block `(Dd/4, 4, 1)`). On the
+   split=2 shapes this moved e.g. GQA×3 0.028→0.026 ms, [512,768] 0.034→0.032 ms;
+   512² itself sat *at* the combine's launch floor (the 4.2 µs combine overlaps
+   other CTAs' mainloop tail, so its cost was partly hidden) — net: honest −4-7%
+   where combine is on the critical path, elsewhere noise.
+2. **sO MemRange deleted (−16 KB/CTA)**: like sP in v6b, `sO` turned out to be a
+   pure `partition_C` layout template — `tCrO` lives in registers and the epilogue
+   copy (`r2s_tiled_copy_o`, misleadingly named) goes reg→gmem directly. Both
+   sP/sO now borrow sV's base pointer; smem 96→80 KB/CTA at stages=2. Occupancy
+   stays at 2 CTA/SM (3 would need ≤75 KB) and long-seq numbers are unchanged
+   (within noise), so this is pure memory headroom, not a speed lever.
+3. **pick_split threshold kept at 96** (data correction from the review): at
+   exactly 96 CTAs the two shapes disagree — unequal [512,768] *gains* +0.16x from
+   split=2 while balanced GQA×3 *loses* −0.04x — so ≤96 stays; documented in the
+   docstring.
+
+### Result (v7 = current default)
+multi-stage zone **8/8 vs hpc-ops, 1.03-1.46x** (H1 1.46, 512² 1.42, GQA512 1.40,
+[512,768] 1.37, GQA×3 1.33, [200,328] 1.12, [512]×4 1.08, 1024² 1.03); Llama3
+standard zone unchanged 0.79-0.96x (zipf varlen 0.96x).
+
+### Verified
+- `make quality` ✓; `run_prefill.py` **22/22**; `test_varlen.py` **5/5**;
+  `compare_hpcops.py` small-8 + Llama3/varlen-8 **3-way 0 Failed** each.
+
+---
+
+## Step 8+: planned optimizations (multi-stage scope only)
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
-| ~~6~~ | ~~flash-ex1-v6-picksplit~~ | ✅ DONE — 8/8 multi-stage shapes faster (1.03-1.52x) | — |
-| 7 | (candidate) | † long-seq re-bench under stages=2 (matrix only covered the 8 multi-stage shapes); sO-over-sQ smem aliasing for occupancy; BLK_N=128 (halve iterations) | †-region + polish |
+| ~~7~~ | ~~flash-ex1-v7-combine~~ | ✅ DONE — combine vectorized, sO smem freed, 1.03-1.46x | — |
+| 8 | (candidate) | O epilogue TMA store (reg->smem->S2G bulk, coalesced async exit) | small tail-latency win |
+| 9 | (candidate) | BLK_N=128 (halve iterations; needs smem headroom from Step 7) | uncertain, causal tail waste |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
 **Bench target set from v3 on: the 8 multi-stage shapes** (`--shapes 0,1,2,3,6,7,8,9`) —
 long/serving shapes compare against hpc-ops' *different* kernel (warp_spec) and are
 informational only.
-

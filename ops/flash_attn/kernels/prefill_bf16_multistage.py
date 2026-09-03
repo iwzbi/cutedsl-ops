@@ -198,11 +198,11 @@ class FlashAttnPrefillBf16Multistage:
         sQ_full = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
         sK_full = storage.sK.get_tensor(sK_layout_staged.outer, swizzle=sK_layout_staged.inner)
         sV_full = storage.sV.get_tensor(sV_layout_staged.outer, swizzle=sV_layout_staged.inner)
-        # sP_flat is a compile-time partition_C TEMPLATE only (tCrS lives in
-        # registers; the memory is never dereferenced), so it borrows sO's
-        # base pointer instead of owning 8KB of smem (v6: 72 -> 64KB/CTA).
-        sP_flat = cute.make_tensor(storage.sO.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
-        sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
+        # sP_flat/sO are compile-time partition_C TEMPLATES only (tCrS/tCrO
+        # live in registers; the epilogue copies reg->gmem directly), so both
+        # borrow sV's base pointer and own no smem (v6: -8KB sP, v7: -16KB sO).
+        sP_flat = cute.make_tensor(storage.sV.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
+        sO = cute.make_tensor(storage.sV.data_ptr(), cute.make_layout((BLK_M, Dd)))
 
         # Varlen: this CTA owns (batch = bid_bh // H_q, head = bid_bh % H_q).
         # gmem is (total_seq, H_q/H_kv, D) — NOT batch-folded: the head index
@@ -568,29 +568,45 @@ class FlashAttnPrefillBf16Multistage:
         thread d owns output column d.  O = sum_s w_s*PO_s / sum_s w_s*Pl_s
         with w_s = exp2(scale_log2*(m_s - M)), M = max_s m_s (w_s=0 when
         m_s=-inf, all-inf rows emit 0)."""
-        d, _, _ = cute.arch.thread_idx()
-        row, h, _ = cute.arch.block_idx()
+        # v7: thread (tx, ty) merges row = bx*ROWS + ty across cols
+        # [tx*VEC, (tx+1)*VEC) so PO loads / O stores are VEC-wide vectors.
+        # T_pad is 64-aligned, so ROWS divides the row grid exactly.
+        VEC: cutlass.Constexpr[int] = 4
+        ROWS: cutlass.Constexpr[int] = 4
+        tx, ty, _ = cute.arch.thread_idx()
+        bx, h, _ = cute.arch.block_idx()
+        row = bx * ROWS + ty
+        d0 = tx * VEC
 
         m_max = mPm[(row, h, 0)]
         for s in cutlass.range_constexpr(1, SplitK):
             m_max = cutlass.max(m_max, mPm[(row, h, s)])
 
-        if m_max == float("-inf"):
-            mO[(row, h, d)] = self.o_dtype(0.0)
-        else:
+        acc = cute.make_rmem_tensor((VEC,), cutlass.Float32)
+        for j in cutlass.range_constexpr(VEC):
+            acc[j] = cutlass.Float32(0.0)
+        if m_max != float("-inf"):
             l_sum = cutlass.Float32(0.0)
-            acc = cutlass.Float32(0.0)
+            frag = cute.make_rmem_tensor((VEC,), cutlass.Float32)
             for s in cutlass.range_constexpr(SplitK):
                 m_s = mPm[(row, h, s)]
                 w = cute.math.exp2(scale_log2 * (m_s - m_max), fastmath=True)
                 if m_s == float("-inf"):
                     w = cutlass.Float32(0.0)
                 l_sum = l_sum + w * mPl[(row, h, s)]
-                acc = acc + w * mPO[(row, h, s, d)]
+                tile = cute.local_tile(mPO, (1, 1, 1, VEC), (row, h, s, tx))
+                cute.autovec_copy(tile, frag)
+                for j in cutlass.range_constexpr(VEC):
+                    acc[j] = acc[j] + w * frag[j]
             inv = cute.arch.rcp_approx(l_sum)
             if l_sum == 0.0 or l_sum != l_sum:  # noqa: PLR0124
                 inv = 1.0
-            mO[(row, h, d)] = self.o_dtype(acc * inv)
+            for j in cutlass.range_constexpr(VEC):
+                acc[j] = acc[j] * inv
+        out = cute.make_rmem_tensor((VEC,), self.o_dtype)
+        out.store(acc.load().to(self.o_dtype))
+        o_tile = cute.local_tile(mO, (1, 1, VEC), (row, h, tx))
+        cute.autovec_copy(out, o_tile)
 
     @cute.jit
     def __call__(
@@ -706,8 +722,12 @@ class FlashAttnPrefillBf16Multistage:
             (Dd, BLK_N),
         )
 
-        # Shared storage: K/V ring buffers (staged cosize), P, O, plus Q and
-        # K/V mbarrier arrays (PipelineTmaAsync needs 2 Int64 per stage).
+        # Shared storage: K/V ring buffers (staged cosize) plus Q and K/V
+        # mbarrier arrays (PipelineTmaAsync needs 2 Int64 per stage). The P and
+        # O C-fragment templates (sP_flat/sO below) never dereference smem —
+        # accumulators live in registers and the epilogue copies reg->gmem —
+        # so in v7 both MemRanges are gone (-24KB/CTA) and the tensors borrow
+        # sV's base pointer purely for compile-time layout algebra.
         @cute.struct
         class SharedStorage:
             bar_kv_array: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
@@ -715,7 +735,6 @@ class FlashAttnPrefillBf16Multistage:
             sQ: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sQ_layout_staged)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sK_layout_staged)], 1024]
             sV: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sV_layout_staged)], 1024]
-            sO: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sO_layout)], 1024]
 
         # Non-clustered CTA: vmnk = (1, 1, 1, 1).
         cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
@@ -767,7 +786,11 @@ class FlashAttnPrefillBf16Multistage:
                 self.split_k,
                 H_q,
                 Dd,
-            ).launch(grid=(mO.shape[0], H_q, 1), block=(Dd, 1, 1), stream=stream)
+            ).launch(
+                grid=((mO.shape[0] + 3) // 4, H_q, 1),
+                block=(Dd // 4, 4, 1),  # tx: column-vec group, ty: row group
+                stream=stream,
+            )
 
 
 __all__ = ["BLK_M", "BLK_N", "NUM_THREADS", "D", "FlashAttnPrefillBf16Multistage"]
