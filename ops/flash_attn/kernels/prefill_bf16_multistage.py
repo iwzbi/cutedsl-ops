@@ -162,7 +162,8 @@ class FlashAttnPrefillBf16Multistage:
         mK_tma: cute.Tensor,
         tma_atom_v: cute.CopyAtom,
         mV_tma: cute.Tensor,
-        mO: cute.Tensor,
+        tma_atom_o: cute.CopyAtom,
+        mO_tma: cute.Tensor,
         mSeqlens: cute.Tensor,
         mCuSeqlens: cute.Tensor,
         mPO: cute.Tensor,
@@ -198,11 +199,17 @@ class FlashAttnPrefillBf16Multistage:
         sQ_full = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
         sK_full = storage.sK.get_tensor(sK_layout_staged.outer, swizzle=sK_layout_staged.inner)
         sV_full = storage.sV.get_tensor(sV_layout_staged.outer, swizzle=sV_layout_staged.inner)
-        # sP_flat/sO are compile-time partition_C TEMPLATES only (tCrS/tCrO
-        # live in registers; the epilogue copies reg->gmem directly), so both
-        # borrow sV's base pointer and own no smem (v6: -8KB sP, v7: -16KB sO).
+        # sP_flat is a compile-time partition_C TEMPLATE only (tCrS lives in
+        # registers), so it borrows sV's base pointer and owns no smem (v6b).
         sP_flat = cute.make_tensor(storage.sV.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
-        sO = cute.make_tensor(storage.sV.data_ptr(), cute.make_layout((BLK_M, Dd)))
+        # v8: sO is a REAL buffer again (r2s landing pad for the TMA store)
+        # but aliases the sQ region — the last sQ read is the final QK WGMMA
+        # (wait_group(0) before any epilogue runs), and a sync_threads below
+        # orders the overwrite. Same (BLK_M, Dd) bf16 swizzled layout as Q.
+        # PLAIN row-major on purpose: r2s (partition_D) and the S2G TMA atom
+        # must see byte-identical layouts; the swizzled sO_layout caused a
+        # d>=64 column-swap between the two interpretations (v8 debug).
+        sO = cute.make_tensor(storage.sQ.data_ptr(), cute.make_layout((BLK_M, Dd), stride=(Dd, 1)))
 
         # Varlen: this CTA owns (batch = bid_bh // H_q, head = bid_bh % H_q).
         # gmem is (total_seq, H_q/H_kv, D) — NOT batch-folded: the head index
@@ -283,6 +290,17 @@ class FlashAttnPrefillBf16Multistage:
                 cute.group_modes(tSgQ, 0, 2),
             )
             tQgQ = tQgQ_tmp[(None, None, 0, h_q)]
+            # v8: output tile for the epilogue TMA store (S2G atom over the
+            # (S, D, H_q) view; gmem tile index q_row0//BLK_M at store time).
+            tSgO = cute.flat_divide(mO_tma, (BLK_M, Dd))
+            tOsO, tOgO_tmp = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_o,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sO, 0, 2),
+                cute.group_modes(tSgO, 0, 2),
+            )
+            tOgO = tOgO_tmp[(None, None, 0, h_q)]
 
             # ----- MMA fragments & softmax state (unchanged from v1) -----
             qk_thr = qk_tiled_mma.get_slice(tidx)
@@ -517,8 +535,11 @@ class FlashAttnPrefillBf16Multistage:
                     a_sum[i] = cute.arch.warp_reduction_sum(a_sum[i], threads_in_group=red_target.shape[r])
 
             if cutlass.const_expr(self.split_k == 1):
-                # Fused epilogue: O /= l, cast fp32→bf16, write the Q-tile to
-                # gmem via a register→gmem tiled copy (CopyUniversalOp route).
+                # Fused epilogue (v8): O /= l, cast fp32→bf16, r2s into the
+                # sQ-aliased smem, then one bulk TMA store smem→gmem (the
+                # lesson-11 S2G pattern: fence_proxy so the async proxy sees
+                # the writes, sync, warp0 elect_one issues the store and
+                # waits the read-back before CTA exit frees the smem).
                 for i in cutlass.range_constexpr(qk_m):
                     s = a_sum[i]
                     inv = cute.arch.rcp_approx(s)
@@ -526,12 +547,18 @@ class FlashAttnPrefillBf16Multistage:
                         inv = 1.0
                     for j in cutlass.range_constexpr(pv_n):
                         acc_pv_mn[i, j] = acc_pv_mn[i, j] * inv
-                gO = cute.local_tile(mO, (BLK_M, 1, Dd), (q_row0 // BLK_M, h_q, 0))
                 acc_o_bf16 = cute.make_fragment_like(tCrO, self.o_dtype)
                 acc_o_bf16.store(tCrO.load().to(self.o_dtype))
                 tDrO = thr_r2s_o.retile(acc_o_bf16)
-                tDgO = thr_r2s_o.partition_D(cute.group_modes(gO, 0, 2))
-                cute.copy(r2s_tiled_copy_o, tDrO, tDgO)
+                tDsO = thr_r2s_o.partition_D(sO)
+                cute.copy(r2s_tiled_copy_o, tDrO, tDsO)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_threads()
+                if warp_idx == 0:
+                    with cute.arch.elect_one():
+                        cute.copy(tma_atom_o, tOsO[None], tOgO[None, q_row0 // BLK_M])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
             else:
                 # split-KV partial epilogue: write the UN-normalized fp32 O
                 # tile to PO, plus per-row running max (Pm) and running sum
@@ -694,6 +721,18 @@ class FlashAttnPrefillBf16Multistage:
             cute.slice_(sQ_layout_staged, (None, None, 0)),
             (BLK_M, Dd),
         )
+        # v8: output view (S, D, H_q) + S2G atom; same construct as q_view but
+        # CopyBulkTensorTileS2GOp, plain (non-staged) sO layout.
+        o_view = cute.make_tensor(
+            mO.iterator,
+            cute.make_layout((total_seq, Dd, H_q), stride=(H_q * Dd, 1, Dd)),
+        )
+        tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            o_view,
+            cute.make_layout((BLK_M, Dd), stride=(Dd, 1)),
+            (BLK_M, Dd),
+        )
         # K view (S, D, H_kv), strides (H_kv*D, 1, D): matches hpc-ops' K =
         # (max_seq, D, H_kv) construct.  The 2D tma box (BLK_N, Dd) divides the
         # leading (S, D) modes; the trailing H_kv mode is indexed per-CTA.
@@ -723,11 +762,12 @@ class FlashAttnPrefillBf16Multistage:
         )
 
         # Shared storage: K/V ring buffers (staged cosize) plus Q and K/V
-        # mbarrier arrays (PipelineTmaAsync needs 2 Int64 per stage). The P and
-        # O C-fragment templates (sP_flat/sO below) never dereference smem —
-        # accumulators live in registers and the epilogue copies reg->gmem —
-        # so in v7 both MemRanges are gone (-24KB/CTA) and the tensors borrow
-        # sV's base pointer purely for compile-time layout algebra.
+        # mbarrier arrays (PipelineTmaAsync needs 2 Int64 per stage). The P
+        # C-fragment template owns no smem (v6b: compile-time layout algebra,
+        # borrows sV's pointer); v7 deleted sO's MemRange the same way, and v8
+        # reintroduces sO data as an r2s landing pad that ALIASES the sQ region
+        # (Q is fully consumed before the epilogue writes it) — so the smem
+        # budget stays at sQ + K/V ring with no extra buffers.
         @cute.struct
         class SharedStorage:
             bar_kv_array: cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages]
@@ -752,7 +792,8 @@ class FlashAttnPrefillBf16Multistage:
             tma_tensor_k,
             tma_atom_v,
             tma_tensor_v,
-            mO,
+            tma_atom_o,
+            tma_tensor_o,
             mSeqlens,
             mCuSeqlens,
             mPO,
