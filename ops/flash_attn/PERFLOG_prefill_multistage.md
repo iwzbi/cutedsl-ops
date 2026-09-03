@@ -47,6 +47,7 @@ figures). Raw data: `.omo/closure/{tag}_unified.tsv` + `matrix.json`; ncu:
 | v8 `…-v8-tma-store` | O epilogue = bulk TMA store from sQ-aliased pad | 0.022 | 1.40x | fused mid-band −14% | 17.6 µs | barrier 118 (top), long_sb 54 ↓ | 2.88% |
 | v10 `…-v10-store-retire` | drop redundant bulk commit/wait | 0.022 | 1.39x | neutral (simplification) | 17.8 µs | barrier 114 (top) | 2.90% |
 | v11 `…-v11-pdl` | PDL on the split-path combine launch (`use_pdl` + `griddepcontrol_wait`) | 0.020 | 1.45-1.79x | split-band −4~14% | — (fused path untouched) | — | — |
+| v12 (no tag, **reverted**) | single-kernel split via Hopper cluster + DSMEM merge (Step 12) | 0.020-0.042 | 0.96-1.50x | **+0~35% regression** | — | — | — |
 
 ### Full 22-shape × 9-version matrix (vs hpc, >1 = ours faster; unified re-bench)
 
@@ -688,6 +689,62 @@ with zero downside.
 
 ---
 
+## Step 12: ❌ v12 — single-kernel split-KV via Hopper cluster + DSMEM (built, measured, reverted)
+
+**no feature tag (rejected experiment; v11 remains terminal)** — user-chosen
+route B: replace the two-kernel split path (main + LSE-combine) with a
+**2-CTA cluster** (`cluster=(1,1,2)`): each CTA computes one KV span, writes its
+un-normalized fp32 partial + (m, l) into its own `cutlass.Array` smem buffers, a
+non-relaxed `barrier_cluster_arrive/wait` pair publishes them, then both CTAs
+mapa-**pull** the peer's partial, do the LSE merge in-register, and rank 0 emits
+the v8 TMA store. combine kernel, PO/Pm/Pl gmem buffers and PDL all deleted.
+
+### Engineering outcome: every primitive works; the idea doesn't
+- Correctness fully achieved: fused regression 22/22, cluster path 22/22,
+  test_varlen 5/5, compare 3-way 0 Failed — the DSL *can* build a
+  DSMEM-merged single-kernel split attention. Key findings (see below).
+- Performance: split-band **regressed +0~35%** vs v11 — 512²/GQA512/H1 roughly
+  flat-to-+11%, multi-batch shapes brutally worse ([512,768] 0.031→0.042,
+  [200,328] 0.021→0.027 (falls below hpc!), GQA×3 0.025→0.033). Reverted.
+
+### Why it loses (measured attribution)
+1. **Merge parallelism collapse dominates**: v11's combine runs as its own grid
+   (~2048 CTAs across the whole GPU) and v11's PDL already hid its launch gap.
+   v12 squeezes the same LSE math into the 128 threads of one cluster member —
+   scalar per-element mapa loads (64/thread) are far slower than the massively
+   parallel dedicated kernel. Saving ~4 µs of launch pays nothing when the
+   merge itself costs +6-11 µs.
+2. **Cluster gang-scheduling + smem tax on exactly the multi-batch shapes**:
+   the split path's smem grew 80 → ~112.5 KB/CTA (sPart 32 KB + stats), hugging
+   the 2-CTA/SM ceiling, and both members must co-reside in one GPC — fine for
+   tiny grids, harmful at 96-192 CTA (the +30% band).
+3. Lesson generalized: **co-location ≠ free**. Turning a launch boundary into a
+   cluster boundary imports the scheduler's constraints into the hot path; it
+   only pays when the merged stage is small AND latency-bound (here it was small
+   but wide-parallel after PDL).
+
+### Reusable findings banked (from X1-X4 bisection + fix)
+- Full cluster recipe verified in a real kernel: `launch(cluster=(1,1,2))`,
+  `block_idx_in_cluster()`, `cutlass.Array(fp32,(64,128),smem,16)` coexisting
+  with `@cute.struct` SharedStorage + `PipelineTmaAsync(cta_layout_vmnk=
+  (1,1,1,1))` (X1: innocent), non-relaxed arrive/wait for publication,
+  `prims.mapa(ptr, peer_rank)` + `(peer+off).load()` for pulls, and a terminal
+  `arrive_relaxed+wait` so no member frees smem while its peer reads (X-era
+  crash #1).
+- **Identity-tensor coordinate trap** (crash #2, illegal access): `c_idx`-derived
+  row numbers are *batch-local absolute* — correct for v4's gmem Pm/Pl writes,
+  OOB by up to 448 when indexing a 64-slot tile-local smem buffer. Fix: subtract
+  `q_tile_start`. Rule: re-audit the coordinate space whenever a c_idx-derived
+  index changes destination.
+- DSL `map_dsmem_ptr`'s dsmem tensors don't support load/store —
+  `cutlass.experimental.primitives.mapa` is the only working pull path.
+
+### Verified (as experiment, on /tmp/v12_backup.py)
+22/22 ×2 configs, 5/5, 3-way 0 Failed; bench table in journey row above. Code
+reverted to v11 (04535ea); no tag.
+
+---
+
 ## Closure: frozen state & unused levers (v10 = final)
 
 **This kernel line is frozen at v10.** Final per-version evidence lives in the
@@ -706,10 +763,12 @@ each Step's `Δ analysis` block ties its lever to the metric it moved.
    band; `use_pdl` + `griddepcontrol_wait` are both wrapped by the DSL — the
    original 'not wrapped' note was wrong). Producer-side `launch_dependents()`
    early-release remains unexplored.
-4. **TMA multicast / clusters / DSMEM**: KV is re-read across Q-tiles of the same
-   (b,h); a 2-CTA cluster sharing one K/V load halves ring traffic at long seqs —
-   untested, plausible for rows 16-21, but v3's grid-order A/B hints L2 already
-   catches much of it at these sizes.
+4. **TMA multicast (still untested) / clusters+DSMEM (exploited and REJECTED as
+   merge vehicle — Step 12)**: the cluster-as-merge-transport idea measured
+   +0~35% (merge parallelism collapse + gang-scheduling tax). What remains
+   untried is the *other* cluster use: multicast-loading shared K/V tiles to
+   halve ring traffic on long seqs (rows 16-21) — Step 12 proved the plumbing
+   works if anyone wants to attempt it.
 5. **L2 persistence window** (`cudaAccessPolicyWindow`) for K/V prefixes on
    serving rows ([512]×8..×32).
 6. **FP8 P·V / reduced softmax precision**: hpc's own D-series direction; breaks
