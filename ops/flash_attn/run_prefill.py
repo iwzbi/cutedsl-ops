@@ -42,14 +42,20 @@ from ops.flash_attn.kernels.prefill_bf16_multistage import (
     NUM_THREADS,
     FlashAttnPrefillBf16Multistage,
 )
-from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen
+from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen, pick_split
 
 
 ATOL = 0.016
-NUM_STAGES = 1  # smem pipeline stages (kernel class default)
-# Split-KV factor (grid z).  FA_SPLIT=2/4/8 for the v4 A/B bench; default 1
-# keeps the fused single-pass epilogue (identical to v3).
-SPLIT = int(os.environ.get("FA_SPLIT", "1"))
+STAGES = int(os.environ.get("FA_STAGES", "2"))  # K/V ring depth (v6: stages=2 wins)
+
+
+def _split_for(shape):
+    """Split-KV factor (grid z): FA_SPLIT env overrides for A/B benches, else
+    auto by grid shape (v6: pick_split=2 wins on small grids)."""
+    if "FA_SPLIT" in os.environ:
+        return int(os.environ["FA_SPLIT"])
+    H_q, _H_kv, _D, seqlens = shape
+    return pick_split(((max(seqlens) + BLK_M - 1) // BLK_M) * len(seqlens) * H_q)
 
 
 DESC = "bf16 multi-stage varlen (single WG, class-based)"
@@ -68,6 +74,7 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
     H_q, H_kv, D, seqlens = shape
     B = len(seqlens)
     max_s = max(seqlens)
+    split = _split_for(shape)
     q, k, v = _gen_bf16(B, H_q, H_kv, max_s, D)
     q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens = pack_varlen(q, k, v, seqlens)
     pad_offsets = cu_seqlens.cpu().numpy()
@@ -81,11 +88,11 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
     print(f"{'=' * 80}")
 
     print("Compiling CuTe DSL (ex.1, bf16 varlen) ...")
-    instance = FlashAttnPrefillBf16Multistage(split_k=SPLIT)
+    instance = FlashAttnPrefillBf16Multistage(num_stages=STAGES, split_k=split)
     t_pad = o_cat.shape[0]
-    po = torch.empty(t_pad, H_q, SPLIT, D, device="cuda", dtype=torch.float32)
-    pm = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
-    pl = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
+    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
+    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
+    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
     compiled = cute.compile(
         instance,
         # q_cat: (T, H_q, D) bf16, strides (H_q*D, D, 1) — contiguous; T = Σ_b ceil(seq_b/64)*64
@@ -101,7 +108,7 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
         # cu_seqlens: (B+1,) int32, padded 64-aligned cumulative offsets
         make_cute_tensor(cu_seqlens, leading_dim=0),
         # split-KV workspace (fp32): partial O (T,H_q,S,D) + per-split max/sum
-        # (T,H_q,S).  Unused when SPLIT==1 but still required by the signature.
+        # (T,H_q,S).  Unused when split==1 but still required by the signature.
         make_cute_tensor(po, leading_dim=3),
         make_cute_tensor(pm, leading_dim=2),
         make_cute_tensor(pl, leading_dim=2),
@@ -145,7 +152,7 @@ def run_case(shape, *, bench=False, use_ncu=False) -> bool:
 
         meta = KernelMeta(
             name="FA-Prefill-ex1",
-            tile_dims={"BLK_M": BLK_M, "BLK_N": 64, "D": D, "NUM_STAGES": NUM_STAGES, "SPLIT": SPLIT},
+            tile_dims={"BLK_M": BLK_M, "BLK_N": 64, "D": D, "NUM_STAGES": STAGES, "SPLIT": split},
             block_threads=NUM_THREADS,
             block_description=DESC,
             grid_mode="standard",

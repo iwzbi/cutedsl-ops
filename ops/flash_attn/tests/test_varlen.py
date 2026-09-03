@@ -18,11 +18,15 @@ import torch.nn.functional as F
 from cutlass import cute
 
 from common.cute_runtime import make_cute_tensor, make_stream
-from ops.flash_attn.kernels.prefill_bf16_multistage import FlashAttnPrefillBf16Multistage
-from ops.flash_attn.reference import allclose, pack_varlen
+from ops.flash_attn.kernels.prefill_bf16_multistage import (
+    BLK_M,
+    FlashAttnPrefillBf16Multistage,
+)
+from ops.flash_attn.reference import allclose, pack_varlen, pick_split
 
 
-SPLIT = int(os.environ.get("FA_SPLIT", "1"))
+SPLIT_OVERRIDE = int(os.environ["FA_SPLIT"]) if "FA_SPLIT" in os.environ else None
+STAGES = int(os.environ.get("FA_STAGES", "2"))
 
 
 def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
@@ -30,6 +34,8 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
     scale_sqrt = (1.0 / math.sqrt(D)) ** 0.5
     max_s = max(seqlens_list)
     pad_to = pad_to or max_s
+    # v6a: auto split-K by grid shape unless FA_SPLIT overrides.
+    split = SPLIT_OVERRIDE or pick_split(((max_s + BLK_M - 1) // BLK_M) * B * H_q)
 
     q = torch.randn(B, H_q, pad_to, D, device="cuda", dtype=torch.bfloat16) * scale_sqrt
     k = torch.randn(B, H_kv, pad_to, D, device="cuda", dtype=torch.bfloat16) * scale_sqrt
@@ -40,12 +46,12 @@ def run(B, H_q, H_kv, seqlens_list, D, pad_to=None):
     padded_offsets = cu_seqlens.cpu().to(torch.int64).numpy()
 
     t_pad = o_cat.shape[0]
-    po = torch.empty(t_pad, H_q, SPLIT, D, device="cuda", dtype=torch.float32)
-    pm = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
-    pl = torch.empty(t_pad, H_q, SPLIT, device="cuda", dtype=torch.float32)
+    po = torch.empty(t_pad, H_q, split, D, device="cuda", dtype=torch.float32)
+    pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
+    pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
 
-    inst = FlashAttnPrefillBf16Multistage(split_k=SPLIT)
-    print(f"Compiling varlen(B={B},H_q={H_q},H_kv={H_kv},seq={seqlens_list},max={pad_to},D={D},split={SPLIT}) ...")
+    inst = FlashAttnPrefillBf16Multistage(num_stages=STAGES, split_k=split)
+    print(f"Compiling varlen(B={B},H_q={H_q},H_kv={H_kv},seq={seqlens_list},max={pad_to},D={D},split={split}) ...")
     compiled = cute.compile(
         inst,
         make_cute_tensor(q_cat, leading_dim=2),

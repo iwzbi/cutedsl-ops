@@ -35,8 +35,11 @@ from cutlass import cute
 sys.path.insert(0, ".")
 from common.bench import cuda_bench, get_gpu_info
 from common.cute_runtime import make_cute_tensor, make_stream
-from ops.flash_attn.kernels.prefill_bf16_multistage import FlashAttnPrefillBf16Multistage
-from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen
+from ops.flash_attn.kernels.prefill_bf16_multistage import (
+    BLK_M,
+    FlashAttnPrefillBf16Multistage,
+)
+from ops.flash_attn.reference import PREFILL_SHAPES, allclose, pack_varlen, pick_split
 
 
 def _gen_data(H_q, H_kv, seqlens, D, device="cuda"):
@@ -121,7 +124,7 @@ def _run_cutedsl(q, k, v, seqlens, H_q, H_kv, D, split=1):
     pm = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
     pl = torch.empty(t_pad, H_q, split, device="cuda", dtype=torch.float32)
 
-    instance = FlashAttnPrefillBf16Multistage(split_k=split)
+    instance = FlashAttnPrefillBf16Multistage(num_stages=int(os.environ.get("FA_STAGES", "2")), split_k=split)
     compiled = cute.compile(
         instance,
         make_cute_tensor(q_cat, leading_dim=2),
@@ -172,10 +175,12 @@ def main():
         shape_indices = [int(x) for x in sys.argv[idx].split(",")]
     shapes = PREFILL_SHAPES if shape_indices is None else [PREFILL_SHAPES[i] for i in shape_indices]
 
-    split = int(os.environ.get("FA_SPLIT", "1"))
+    split_override = None
+    if "FA_SPLIT" in os.environ:
+        split_override = int(os.environ["FA_SPLIT"])
     if "--split" in sys.argv:
-        split = int(sys.argv[sys.argv.index("--split") + 1])
-    print(f"  cutedsl split_k = {split}")
+        split_override = int(sys.argv[sys.argv.index("--split") + 1])
+    print(f"  cutedsl split_k = {split_override or 'auto (pick_split by grid)'}")
 
     print(f"\n{'Shape':<40} {'H':>3} {'Hkv':>4} {'D':>4} {'B':>3} {'max_s':>6}")
     print("-" * 100)
@@ -194,6 +199,8 @@ def main():
         # both roughly do this; padded rows of the cutedsl kernel are masked).
         flops = int(4 * H_q * sum(s * s for s in seqlens) * D)
         label = f"({H_q},{H_kv},{D},{seqlens})"
+        # v6a: auto split-K by grid shape unless FA_SPLIT/--split overrides.
+        split = split_override or pick_split(((max(seqlens) + BLK_M - 1) // BLK_M) * len(seqlens) * H_q)
 
         q, k, v = _gen_data(H_q, H_kv, seqlens, D)
 

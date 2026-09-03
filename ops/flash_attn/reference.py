@@ -130,6 +130,18 @@ def pack_varlen(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens, blk_
     return q_cat, k_cat, v_t, o_cat, seqlens_t, cu_seqlens
 
 
+def pick_split(ctas: int) -> int:
+    """Split-K factor for the varlen prefill kernel, by grid shape.
+
+    v4/v5/v6 A/B: split_k=2 wins on small grids (fewer than ~2 waves of 78
+    SMs: up to 96 CTAs here) where per-CTA fixed cost dominates and extra CTAs
+    fill the GPU; it loses on >=128-CTA grids where the GPU is already busy
+    and the extra Q loads / partial traffic are pure cost.  See PERFLOG
+    Step 4/5/6.
+    """
+    return 2 if ctas <= 96 else 1
+
+
 def repeat_kv(x: torch.Tensor, num_heads: int) -> torch.Tensor:
     """Repeat KV for GQA: ``(B, H_kv, N, D) -> (B, H, N, D)``."""
     if num_heads == x.shape[1]:
@@ -386,6 +398,7 @@ __all__ = [
     "gather_paged_kv",
     "lse_combine",
     "pack_varlen",
+    "pick_split",
     "ref_decode_bf16",
     "ref_decode_fp8",
     "repeat_kv",

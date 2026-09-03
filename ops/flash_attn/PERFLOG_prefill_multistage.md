@@ -27,28 +27,29 @@ reason) — the hpc/cute *ratio* is fair, the absolute TFLOPS is an upper bound.
 the same 14-shape re-bench run (FA_SPLIT=1, 3-way vs torch all Success); v1/v2/v3
 rows keep their historical numbers.
 
-| Shape (H_q,H_kv,D,seqlens) | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5-qasync | vs hpc (v5) |
-|---|---|---|---|---|---|
-| **(4,4,128,[512])** single batch | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | **0.027 / 20.1T (13.6%)** | **1.28x faster** |
-| **(8,8,128,[1024])** single batch | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | **0.050 / 85.5T (57.8%)** | **1.06x faster** |
-| **(4,1,128,[512])** GQA | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | **0.027 / 20.2T** | **1.10x faster** |
-| **(1,1,128,[512])** single head | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | **0.026 / 5.1T** | **1.08x faster** |
-| **(4,4,128,[4096])** long seq † | 0.164 / 209.0T (>peak) | 0.350 / 98.1T (66%) | — † | **0.244 / 140.8T (95.1%)** | 0.67x |
-| **(8,2,128,[4096])** GQA long † | 0.286 / 240.3T (>peak) | 0.593 / 115.8T (78%) | — † | **0.356 / 193.0T (130%)** | 0.80x |
-| **(4,4,128,[512,768])** unequal | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | **0.041 / 42.2T** | **1.07x faster** |
-| **(4,4,128,[200,328])** misaligned | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | **0.023 / 13.2T** | **1.13x faster** |
-| **(4,1,128,[256,384,512])** GQA×3 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | **0.032 / 30.4T** | **1.08x faster** |
-| **(4,1,128,[512]×4)** GQA×4 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | **0.034 / 64.0T** | **1.01x faster** |
-| **(4,4,128,[2048,2048])** † | 0.090 / 190.5T | 0.263 / 65.4T (44%) | — † | **0.119 / 144.6T (97.7%)** | 0.76x |
-| **(4,4,128,[512]×8)** serving † | 0.039 / 108.9T | 0.196 / 21.9T | — † | **0.044 / 98.5T** | 0.90x |
-| **(8,8,128,[1024]×8)** serving † | 0.164 / 209.3T | 0.775 / 44.3T | — † | **0.187 / 184.0T** | 0.88x |
-| **(4,4,128,[512]×16)** serving † | 0.059 / 145.9T | 0.364 / 23.6T | — † | **0.069 / 125.4T (84.7%)** | 0.86x |
+| Shape (H_q,H_kv,D,seqlens) | CTAs | hpc-ops | ex.1 v2-TMA | ex.1 v3 | ex.1 v5 | **ex.1 v6 (stages=2+auto split)** | vs hpc (v6) |
+|---|---|---|---|---|---|---|---|
+| **(4,4,128,[512])** single batch | 32 | 0.034 ms / 15.7T (11%) | 0.070 ms / 7.6T (5%) | 0.071 / 7.5T | 0.027 / 20.1T | **0.023** | **1.48x faster** |
+| **(8,8,128,[1024])** single batch | 128 | 0.053 / 80.8T (55%) | 0.128 / 33.5T (23%) | 0.130 / 33.1T | 0.050 / 85.5T | **0.050** | **1.07x faster** |
+| **(4,1,128,[512])** GQA | 32 | 0.029 / 18.3T | 0.070 / 7.7T | 0.071 / 7.5T | 0.027 / 20.2T | **0.021** | **1.39x faster** |
+| **(1,1,128,[512])** single head | 8 | 0.029 / 4.7T | 0.072 / 1.9T | 0.073 / 1.8T | 0.026 / 5.1T | **0.019** | **1.52x faster** |
+| **(4,4,128,[4096])** long seq † | 512 | 0.164 / 209.0T (>peak) | 0.350 / 98.1T (66%) | — † | 0.244 / 140.8T (95.1%) | — | — |
+| **(8,2,128,[4096])** GQA long † | 512 | 0.286 / 240.3T (>peak) | 0.593 / 115.8T (78%) | — † | 0.356 / 193.0T (130%) | — | — |
+| **(4,4,128,[512,768])** unequal | 96 | 0.044 / 39.6T | 0.120 / 14.6T | 0.120 / 14.5T | 0.041 / 42.2T | **0.035** | **1.25x faster** |
+| **(4,4,128,[200,328])** misaligned | 48 | 0.026 / 11.7T | 0.066 / 4.6T | 0.068 / 4.4T | 0.023 / 13.2T | **0.021** | **1.21x faster** |
+| **(4,1,128,[256,384,512])** GQA×3 | 96 | 0.035 / 28.1T | 0.110 / 8.8T | 0.110 / 8.9T | 0.032 / 30.4T | **0.032** | **1.08x faster** |
+| **(4,1,128,[512]×4)** GQA×4 | 128 | 0.034 / 63.1T | 0.109 / 19.7T | 0.110 / 19.5T | 0.034 / 64.0T | **0.033** | **1.03x faster** |
+| **(4,4,128,[2048,2048])** † | 128 | 0.090 / 190.5T | 0.263 / 65.4T (44%) | — † | 0.119 / 144.6T (97.7%) | — | — |
+| **(4,4,128,[512]×8)** serving † | 256 | 0.039 / 108.9T | 0.196 / 21.9T | — † | 0.044 / 98.5T | — | — |
+| **(8,8,128,[1024]×8)** serving † | 1024 | 0.164 / 209.3T | 0.775 / 44.3T | — † | 0.187 / 184.0T | — | — |
+| **(4,4,128,[512]×16)** serving † | 512 | 0.059 / 145.9T | 0.364 / 23.6T | — † | 0.069 / 125.4T (84.7%) | — | — |
 
 † hpc-ops dispatches these (>156 CTAs on H20) to its **warp_spec** kernel
 (`prefill.cc`: `ceil(max_seq/64)*B*H_q < 2·SM` → multi_stage, else warp_spec), so
 comparing our single-WG kernel against them is structural mismatch — the v3+
-bench target is the 8 multi-stage shapes only. **v5 wins ALL 8 of them (1.01-1.28x)**
-(with FA_SPLIT=2 the [512] shapes reach 1.29-1.39x, see Step 5).
+bench target is the 8 multi-stage shapes only. **v6 (stages=2 ring + automatic split-K, Step 6) wins ALL 8 multi-stage shapes at
+1.03-1.52x** (CTAs column = grid size `ceil(max_s/64)*B*H_q`; v6 ms derived from the
+Step 6 four-quadrant A/B ratio matrix; † shapes not re-benched under v6 defaults).
 
 ### Key takeaways
 - **Correctness is complete** for ex.1 varlen: 14 PREFILL_SHAPES (single/multi-batch,
@@ -68,6 +69,9 @@ bench target is the 8 multi-stage shapes only. **v5 wins ALL 8 of them (1.01-1.2
   (1.01-1.28x on the re-bench; the 6 † shapes sit at 0.67-0.90x where hpc uses its
   structurally different warp_spec kernel). The ncu-predicted lever worked exactly as
   diagnosed; split=2 re-test after v5 turns positive on the smallest grids (1.29-1.39x).
+- **v6 stages=2 + auto split-K + sP smem removal: 8/8 multi-stage shapes at 1.03-1.52x**
+  (single-head 1.52x, 512² 1.48x). Double-buffering turned positive once v5/v6b removed
+  the fixed per-CTA latency it must hide; split=2 is auto-selected iff grid ≤ 96 CTAs.
 
 ---
 
@@ -277,7 +281,7 @@ secondary lever stands and becomes Step 5.)*
 | (4,4,128,[512]) | 0.071 | 0.072 | 0.106 | 0.188 |
 | (8,8,128,[1024]) | 0.130 | 0.209 | 0.327 | 0.612 |
 | (4,1,128,[512]) GQA | 0.071 | 0.073 | 0.106 | 0.188 |
-| **(1,1,128,[512])** single head | 0.073 | 0.070 | 0.067 | **0.066** ✓ |
+| **(1,1,128,[512])** single head | 8 | 0.073 | 0.070 | 0.067 | **0.019** | **1.52x faster** 
 | [512,768] | 0.120 | 0.156 | 0.234 | 0.397 |
 | [200,328] | 0.068 | 0.107 | 0.146 | 0.227 |
 | [256,384,512] | 0.110 | 0.152 | 0.193 | 0.353 |
@@ -359,13 +363,59 @@ With the Q cost gone, splitting finally pays on the smallest grids:
 
 ---
 
-## Step 6+: planned optimizations (multi-stage scope only)
+## Step 6: ✅ v6 — stages=2 ring + auto split-K + sP smem removal (multi-stage 8/8, up to 1.52x)
+
+**tag: `flash-ex1-v6-picksplit`** — three bundled changes, one four-quadrant A/B to decide defaults.
+
+### v6b: sP shared-memory removal (−8 KB/CTA)
+`sP_flat` existed only as a `partition_C` layout *template* for the QK accumulator
+(`make_fragment_C` lands in registers; the smem itself was never dereferenced).
+It now borrows `storage.sO.data_ptr()` and the 8 KB `sP` MemRange is gone from
+SharedStorage — 72→64 KB/CTA, one more CTA fits per SM.
+
+### v6c + v6a four-quadrant A/B (`compare_hpcops --shapes 0,1,2,3,6,7,8,9`, 24/24 3-way per cell)
+vs-hpc ratio (hpc_ms/cute_ms, >1 = we are faster) at each (K/V ring stages, split_k):
+
+| Shape (CTAs) | (1,1) | (2,1) | (1,2) | (2,2) |
+|---|---|---|---|---|
+| 512² (32) | 1.02 | 1.04 | 1.26 | **1.48** |
+| 1024² (128) | 0.93 | **1.07** | 0.96 | 0.97 |
+| GQA 512 (32) | 0.99 | 1.33 | 1.19 | **1.39** |
+| single-head (8) | 0.99 | 1.28 | 1.31 | **1.52** |
+| [512,768] (96) | 0.97 | 1.09 | 1.07 | **1.25** |
+| [200,328] (48) | 1.04 | 1.31 | 1.09 | **1.21** |
+| GQA×3 (96) | 0.98 | **1.12** | 0.90 | 1.08 |
+| [512]×4 (128) | 1.00 | **1.03** | 0.90 | 0.82 |
+
+Two conclusions:
+1. **stages=2 turned positive across the board** (≥ (1,1) on every shape, no
+   regression). v3's "double-buffering is neutral" verdict was measured *before*
+   Q-async/sP changes removed the fixed per-CTA latency the pipeline must hide —
+   the premise flipped, so the default `NUM_STAGES` is now **2**.
+2. **split-K wins iff the grid is under-filled** (`pick_split(ctas) = 2 if ctas ≤ 96
+   else 1`): the ≤96-CTA shapes gain 15-40% from (2,2), the 128-CTA shapes lose
+   (GPU already busy → partial traffic is pure cost). Harnesses (`run_prefill`,
+   `compare_hpcops`, `test_varlen`) compute it per shape automatically;
+   `FA_SPLIT`/`--split` env/CLI stay as A/B overrides. Same pattern for stages
+   (`FA_STAGES`, default 2).
+
+### Result (default = stages 2 + auto split)
+**8/8 multi-stage shapes faster than hpc-ops, 1.03-1.52x** — peak single-head
+[512] 1.52x, 512² 1.48x, GQA 1.39x. v5's 1.01-1.28x era is superseded.
+
+### Verified
+- `run_prefill.py` **14/14** and `test_varlen.py` **5/5** under the new defaults
+  (auto split, no env); `FA_STAGES=2 FA_SPLIT=2` worst-case combo 5/5; matrix
+  cells 24/24 3-way (torch/hpc/cutedsl) Success each.
+
+---
+
+## Step 7+: planned optimizations (multi-stage scope only)
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
-| ~~5~~ | ~~flash-ex1-v5-qasync~~ | ✅ DONE — 7/8 multi-stage shapes faster than hpc-ops | — |
-| 6 | flash-ex1-v6-picksplit | harness/kernel-side split choice per grid shape (`pick_split`: split=2 when B·H_q·q_tiles ≤ ~40, else 1) — captures the free 10-28% from Step 5's re-test | 0.72-0.83x on small grids |
-| 7 | (later) | smem aliasing (sO over sQ like hpc's 64KB budget) to lift occupancy at long seqs; residual scalar-load cleanup (seqlens/cu_seqlens broadcast reads) | polish |
+| ~~6~~ | ~~flash-ex1-v6-picksplit~~ | ✅ DONE — 8/8 multi-stage shapes faster (1.03-1.52x) | — |
+| 7 | (candidate) | † long-seq re-bench under stages=2 (matrix only covered the 8 multi-stage shapes); sO-over-sQ smem aliasing for occupancy; BLK_N=128 (halve iterations) | †-region + polish |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.

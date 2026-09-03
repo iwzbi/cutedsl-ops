@@ -60,9 +60,10 @@ BLK_M = 64
 BLK_N = 64
 D = 128
 NUM_THREADS = 128
-NUM_STAGES = 1  # K/V ring depth; 1 keeps smem at ~72KB → 3 CTAs/SM (hpc-ops
-# multi_stage_dim128 runs kStage=1 and hides TMA latency via CTA interleaving).
-# A/B verified: stages=1 vs 2 with grid-swap+mask-skip is within noise (<4%).
+NUM_STAGES = 2  # K/V ring depth. v3 A/B said "neutral" — but that pre-dated
+# v5 (async Q) removing the per-CTA fixed cost that masked the overlap. The v6
+# (stages x split) matrix shows stages=2 >= stages=1 on every multi-stage shape
+# (e.g. 512^2: 1.04x vs 1.02x vs hpc; GQA512: 1.33x vs 0.99x). See PERFLOG Step 6.
 
 
 class FlashAttnPrefillBf16Multistage:
@@ -197,7 +198,10 @@ class FlashAttnPrefillBf16Multistage:
         sQ_full = storage.sQ.get_tensor(sQ_layout_staged.outer, swizzle=sQ_layout_staged.inner)
         sK_full = storage.sK.get_tensor(sK_layout_staged.outer, swizzle=sK_layout_staged.inner)
         sV_full = storage.sV.get_tensor(sV_layout_staged.outer, swizzle=sV_layout_staged.inner)
-        sP_flat = cute.make_tensor(storage.sP.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
+        # sP_flat is a compile-time partition_C TEMPLATE only (tCrS lives in
+        # registers; the memory is never dereferenced), so it borrows sO's
+        # base pointer instead of owning 8KB of smem (v6: 72 -> 64KB/CTA).
+        sP_flat = cute.make_tensor(storage.sO.data_ptr(), cute.make_layout((BLK_M, BLK_N)))
         sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
 
         # Varlen: this CTA owns (batch = bid_bh // H_q, head = bid_bh % H_q).
@@ -711,7 +715,6 @@ class FlashAttnPrefillBf16Multistage:
             sQ: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sQ_layout_staged)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sK_layout_staged)], 1024]
             sV: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sV_layout_staged)], 1024]
-            sP: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sP_layout)], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[bf16, cute.cosize(sO_layout)], 1024]
 
         # Non-clustered CTA: vmnk = (1, 1, 1, 1).
