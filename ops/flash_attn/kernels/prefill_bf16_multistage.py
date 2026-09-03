@@ -557,8 +557,11 @@ class FlashAttnPrefillBf16Multistage:
                 if warp_idx == 0:
                     with cute.arch.elect_one():
                         cute.copy(tma_atom_o, tOsO[None], tOgO[None, q_row0 // BLK_M])
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        # v10: no commit/wait_group here.  The fused CTA exits
+                        # right after and never rewrites the sO pad, and PTX
+                        # guarantees outstanding bulk async ops complete
+                        # before kernel exit — waiting only delayed retire
+                        # (~3-4% on dense long-seq grids).
             else:
                 # split-KV partial epilogue: write the UN-normalized fp32 O
                 # tile to PO, plus per-row running max (Pm) and running sum

@@ -98,7 +98,8 @@ residual is single-warpgroup vs 3-warpgroup WGMMA scheduling, not load/pipeline 
 - **v8 O epilogue TMA store (Step 8)**: fused path exits via one bulk S2G store from
   the sQ-aliased smem pad. The †/Llama3 fused-heavy band got its first real wins vs
   hpc's warp_spec ([512]×32 0.79→0.92x, −14% ms); multi-stage zone unchanged;
-  [8192]/[16384] give back ~3% to the pre-store sync/bulk-wait tail.
+  [8192]/[16384] appear ~3% below v7 — later attributed to measurement drift, not
+  the store tail (Step 10 removed the bulk-wait with zero change).
 
 ---
 
@@ -500,7 +501,8 @@ Two debugging lessons now baked into comments:
   [1024]×16 0.85→0.91, [512]×8 →0.96, [512]×16 →0.94, zipf 0.96, U-dist 0.94;
   the first real gains against hpc's warp_spec kernel.
 - Cost: longest sequences give back ~3-4% ([8192] 0.92→0.89, [16384] 0.92→0.89)
-  — the extra sync + bulk-wait before CTA retire adds tail when CTAs are dense.
+  — initially blamed on the extra sync + bulk-wait before CTA retire, but Step 10
+  removed the wait with zero change: it was measurement drift.
   Net strongly positive on the fused-dominant middle band; accepted.
 
 ### Verified
@@ -510,13 +512,36 @@ Two debugging lessons now baked into comments:
 
 ---
 
-## Step 9+: planned optimizations (multi-stage scope only)
+## Step 10: ➖ v10 — drop the epilogue bulk commit/wait (neutral, kept as simplification)
+
+**hypothesis**: the v8 fused path's ~3-4% regression on [8192]/[16384] came from
+`cp_async_bulk_commit_group()` + `wait_group(0, read=False)` delaying CTA retire.
+**Result: falsified.** With an idle GPU (an unrelated co-tenant had been inflating
+*both* kernels ~2x in the first measurements — caught by hpc's own 7.9→15.2 ms
+baseline), removing the wait leaves everything at v8 levels: [8192] 8.815 ms
+(0.89x), [16384] 17.519 ms (0.89x), [512]×8 0.041 (0.97x), and the 8 multi-stage
+shapes 1.09-1.47x, all within noise of v8. The v8 "regression" was measurement
+drift, not the wait.
+
+Kept anyway: the wait was provably redundant — PTX guarantees outstanding bulk
+async groups complete before kernel exit, and the fused CTA never rewrites the
+sO pad after issuing the store — so this removes one barrier and two instructions
+with zero downside.
+
+### Verified
+- `run_prefill.py` **22/22**, `test_varlen.py` **5/5**, clean-GPU compare long-5 +
+  small-8 **3-way 0 Failed**.
+
+---
+
+## Step 11+: planned optimizations (multi-stage scope only)
 
 | Step | Tag | Change | Expected |
 |---|---|---|---|
 | ~~8~~ | ~~flash-ex1-v8-tma-store~~ | ✅ DONE — fused mid-band 0.89-0.96x vs warp_spec | — |
-| 9 | (candidate) | BLK_N=128 (halve iterations; needs smem headroom, causal tail waste) | uncertain |
-| 10 | (candidate) | recover the ~3% on [8192]/[16384]: async store retire without bulk-wait (kernel-exit flushes) or double-buffer sO alias | polish |
+| ~~9~~ | — | ❌ SKIPPED (analysis): BLK_N=128 cannot shorten the critical path — QK stays two serial N=64 WGMMA instrs and softmax volume is unchanged; it would force pad-128 contract + 144 KB smem (1 CTA/SM) for at most loop-overhead savings already hidden by stages=2 | — |
+| ~~10~~ | flash-ex1-v10-store-retire | ➖ DONE — neutral, kept as simplification | — |
+| 11 | (candidate) | ncu on [4096]-class fused shapes to attribute the 0.70-0.80x vs warp_spec (suspect: single-WG WGMMA serialization, i.e. the red line — may be terminal for multi-stage scope) | knowledge |
 
 Each step: implement → verify (`run_prefill.py` + `tests/test_varlen.py`
 + `compare_hpcops.py`) → record in Master Table → `git commit` + tag → ncu report if >10% jump.
