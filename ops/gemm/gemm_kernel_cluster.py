@@ -110,13 +110,29 @@ def gemm_kernel(
 
     sA_for_tma = cute.group_modes(sA_full, 0, 2)
     gA_for_tma = cute.group_modes(gA, 0, 2)
-    tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
-        tma_atom_a,
-        0,
-        cute.make_layout(1),
-        sA_for_tma,
-        gA_for_tma,
-    )
+    if cutlass.const_expr(CLUSTER_N > 1):
+        # A tiles are shared across cluster-mode-1 (N): partition with the
+        # per-axis cta coord/layout so each CTA issues only its 1/CLUSTER_N
+        # slice; the multicast mask fans every slice into ALL members' sA.
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cta_layout_mnk, (0, None, 0)).shape,
+        )
+        a_cta_crd = cluster_coord_mnk[1]
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            a_cta_crd,
+            a_cta_layout,
+            sA_for_tma,
+            gA_for_tma,
+        )
+    else:
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            sA_for_tma,
+            gA_for_tma,
+        )
     sB_for_tma = cute.group_modes(sB_full, 0, 2)
     gB_for_tma = cute.group_modes(gB, 0, 2)
     if cutlass.const_expr(CLUSTER_M > 1):
@@ -194,6 +210,7 @@ def gemm_kernel(
                 tAgA[None, mainloop_prod_state.count],
                 tAsA[None, mainloop_prod_state.index],
                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_prod_state),
+                mcast_mask=a_mcast_mask,
             )
             cute.copy(
                 tma_atom_b,
@@ -250,6 +267,7 @@ def gemm_kernel(
                 tAgA[None, mainloop_prod_state.count],
                 tAsA[None, mainloop_prod_state.index],
                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_prod_state),
+                mcast_mask=a_mcast_mask,
             )
             cute.copy(
                 tma_atom_b,
@@ -323,8 +341,13 @@ def gemm(
 
     # TMA atoms: B is multicast along cluster M (both members read the same B
     # tile; each CTA issues half of it and the DMA broadcasts to both smem
-    # domains — lesson-12 recipe). A is plain G2S (CLUSTER_N == 1).
-    a_g2s_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    # domains — lesson-12 recipe). A is multicast along cluster-mode-1 (N)
+    # when CLUSTER_N > 1 (cluster members share an M-row -> identical A tile).
+    a_g2s_op = (
+        cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
+        if cutlass.const_expr(CLUSTER_N > 1)
+        else cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    )
     b_g2s_op = (
         cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
         if cutlass.const_expr(CLUSTER_M > 1)
@@ -335,6 +358,7 @@ def gemm(
         mA,
         sA_layout_one,
         (BLK_M, BLK_K),
+        num_multicast=max(1, CLUSTER_N),
     )
     tma_atom_b, tma_tensor_b = cute.nvgpu.cpasync.make_tiled_tma_atom(
         b_g2s_op,
@@ -374,8 +398,17 @@ def gemm(
             1024,
         ]
 
-    cta_layout_mnk = cute.make_layout((CLUSTER_M, CLUSTER_N, 1))
-    cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
+    # CRITICAL (v10 2x2 fix): the hardware cluster rank linearizes with the
+    # grid-x (= N) axis fastest: rank = n + CLUSTER_N * m. CuTe default
+    # strides are column-major (M fastest), which silently swaps m/n in the
+    # flat->hier coord used for tma_partition cta_coord and for the pipeline's
+    # empty-barrier dst_rank routing. Both axes size 2 (2x2) exposes it;
+    # (2,1)/(1,2) degenerate so they look fine. Pin n-fastest explicitly.
+    cta_layout_mnk = cute.make_layout((CLUSTER_M, CLUSTER_N, 1), stride=(CLUSTER_N, 1, 1))
+    cta_layout_vmnk = cute.make_layout(
+        (1, CLUSTER_M, CLUSTER_N, 1),
+        stride=(CLUSTER_M * CLUSTER_N, CLUSTER_N, 1, 1),
+    )
 
     grid_n = (N + BLK_N - 1) // BLK_N
     grid_m = (M + BLK_M - 1) // BLK_M

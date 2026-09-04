@@ -793,6 +793,62 @@ sector count; multicast's win is DRAM-side fetch dedup + xbar traffic, which a
 60 MB-L2-resident B never exercises. Kept for (a) mechanism availability,
 (b) robustness under co-tenancy, (c) future bandwidth-bound shapes.
 
+### #19: Bidirectional multicast — A-side, B-side, and the 2×2 rank/coord trap
+
+**Verdict: bidirectional support ships (`gemm-v10-bimcast`, default `(2,1)`).
+All three configs now correct — the 2×2 rank/coord mismatch was a CuTe
+column-major-vs-hardware-x-fastest stride trap, not a DSL limit — but 2×2
+multicast measures **slower** (−25~46%) from cross-CTA stage-release cost, so
+the practical win envelope is one-directional, 2-CTA stripes.**
+
+Extends #18 from "B multicast along M" to the full 2-D scheme (principle
+diagram in section 12). Four edits on #18's skeleton (which already computed
+both masks — only A-side plumbing was missing): A's host op becomes
+`G2SMulticastOp` when `CLUSTER_N>1`, A's atom gains `num_multicast=CLUSTER_N`,
+A gets the mirrored `tma_partition` branch (`slice_ (0,None,0)`, coord
+`cluster_coord_mnk[1]`), and both A producer copies take `mcast_mask=a_mcast_mask`.
+
+**The 2×2 failure.** `(2,1)` and `(1,2)` passed immediately; `(2,2)` gave
+RE=122.5% and stayed broken even with either operand reverted to plain loads
+(E2/E3) — so it was the cluster geometry, not the new A code. Root cause:
+`make_layout((CLUSTER_M, CLUSTER_N, 1))` defaults to column-major (**m
+fastest**) while hardware cluster ranks are **grid-x = n fastest**; degenerate
+axes mask the swap, a true 2×2 exposes it (every member computes the wrong
+slice coord and mask). Fix = pinned strides:
+
+```python
+cta_layout_mnk  = cute.make_layout((CLUSTER_M, CLUSTER_N, 1), stride=(CLUSTER_N, 1, 1))
+cta_layout_vmnk = cute.make_layout((1, CLUSTER_M, CLUSTER_N, 1),
+                                   stride=(CLUSTER_M * CLUSTER_N, CLUSTER_N, 1, 1))
+```
+
+(`enable_multicast_signaling=True`, E1, reproduced the identical error — the
+hand-rolled `(CLUSTER_M+CLUSTER_N-1)*NUM_WARPS` arrive count was never the issue.)
+
+**Results** (post-fix; correctness 9/9 = 3 configs × {1024³, 4096³,
+8192²×256} all Success, RE ≤ 0.01%; TFLOPS on idle GPU, same session):
+
+| config | multicast | 1024³ | 4096³ | 8192²×256 | vs (2,1) |
+|---|---|---|---|---|---|
+| (2,1) | B only | 93.9 | 130.8 | 103.5 | — |
+| (1,2) | A only | 95.0 | 130.4 | 102.7 | ≈ neutral ✓ |
+| (2,2) | A+B | **50.9** | **101.8** | **77.9** | **−25~46%** |
+
+New, sharper than "neutral": **one-directional multicast is free in both
+directions** — A-side (1,2) matches B-side (2,1) everywhere, confirming the
+mechanism is symmetric. But **2×2 is genuinely slow**, and the why is
+structural, not a bug: multicast forces the *stage-release* to be cross-CTA —
+a member may not recycle a shared tile until **every** peer's warps have
+consumed their fan-out copies, so each release becomes DSMEM arrive traffic
+sized by `mcast_size` (3 for 2×2 vs 2 for a stripe). At 4 members the release
+chain overtakes the wgmma work it was supposed to hide: −46% at 1024³. The
+cluster's co-residency/gang constraints likely add on top (2 warpgroups/CTA ×
+4 CTAs pinned to one GPC). Not a race — every number is bit-correct.
+
+**Takeaway for sizing**: multicast pays where it dedups an operand *and* the
+cluster stripe stays 2 CTAs wide; bidirectional dedup at 2×2 converts a
+bandwidth idea into a synchronization tax.
+
 ---
 
 
@@ -1268,7 +1324,13 @@ Worked: `prod=24, prod_threads=128, cons_threads=256` → `(65536 − 24·128)/2
 
 ### 12. TMA Multicast + Cluster
 
-**Mechanism.** A *cluster* groups N CTAs (cooperative thread arrays) that share a Distributed Shared Memory (DSMEM) bus across the SMs they land on. One CTA is elected the *leader*; it issues a single **multicast TMA** descriptor. The TMA engine reads the source tile from global memory **once**, then fans the payload out to all N CTAs' shared memory in one transaction.
+**Mechanism.** A *cluster* groups N CTAs (cooperative thread arrays) that share a
+Distributed Shared Memory (DSMEM) bus across the SMs they land on. A **multicast
+TMA** load reads its source bytes from the memory hierarchy **once** and fans the
+payload out into several CTAs' shared memory in one transaction. (It is *not* one
+"leader" CTA fetching the whole tile for everyone: each member issues only its
+`1/N` slice of the tile — see the wire-level picture below — and each slice is
+broadcast to all members named in its `mcast_mask`.)
 
 **Bandwidth savings formula.**
 
@@ -1288,13 +1350,125 @@ For the H20 GEMM baseline (BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3, 384 thr
 | Compute-bound | ≤ 5% | ~0–2% |
 | Memory-bound | ≥ 40% | +10–20% |
 
-**Implementation status (CuTe DSL 4.7.0).** Nine distinct approaches were attempted; all failed:
+**Implementation status.** RESOLVED in CuTe DSL 4.7.0 — shipped as
+`gemm-v9-multicast` (#18, one-way) and `gemm-v10-bimcast` (#19, bidirectional +
+2×2). The earlier "nine approaches, all failed" verdict (#17) was self-inflicted:
+the real blockers were a wrong `slice_` axis on the shared mode (double-issue →
+RE≈70%) and unpinned layout strides (rank/coord swap → only bites at true 2×2).
+The lesson-12 recipe below is the complete working form.
 
-- codegen hang (compiler does not terminate)
-- segfault in compiled artifact
-- RE = 70% (relative error vs. torch reference, far above tolerance)
+**Which operand is multicast — one picture, then three rules.**
 
-Working reference implementations exist in **HPC-Ops (C++)** and the **12-lesson SM80-MMA** series, confirming the technique is sound — the gap is DSL frontend support, not the hardware feature.
+The whole topic reduces to one identity: a CTA at grid slot (m, n) computes
+`C[m,n] = A[m,:] · B[:,n]` — **its A tile depends only on the row m, its B tile
+only on the column n.** A cluster is just a small rectangle on the (m, n) tile
+grid; whatever is *identical inside that rectangle* is what multicast dedups.
+
+A 2×2 cluster on the tile grid (each cell = one CTA, listing what it needs):
+
+```text
+              column n=0          column n=1
+           ┌────────────────┬────────────────┐
+ row m=0   │  CTA(0,0)      │  CTA(0,1)      │
+ (needs A0)│  needs A0, B0  │  needs A0, B1  │◄─── same ROW  ⇒ same A0
+           ├────────────────┼────────────────┤
+ row m=1   │  CTA(1,0)      │  CTA(1,1)      │
+ (needs A1)│  needs A1, B0  │  needs A1, B1  │
+           └────────────────┴────────────────┘
+                 ▲                ▲
+                 └──── same COLUMN ⇒ same B0 ┘
+```
+
+Rule 1 — **stack members along M** (`CLUSTER_M = 2`, grid.y): members share a
+column ⇒ share **B** ⇒ multicast **B** (this is what `gemm-v9` shipped: the
+`(2,1)` config pairs CTA(0,0)+(1,0), both need B0).
+Rule 2 — **line members along N** (`CLUSTER_N = 2`, grid.x): members share a row
+⇒ share **A** ⇒ multicast **A**.
+Rule 3 — **2×2**: both directions share something ⇒ multicast **both** (A along
+rows, B along columns; `gemm-v10` verified).
+
+What multicast actually does at the wire level, for one shared tile (say B0,
+split into halves b0ᵀ/b0ᴮ for the 2 members, `num_multicast=2` + mask {0,1}):
+
+```text
+without multicast:  CTA0 reads B0 completely ──► smem0        (B0 fetched twice)
+                    CTA1 reads B0 completely ──► smem1        (DRAM/L2 answers 2x)
+
+with multicast:     CTA0 issues b0ᵀ ──► TMA reads it ONCE ──► lands in smem0 AND smem1
+                    CTA1 issues b0ᴮ ──► TMA reads it ONCE ──► lands in smem0 AND smem1
+                    each CTA still ends with the FULL B0 in its own smem;
+                    L2/DRAM answered exactly one B0 worth of bytes, total.
+```
+
+So the three ingredients must tell one consistent story: the **atom** knows the
+fan-out width (`num_multicast`), `tma_partition(cta_coord, cta_layout)` makes
+each member issue only its 1/N slice, and `mcast_mask` names the receiving
+members. Get any one of them inconsistent with the rectangle in picture 1 and
+you get double-issue (RE≈70%) or rank swap (RE≈122%) — caveats below.
+
+#### Multicast+cluster kernel vs ordinary kernel — the full delta
+
+(`gemm_kernel_cluster.py`; "ordinary" = same code with `CLUSTER_M=CLUSTER_N=1`.)
+
+| Component | Ordinary | Multicast + cluster | Why |
+|---|---|---|---|
+| launch | `grid=(grid_n, grid_m, 1)` | + `cluster=(CLUSTER_N, CLUSTER_M, 1)` | cluster dims must mirror grid axes (x fastest); members co-schedule on DSMEM-connected SMs |
+| CTA identity | `block_idx()` | + `block_idx_in_cluster()` (linear rank, x-fastest) | feeds every cluster-aware lookup |
+| rank→coord | — | `cta_layout_mnk.get_flat_coord(rank)`, strides **pinned n-fastest** | CuTe default is m-fastest → swaps m/n at 2×2 (see caveat 1) |
+| load atom | `G2SOp` | `G2SMulticastOp` + `num_multicast=<axis>` on the shared operand | plain flavor hard-rejects `num_multicast≠1` (helpers.py:523); SASS shows `UTMALDG.2D.MULTICAST` |
+| partitioning | `tma_partition(atom, 0, layout(1), …)` | shared axis: `tma_partition(atom, cta_crd, cta_layout, …)` | each member issues only its slice instead of the whole tile |
+| copy call | `cute.copy(atom, …)` | + `mcast_mask=` (Int bitmask or `Int16(0)` on degenerate axis) | tells HW which members receive the slice |
+| smem | private | private *capacity* unchanged; TMA may now write peer smem | multicast widens reach, not size |
+| stage barrier arrives | `NUM_WARPS` | `(CLUSTER_M+CLUSTER_N-1) * NUM_WARPS` | barrier must see every contributing member's warps; miscount ⇒ hang or stale reads |
+| `cta_layout_vmnk` (pipeline) | `(1,1,1,1)` | real cluster shape, pinned strides | pipeline routes `dst_rank`/mcast signaling through it |
+| cluster start gate | none | `pipeline_init_arrive(cluster_shape_mn=…, relaxed=True)` + `wait` | no producer may issue before all members arrived |
+| `tx_count` | stage bytes | **unchanged** (do not divide by cluster size) | barrier fires when the whole tile has landed |
+| MMA / epilogue | `wgmma` + TMA store | identical | cluster shares DATA only — wgmma stays single-CTA |
+
+#### Caveats — every one of these actually bit us (#17→#19)
+
+1. **Stride order of `cta_layout_mnk` (2×2 killer).** `make_layout((M,N,1))` is
+   column-major (m fastest) but hardware ranks are grid-x = **n fastest**
+   (`rank = n + CLUSTER_N*m`). Degenerate axes hide the mismatch — `(2,1)` and
+   `(1,2)` pass "by luck", `(2,2)` explodes with RE≈122%. Pin strides explicitly.
+2. **Slice the correct axis.** B multicast ⇒ shared axis is M ⇒
+   `slice_(cta_layout_mnk, (None,0,0))` + `cluster_coord_mnk[0]`; A multicast is
+   the mirror `(0,None,0)`/coord[1]. Wrong branch ⇒ every member issues the full
+   tile ⇒ duplicate writes, RE≈70% (bit #18 once, #19 again identically).
+3. **Mask must match real sharing.** If grid/cluster/cta_layout ever get
+   rearranged independently, the mask silently stops describing identical
+   operands — data corruption with no error anywhere. Keep the three in one
+   mental picture (diagram above).
+4. **Arrive-count semantics.** `mcast_size = CLUSTER_M+CLUSTER_N-1` (union of
+   contributors); the hand-rolled `mcast_size*NUM_WARPS` must equal the DSL's
+   `enable_multicast_signaling` computation if you switch to it (verified E1, #19).
+5. **Co-scheduling is a real cost.** Cluster members must be co-resident on one
+   GPC. Free for compute-bound kernels; when the cluster is the wrong
+   granularity (FA v12: merge colocated into the cluster) the gang-scheduling tax
+   measured +0~35%. Cluster ≠ automatic win.
+6. **Sweep the non-degenerate config.** `(2,1)`/`(1,2)` alone cannot catch
+   rank-order bugs; `(2,2)` is the test that actually exercises the mapping.
+
+#### Parameter dictionary
+
+| Symbol | Value in this kernel | Meaning |
+|---|---|---|
+| `CLUSTER_M` | 2 | cluster extent along M-tiles (= grid.y). >1 ⇒ B shared ⇒ B multicast |
+| `CLUSTER_N` | 1..2 | cluster extent along N-tiles (= grid.x). >1 ⇒ A shared ⇒ A multicast |
+| `CLUSTER_SIZE` | `M*N` | CTAs per cluster |
+| `cluster=(CLUSTER_N, CLUSTER_M, 1)` | launch | HW dims (x,y,z) mirroring grid; x=n fastest |
+| `cta_layout_mnk` | `(CLUSTER_M, CLUSTER_N, 1) : (CLUSTER_N, 1, 1)` | rank↔(m,n,k) bijection; **strides are load-bearing** |
+| `cta_layout_vmnk` | `(1, CLUSTER_M, CLUSTER_N, 1)` (pinned) | pipeline's cluster view; V=1 = no CTA-level TMA multicast *of the pipeline itself* |
+| `block_idx_in_cluster()` | Int | linear rank ∈ [0, CLUSTER_SIZE) |
+| `cluster_coord_mnk` | `get_flat_coord(rank)` | this CTA's (m,n,k) slot in the patch |
+| `make_layout_image_mask(layout, coord, mode)` | Int16 bitmask | set of members sharing `coord` when mode axis is projected out; mode 0 ⇒ B's column set, mode 1 ⇒ A's row set |
+| `a_mcast_mask` / `b_mcast_mask` | mask or `Int16(0)` | passed to `cute.copy(..., mcast_mask=)`; 0 = this operand isn't multicast |
+| `num_multicast=` | axis size | TMA engine: how many copies of each issued slice to fan out |
+| `G2SMulticastOp` | atom class | only class that lowers to `UTMALDG.*.MULTICAST` |
+| `mcast_size` | `CLUSTER_M+CLUSTER_N-1` | contributors to one stage barrier (union, minus double-counted self) |
+| `tx_count` | full A+B tile bytes | expected barrier bytes — never divide by cluster size |
+| `pipeline_init_arrive/wait(cluster_shape_mn)` | relaxed pair | cluster-wide start gate before first producer issue |
+| `defer_sync=True` | pipeline opt | skip built-in fence/sync; required for correct multicast staging (#17 limitation 2) |
 
 ---
 
