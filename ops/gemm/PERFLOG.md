@@ -6,6 +6,20 @@ cuBLAS reference: `torch.mm(a, b.t())` with FP16 (libcublas.so.13).
 Each step links to ncu raw reports in [`ncu_reports/`](./ncu_reports/).
 Use `git diff v1-baseline..<tag> -- ops/gemm/gemm_kernel.py` to see code changes.
 
+**How to read this log.** Three independent numbering systems coexist:
+`## Step N` is the main optimization line (v1-v7 FP8 big-kernel iterations,
+plus the fp16 cluster line in case studies); `## Experiment Log
+
+*(Stable IDs — see "How to read this log"; entries are chronological, their
+numbers are not, and dropped ideas leave gaps on purpose.)*` entries `#N`
+are per-idea case studies whose numbers are **stable IDs** cited from commits
+and the roadmap — append-only, deliberately *not* renumbered, hence gaps and
+non-chronological order; `## Optimization Principles` sections `N.` are a
+technique manual keyed by idea, not by experiment. Where both cover one idea
+(e.g. principle 12 *TMA Multicast* ↔ cases #17-#19), the principle section is
+the reference (diagram, parameter dictionary, caveats) and the case entries are
+the experiment records.
+
 ---
 
 ## Master Performance Table
@@ -479,17 +493,33 @@ This is the single most actionable finding: **reduce tile size to increase pipel
 The tradeoff: smaller tiles = more tiles = more grid overhead + smaller wgmma atom (less work per instruction). HPC-Ops uses `SM90_64x64x16` (half our 64x256x16) — same K but smaller N.
 
 ### What we should try next (prioritized by HPC-Ops findings)
-1. **launch_bounds** (#4) — trivial, 1 line, helps compiler
-2. **kStage=5 with smaller tiles** (#1) — the big one, addresses 74.3% barrier stall
-3. **Per-warpgroup B barriers** (#2) — requires manual barrier management
-4. **In-kernel split-K reduction** (#3) — eliminates host-side reduction
-5. **reg_dealloc<24>** (#6) — lower producer reg budget
+
+*(Historical snapshot. The `(#n)` tags below are the numbering of that day's
+scratch list, NOT today's stable Experiment Log IDs — do not cross-reference
+them. Dispositions: launch_bounds → #2 no-gain; kStage=5 small tiles → shipped
+as Step 7 (64×64×64 S5 + dispatch); per-warpgroup B barriers → not pursued
+separately; in-kernel split-K reduce → #6 cancelled (CopyReduce codegen hang);
+reg_dealloc → #5 no-op, zero effect.)*
+
+1. **launch_bounds** — trivial, 1 line, helps compiler
+2. **kStage=5 with smaller tiles** — the big one, addresses 74.3% barrier stall
+3. **Per-warpgroup B barriers** — requires manual barrier management
+4. **In-kernel split-K reduction** — eliminates host-side reduction
+5. **reg_dealloc<24>** — lower producer reg budget
 
 ---
 
 ## Unified Optimization Roadmap (16 items, merged self-research + HPC-Ops)
 
-Ordered by priority (impact on #1 bottleneck: CTA barrier stall 73.3%).
+*(Planning snapshot as written; kept verbatim for the record. Disposition
+highlights since: item 1 shipped (Step 7 small-tile S5 + dispatch); items 2/3/
+5/9 measured no-gain (#2/#3/#5/#9); 6 cancelled (#6); 8 rejected on analysis
+(#8, drain window ~20 cyc); 10 done as a correctness fix (#10); 13/14 marginal
+(#13/#14); 15 shipped — the FP8 mainline kernels ARE item 15; 4/7/11/12/16 not
+pursued individually. The `(impact on #1 bottleneck…)` below refers to the
+roadmap's own item 1, not an Experiment Log case.)*
+
+Ordered by priority (impact on the top bottleneck: CTA barrier stall 73.3%).
 
 | # | Optimization | Source | Difficulty | Expected | Attacks |
 |---|---|---|---|---|---|
@@ -1348,6 +1378,7 @@ For the H20 GEMM baseline (BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3, 384 thr
 |---|---|---|
 | Compute-bound | ≤ 5% | ~0–2% |
 | Memory-bound | ≥ 40% | +10–20% |
+| 2×2 multi-stripe cluster (any regime) | — | **negative** (−25~46% measured): every stage-release becomes cross-CTA DSMEM traffic sized by `mcast_size` — see #19 |
 
 **Implementation status.** RESOLVED in CuTe DSL 4.7.0 — shipped as
 `gemm-v9-multicast` (#18, one-way) and `gemm-v10-bimcast` (#19, bidirectional +

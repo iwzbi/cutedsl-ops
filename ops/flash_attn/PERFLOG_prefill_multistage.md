@@ -1,8 +1,11 @@
 # FlashAttention Prefill (multi-stage) — Optimization Journey
 
-> **STATUS: FROZEN at v10** (`flash-ex1-v10-frozen`). All 9 versions were
-> re-measured on one idle H20 under a unified protocol (same harness, same 22
-> shapes, same-session hpc-ops baseline) + per-version ncu; the quantified
+> **STATUS: FROZEN at v10** (`flash-ex1-v10-frozen` = the unified-re-bench
+> anchor). One gain merged post-freeze: **v11 PDL** (`flash-ex1-v11-pdl`) is the
+> shipped code terminal; **v12** (cluster+DSMEM single-kernel merge) was built,
+> measured slower, and reverted (Step 12). All 9 frozen versions were re-measured
+> on one idle H20 under one unified protocol (same harness, same 22 shapes,
+> same-session hpc-ops baseline) + per-version ncu; the quantified
 > effect/metric/mechanism of every lever is in the Master Table and each Step's
 > `Δ analysis` block.
 > Per-kernel optimization log for `kernels/prefill_bf16_multistage.py` (ex.1).
@@ -20,13 +23,15 @@ Use `git diff <prev-tag>..<tag> -- ops/flash_attn/kernels/<kernel>.py` to see co
 
 ---
 
-## Master Performance Table (frozen — all 9 versions re-measured on one idle H20)
+## Master Performance Table (9 frozen versions re-measured on one idle H20 + v11)
 
 Unified protocol: every tagged kernel runs the CURRENT harness — same 22
 PREFILL_SHAPES, same `pack_varlen`, same `cuda_bench` (L2-flushed CUDA events),
 hpc-ops measured in the same session, GPU idle, each version at its shipped
 defaults (v1-v5 stages=1; v6+ stages=2 + auto `pick_split`; v7+ vectorized
-combine; v8+ TMA-store epilogue). BF16 in / FP32 acc / BF16 out, causal varlen.
+combine; v8+ TMA-store epilogue; v11 = v8+ with PDL on the combine launch).
+v11 was benched post-freeze over the 8 multi-stage shapes only (its matrix
+column is `—` elsewhere). BF16 in / FP32 acc / BF16 out, causal varlen.
 `vs hpc` = hpc_ms/cute_ms — **> 1 means our kernel is faster** (old `speedup`
 label inverted accordingly). TFLOPS = 4·H_q·Σs²·D/t is a shared-convention
 upper bound (both kernels skip the causal upper triangle, hence hpc >100% peak
@@ -615,6 +620,11 @@ Two debugging lessons now baked into comments:
   smem rest-mode (`tOsO[None]`), and r2s vs TMA must agree on swizzle (plain
   row-major both sides after d≥64 scrambling).
 
+*(No Step 9 / v9 exists: BLK_N=128 was rejected by analysis before being
+coded — QK would stay two serial N=64 WGMMA and softmax volume is unchanged,
+so the critical path cannot shorten, while the cost would be a pad-128 contract
+change plus 144 KB smem (1 CTA/SM). The number was left as a hole on purpose.)*
+
 ## Step 10: ➖ v10 — drop the epilogue bulk commit/wait (neutral, kept as simplification)
 
 **hypothesis**: the v8 fused path's ~3-4% regression on [8192]/[16384] came from
@@ -697,7 +707,9 @@ route B: replace the two-kernel split path (main + LSE-combine) with a
 un-normalized fp32 partial + (m, l) into its own `cutlass.Array` smem buffers, a
 non-relaxed `barrier_cluster_arrive/wait` pair publishes them, then both CTAs
 mapa-**pull** the peer's partial, do the LSE merge in-register, and rank 0 emits
-the v8 TMA store. combine kernel, PO/Pm/Pl gmem buffers and PDL all deleted.
+the v8 TMA store. combine kernel, PO/Pm/Pl gmem buffers and PDL all deleted
+**in the experiment only** — mainline reverted with the experiment and still
+ships the v11 two-kernel split with PDL (Step 11).
 
 ### Engineering outcome: every primitive works; the idea doesn't
 - Correctness fully achieved: fused regression 22/22, cluster path 22/22,
@@ -745,9 +757,10 @@ reverted to v11 (04535ea); no tag.
 
 ---
 
-## Closure: frozen state & unused levers (v10 = final)
+## Closure: frozen state & unused levers (v11 = final; frozen anchor v10)
 
-**This kernel line is frozen at v10.** Final per-version evidence lives in the
+**This kernel line was frozen at v10; v11 PDL is the single post-freeze gain
+now shipped.** Final per-version evidence lives in the
 Master Performance Table (unified 9-version × 22-shape matrix + ncu chain), and
 each Step's `Δ analysis` block ties its lever to the metric it moved.
 
