@@ -46,6 +46,10 @@ v7 dispatch uses best sk per shape (small tile for 512³, large tile for 4096³+
 | 8192³  | 137.4| 138.1| 138.6| 138.3| 138.6| 139.1| 137.5  |
 | 16384³ | 141.9| 141.5| 141.6| 141.6| 141.8| 141.8| 139.2  |
 
+*(v1-v6 = FP8 big-kernel line. The fp16 cluster line — 94.1 T @1024³, and its
+`gemm-v9-multicast` hardware-multicast variant, neutral on this compute-bound
+GPU — is tracked in case studies #17/#18 and the cluster-kernel entries below.)*
+
 At sk=1 (no split-K), differences between tags are small (<2%). v2-v4 persistent variants show +0.5-1.3% at medium scale (2048³-4096³) from tail-wave elimination. v6 persistent+epi shows +0.7-1.7% at 4096³+ from epilogue overlap. All converge at 16384³ (enough waves to make tail/epilogue negligible).
 
 ---
@@ -691,7 +695,7 @@ operations on partitioned tensors.
 
 **Conclusion**: Cannot be controlled from software. Would only help with structured/low-entropy data patterns (e.g., sparse tensors, zero-padded regions). Not applicable to dense random GEMM.
 
-### #17: TMA Multicast + Cluster — DSL 4.7.0 two limitations, cancelled
+### #17: TMA Multicast + Cluster — cancelled at the time (both 'limitations' later dissolved; see #18)
 
 > **[RETRADED 2026-09-03 — see #18 below.]** Multicast IS implementable in DSL
 > 4.7.0: the missing piece was the lesson-12 recipe (`CopyBulkTensorTileG2SMulti
@@ -727,10 +731,12 @@ the pipeline works for the first round (≤ NUM_STAGES k-tiles). At wrap-around
 are miscalculated → phase mismatch → consumer reads wrong stage → wrong results
 or deadlock. This is a bug in the DSL's pipeline implementation for cluster mode.
 
-**Conclusion**: TMA multicast + cluster is not implementable in CuTe DSL 4.7.0.
-HPC-Ops (production) uses C++ CUDA with manual mbarrier management, bypassing
-these DSL limitations. Requires DSL compiler fixes (multicast codegen + pipeline
-cluster phase management).
+**Conclusion (as of the experiment — SINCE RETRACTED, see #18)**: ~~TMA
+multicast + cluster is not implementable in CuTe DSL 4.7.0. Requires DSL
+compiler fixes.~~ #18 implemented it in the same DSL 4.7.0: 'Limitation 1' was
+self-inflicted (wrong `slice_` axis -> double full-tile issue, RE=70.56%
+reproducible), and 'Limitation 2' (wrap-around) is handled by `defer_sync=True`
++ explicit `pipeline_init_arrive/wait`.
 
 **Learning value**: This experiment taught the Hopper cluster programming model
 (cluster launch, `block_in_cluster_idx`, `cta_layout_vmnk`, multicast TMA masks,
@@ -1266,9 +1272,10 @@ Worked: `prod=24, prod_threads=128, cons_threads=256` → `(65536 − 24·128)/2
 
 **Bandwidth savings formula.**
 
-$$\text{gmem\_reads\_saved}(N) = N - 1 \quad\text{per multicast tile}$$
-
-$$\text{DRAM\_bytes}_{\text{cluster}} = \frac{\text{DRAM\_bytes}_{\text{nomcast}}}{N}$$
+```text
+gmem_reads_saved(N)  = N - 1            (per multicast tile)
+DRAM_bytes(cluster)  = DRAM_bytes(nomcast) / N
+```
 
 For the H20 GEMM baseline (BLK_M=128, BLK_N=256, BLK_K=64, NUM_STAGES=3, 384 threads), DRAM utilization is already only **7.2%** with **TC 90.9%** and **L2 hit 66%** — the kernel is compute-bound, so the saved gmem bandwidth has no place to convert back into speed.
 
@@ -1297,9 +1304,10 @@ Working reference implementations exist in **HPC-Ops (C++)** and the **12-lesson
 
 **Bandwidth formula.**
 
-$$\text{effective\_L2\_hit}(C) = \min\!\left(\text{hitRatio},\ \frac{\text{L2\_size\_pinned}}{|C_{\text{tile}}|}\right)$$
-
-$$\text{DRAM\_writeback}(C) = |C| \cdot (1 - \text{effective\_L2\_hit}(C))$$
+```text
+effective_L2_hit(C)  = min( hitRatio, L2_size_pinned / |C_tile| )
+DRAM_writeback(C)    = |C| * (1 - effective_L2_hit(C))
+```
 
 H20 L2 = **60 MB**. A single 4096³ fp16 output tile is 4096×4096×2 B = **32 MB**, which fits in L2 — so pinning converts repeated write-backs into L2 hits.
 
@@ -1320,9 +1328,11 @@ H20 L2 = **60 MB**. A single 4096³ fp16 output tile is 4096×4096×2 B = **32 M
 
 **Effective capacity formula.**
 
-$$\text{L2}_{\text{eff}} = \text{L2}_{\text{phys}} \cdot \frac{1}{\overline{\text{compression\_ratio}}}, \qquad \overline{\text{compression\_ratio}} \in (0, 1]$$
+```text
+L2_eff = L2_phys / mean(compression_ratio),   mean(compression_ratio) in (0, 1]
+```
 
-For random fp16 noise, $\overline{\text{compression\_ratio}} \approx 1$ (incompressible). For sparse/zero-padded data it can drop to ~0.5 or lower.
+For random fp16 noise, `mean(compression_ratio) ~= 1` (incompressible). For sparse/zero-padded data it can drop to ~0.5 or lower.
 
 **Empirical results on the GEMM workload.**
 
@@ -1345,9 +1355,11 @@ For the H20 baseline (DRAM 7.2%, L2 hit 66%, L2 phys 60 MB), even a perfect 2× 
 
 **ILP vs I-cache tradeoff formula.**
 
-$$\text{speedup}(N) \approx \underbrace{\frac{N}{N - \text{bubbles}_{\text{rel}}}}_{\text{ILP gain}} - \underbrace{\text{Icache\_miss\_penalty}(N)}_{\text{code-size cost}}$$
-
-$$\text{loop\_body\_size}(N) \approx N \cdot |{\text{wgmma\_seq}}|$$
+```text
+speedup(N)       ~=  N / (N - bubbles_rel)   -  Icache_miss_penalty(N)
+                     ~~~~~~ ILP gain ~~~~~~     ~~ code-size cost ~~
+loop_body_size(N) ~=  N * |wgmma_seq|
+```
 
 Hopper has a **48 KB per-SM instruction cache**. A single WGMMA instruction sequence is ~100+ cycles and encodes to a sizable instruction footprint; doubling it (N=2) nearly doubles the loop body's I-cache demand.
 
@@ -1369,17 +1381,16 @@ Because each WGMMA ≈ 100+ cycles, the scheduler already has substantial latenc
 
 ### 16. Double Accumulator (Ping-Pong)
 
-**Mechanism.** Maintain two register-memory accumulators $C_0, C_1$. On even K-iterations, accumulate into $C_0$ while $C_1$ is being drained to shared memory (R2S) and stored to gmem via TMA (S2G); on odd iterations, swap roles. The goal is to overlap the long **TMA store tail** of one tile with the **MMA compute** of the next tile.
+**Mechanism.** Maintain two register-memory accumulators `C0`, `C1`. On even K-iterations, accumulate into `C0` while `C1` is being drained to shared memory (R2S) and stored to gmem via TMA (S2G); on odd iterations, swap roles. The goal is to overlap the long **TMA store tail** of one tile with the **MMA compute** of the next tile.
 
 **Overlap window formula.**
 
-$$\text{overlap}_{\text{available}} = \min(\text{drain\_cost},\ \text{fill\_cost})$$
-
-$$\text{drain\_cost} = \text{R2S} + \text{TMA\_S2G} \approx 20\ \text{cyc (LSU)}$$
-
-$$\text{fill\_cost} = \text{WGMMA} \approx 100+\ \text{cyc (TC)}$$
-
-$$\Rightarrow \text{overlap}_{\text{available}} \approx 20\ \text{cyc}$$
+```text
+overlap_available = min(drain_cost, fill_cost)
+drain_cost = R2S + TMA_S2G ~= 20 cyc (LSU)
+fill_cost  = WGMMA         ~= 100+ cyc (TC)
+=> overlap_available ~= 20 cyc
+```
 
 The drain path is **5× shorter** than the fill path, so the ping-pong only recovers ~20 cycles per tile — far less than the **~180-cycle TMA-store overlap** the existing epilogue/mainloop overlap already captures. Marginal upside.
 

@@ -763,12 +763,14 @@ each Step's `Δ analysis` block ties its lever to the metric it moved.
    band; `use_pdl` + `griddepcontrol_wait` are both wrapped by the DSL — the
    original 'not wrapped' note was wrong). Producer-side `launch_dependents()`
    early-release remains unexplored.
-4. **TMA multicast (still untested) / clusters+DSMEM (exploited and REJECTED as
-   merge vehicle — Step 12)**: the cluster-as-merge-transport idea measured
-   +0~35% (merge parallelism collapse + gang-scheduling tax). What remains
-   untried is the *other* cluster use: multicast-loading shared K/V tiles to
-   halve ring traffic on long seqs (rows 16-21) — Step 12 proved the plumbing
-   works if anyone wants to attempt it.
+4. **TMA multicast / clusters+DSMEM**: clusters+DSMEM as a merge vehicle was
+   built and REJECTED (Step 12: +0~35%, merge-parallelism collapse). TMA
+   *multicast* itself is now PROVEN in this repo — the gemm line shipped it
+   with SASS-level verification (`ops/gemm/PERFLOG.md` #18, tag
+   `gemm-v9-multicast`) — but it measured neutral there too (compute-bound
+   GPU, L2-resident operands). Applying it to FA KV tiles (rows 16-21) remains
+   untried and inherits the same no-gain expectation on H20 unless the working
+   set exceeds L2.
 5. **L2 persistence window** (`cudaAccessPolicyWindow`) for K/V prefixes on
    serving rows ([512]×8..×32).
 6. **FP8 P·V / reduced softmax precision**: hpc's own D-series direction; breaks
