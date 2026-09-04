@@ -817,9 +817,8 @@ axes mask the swap, a true 2×2 exposes it (every member computes the wrong
 slice coord and mask). Fix = pinned strides:
 
 ```python
-cta_layout_mnk  = cute.make_layout((CLUSTER_M, CLUSTER_N, 1), stride=(CLUSTER_N, 1, 1))
-cta_layout_vmnk = cute.make_layout((1, CLUSTER_M, CLUSTER_N, 1),
-                                   stride=(CLUSTER_M * CLUSTER_N, CLUSTER_N, 1, 1))
+cta_layout_mnk = cute.make_layout((CLUSTER_M, CLUSTER_N, 1), stride=(CLUSTER_N, 1, 1))
+cta_layout_vmnk = cute.make_layout((1, CLUSTER_M, CLUSTER_N, 1), stride=(CLUSTER_M * CLUSTER_N, CLUSTER_N, 1, 1))
 ```
 
 (`enable_multicast_signaling=True`, E1, reproduced the identical error — the
